@@ -60,9 +60,8 @@
 #include <debug.h>
 
 #include <mach/kern_return.h>
-#include <mach/mach_host_server.h>
-#include <mach_debug/lockgroup_info.h>
 
+#include <kern/locks_internal.h>
 #include <kern/lock_stat.h>
 #include <kern/locks.h>
 #include <kern/misc_protos.h>
@@ -72,9 +71,14 @@
 #include <kern/sched_prim.h>
 #include <kern/debug.h>
 #include <libkern/section_keywords.h>
+#if defined(__x86_64__)
+#include <i386/tsc.h>
+#include <i386/machine_routines.h>
+#endif
 #include <machine/atomic.h>
 #include <machine/machine_cpu.h>
 #include <string.h>
+#include <vm/pmap.h>
 
 #include <sys/kdebug.h>
 
@@ -82,6 +86,10 @@
 #define LCK_MTX_SLEEP_DEADLINE_CODE     1
 #define LCK_MTX_LCK_WAIT_CODE           2
 #define LCK_MTX_UNLCK_WAKEUP_CODE       3
+
+// Panic in tests that check lock usage correctness
+// These are undesirable when in a panic or a debugger is runnning.
+#define LOCK_CORRECTNESS_PANIC() (kernel_debugger_entry_count == 0)
 
 #if MACH_LDEBUG
 #define ALIGN_TEST(p, t) do{if((uintptr_t)p&(sizeof(t)-1)) __builtin_trap();}while(0)
@@ -94,41 +102,39 @@
 #define ordered_load_hw(lock)          os_atomic_load(&(lock)->lock_data, compiler_acq_rel)
 #define ordered_store_hw(lock, value)  os_atomic_store(&(lock)->lock_data, (value), compiler_acq_rel)
 
+KALLOC_TYPE_DEFINE(KT_GATE, gate_t, KT_PRIV_ACCT);
 
-queue_head_t     lck_grp_queue;
-unsigned int     lck_grp_cnt;
-
-decl_lck_mtx_data(, lck_grp_lock);
-static lck_mtx_ext_t lck_grp_lock_ext;
+struct lck_spinlock_to_info PERCPU_DATA(lck_spinlock_to_info);
+volatile lck_spinlock_to_info_t lck_spinlock_timeout_in_progress;
 
 SECURITY_READ_ONLY_LATE(boolean_t) spinlock_timeout_panic = TRUE;
 
-/* Obtain "lcks" options:this currently controls lock statistics */
+struct lck_tktlock_pv_info PERCPU_DATA(lck_tktlock_pv_info);
+
+#if CONFIG_PV_TICKET
+SECURITY_READ_ONLY_LATE(bool) has_lock_pv = FALSE; /* used by waitq.py */
+#endif
+
+#if DEBUG
+TUNABLE(uint32_t, LcksOpts, "lcks", enaLkDeb);
+#else
 TUNABLE(uint32_t, LcksOpts, "lcks", 0);
-
-ZONE_VIEW_DEFINE(ZV_LCK_GRP_ATTR, "lck_grp_attr",
-    KHEAP_ID_DEFAULT, sizeof(lck_grp_attr_t));
-
-ZONE_VIEW_DEFINE(ZV_LCK_GRP, "lck_grp",
-    KHEAP_ID_DEFAULT, sizeof(lck_grp_t));
-
-ZONE_VIEW_DEFINE(ZV_LCK_ATTR, "lck_attr",
-    KHEAP_ID_DEFAULT, sizeof(lck_attr_t));
-
-lck_grp_attr_t  LockDefaultGroupAttr;
-lck_grp_t       LockCompatGroup;
-lck_attr_t      LockDefaultLckAttr;
+#endif
 
 #if CONFIG_DTRACE
 #if defined (__x86_64__)
-uint64_t dtrace_spin_threshold = 500; // 500ns
-#elif defined(__arm__) || defined(__arm64__)
-uint64_t dtrace_spin_threshold = LOCK_PANIC_TIMEOUT / 1000000; // 500ns
+machine_timeout_t dtrace_spin_threshold = 500; // 500ns
+#elif defined(__arm64__)
+MACHINE_TIMEOUT(dtrace_spin_threshold, "dtrace-spin-threshold",
+    0xC /* 12 ticks == 500ns with 24MHz OSC */, MACHINE_TIMEOUT_UNIT_TIMEBASE, NULL);
 #endif
 #endif
 
+struct lck_mcs PERCPU_DATA(lck_mcs);
+
+__kdebug_only
 uintptr_t
-unslide_for_kdebug(void* object)
+unslide_for_kdebug(const void* object)
 {
 	if (__improbable(kdebug_enable)) {
 		return VM_KERNEL_UNSLIDE_OR_PERM(object);
@@ -137,360 +143,193 @@ unslide_for_kdebug(void* object)
 	}
 }
 
-__startup_func
-static void
-lck_mod_init(void)
+static __abortlike void
+__lck_require_preemption_disabled_panic(void *lock)
 {
-	queue_init(&lck_grp_queue);
+	panic("Attempt to take no-preempt lock %p in preemptible context", lock);
+}
+
+static inline void
+__lck_require_preemption_disabled(void *lock, thread_t self __unused)
+{
+	if (__improbable(!lock_preemption_disabled_for_thread(self))) {
+		__lck_require_preemption_disabled_panic(lock);
+	}
+}
+
+#pragma mark - HW Spin policies
+
+/*
+ * Input and output timeouts are expressed in absolute_time for arm and TSC for Intel
+ */
+__attribute__((always_inline))
+hw_spin_timeout_t
+hw_spin_compute_timeout(hw_spin_policy_t pol)
+{
+	hw_spin_timeout_t ret = {
+		.hwst_timeout = os_atomic_load(pol->hwsp_timeout, relaxed),
+	};
+
+	ret.hwst_timeout <<= pol->hwsp_timeout_shift;
+#if SCHED_HYGIENE_DEBUG
+	ret.hwst_in_ppl = pmap_in_ppl();
+	/* Note we can't check if we are interruptible if in ppl */
+	ret.hwst_interruptible = !ret.hwst_in_ppl && ml_get_interrupts_enabled();
+#endif /* SCHED_HYGIENE_DEBUG */
+
+#if SCHED_HYGIENE_DEBUG
+#ifndef KASAN
+	if (ret.hwst_timeout > 0 &&
+	    !ret.hwst_in_ppl &&
+	    !ret.hwst_interruptible &&
+	    interrupt_masked_debug_mode == SCHED_HYGIENE_MODE_PANIC) {
+		uint64_t int_timeout = os_atomic_load(&interrupt_masked_timeout, relaxed);
+
+#if defined(__x86_64__)
+		int_timeout = tmrCvt(int_timeout, tscFCvtn2t);
+#endif
+		if (int_timeout < ret.hwst_timeout) {
+			ret.hwst_timeout = int_timeout;
+		}
+	}
+#endif /* !KASAN */
+#endif /* SCHED_HYGIENE_DEBUG */
+
+	return ret;
+}
+
+__attribute__((always_inline))
+bool
+hw_spin_in_ppl(hw_spin_timeout_t to)
+{
+#if SCHED_HYGIENE_DEBUG
+	return to.hwst_in_ppl;
+#else
+	(void)to;
+	return pmap_in_ppl();
+#endif
+}
+
+bool
+hw_spin_should_keep_spinning(
+	void                   *lock,
+	hw_spin_policy_t        pol,
+	hw_spin_timeout_t       to,
+	hw_spin_state_t        *state)
+{
+	hw_spin_timeout_status_t rc;
+#if SCHED_HYGIENE_DEBUG
+	uint64_t irq_time = 0;
+#endif
+	uint64_t now;
+
+	if (__improbable(to.hwst_timeout == 0)) {
+		return true;
+	}
+
+	now = ml_get_timebase();
+	if (__probable(now < state->hwss_deadline)) {
+		/* keep spinning */
+		return true;
+	}
+
+#if SCHED_HYGIENE_DEBUG
+	if (to.hwst_interruptible) {
+		irq_time = current_thread()->machine.int_time_mt;
+	}
+#endif /* SCHED_HYGIENE_DEBUG */
+
+	if (__probable(state->hwss_deadline == 0)) {
+		state->hwss_start     = now;
+		state->hwss_deadline  = now + to.hwst_timeout;
+#if SCHED_HYGIENE_DEBUG
+		state->hwss_irq_start = irq_time;
+#endif
+		return true;
+	}
 
 	/*
-	 * Need to bootstrap the LockCompatGroup instead of calling lck_grp_init() here. This avoids
-	 * grabbing the lck_grp_lock before it is initialized.
+	 * Update fields that the callback needs
 	 */
+	state->hwss_now     = now;
+#if SCHED_HYGIENE_DEBUG
+	state->hwss_irq_end = irq_time;
+#endif /* SCHED_HYGIENE_DEBUG */
 
-	bzero(&LockCompatGroup, sizeof(lck_grp_t));
-	(void) strncpy(LockCompatGroup.lck_grp_name, "Compatibility APIs", LCK_GRP_MAX_NAME);
-
-	LockCompatGroup.lck_grp_attr = LCK_ATTR_NONE;
-
-	if (LcksOpts & enaLkStat) {
-		LockCompatGroup.lck_grp_attr |= LCK_GRP_ATTR_STAT;
+	rc = pol->hwsp_op_timeout((char *)lock - pol->hwsp_lock_offset,
+	    to, *state);
+	if (rc == HW_LOCK_TIMEOUT_CONTINUE) {
+		/* push the deadline */
+		state->hwss_deadline += to.hwst_timeout;
 	}
-	if (LcksOpts & enaLkTimeStat) {
-		LockCompatGroup.lck_grp_attr |= LCK_GRP_ATTR_TIME_STAT;
-	}
-
-	os_ref_init(&LockCompatGroup.lck_grp_refcnt, NULL);
-
-	enqueue_tail(&lck_grp_queue, (queue_entry_t)&LockCompatGroup);
-	lck_grp_cnt = 1;
-
-	lck_grp_attr_setdefault(&LockDefaultGroupAttr);
-	lck_attr_setdefault(&LockDefaultLckAttr);
-
-	lck_mtx_init_ext(&lck_grp_lock, &lck_grp_lock_ext, &LockCompatGroup, &LockDefaultLckAttr);
-}
-STARTUP(LOCKS_EARLY, STARTUP_RANK_FIRST, lck_mod_init);
-
-/*
- * Routine:	lck_grp_attr_alloc_init
- */
-
-lck_grp_attr_t  *
-lck_grp_attr_alloc_init(
-	void)
-{
-	lck_grp_attr_t  *attr;
-
-	attr = zalloc(ZV_LCK_GRP_ATTR);
-	lck_grp_attr_setdefault(attr);
-	return attr;
+	return rc == HW_LOCK_TIMEOUT_CONTINUE;
 }
 
-
-/*
- * Routine:	lck_grp_attr_setdefault
- */
-
+__attribute__((always_inline))
 void
-lck_grp_attr_setdefault(
-	lck_grp_attr_t  *attr)
+lck_spinlock_timeout_set_orig_owner(uintptr_t owner)
 {
-	if (LcksOpts & enaLkStat) {
-		attr->grp_attr_val = LCK_GRP_ATTR_STAT;
+#if DEBUG || DEVELOPMENT
+	PERCPU_GET(lck_spinlock_to_info)->owner_thread_orig = owner & ~0x7ul;
+#else
+	(void)owner;
+#endif
+}
+
+__attribute__((always_inline))
+void
+lck_spinlock_timeout_set_orig_ctid(uint32_t ctid)
+{
+#if DEBUG || DEVELOPMENT
+	PERCPU_GET(lck_spinlock_to_info)->owner_thread_orig =
+	    (uintptr_t)ctid_get_thread_unsafe(ctid);
+#else
+	(void)ctid;
+#endif
+}
+
+lck_spinlock_to_info_t
+lck_spinlock_timeout_hit(void *lck, uintptr_t owner)
+{
+	lck_spinlock_to_info_t lsti = PERCPU_GET(lck_spinlock_to_info);
+
+	if (owner < (1u << CTID_SIZE_BIT)) {
+		owner = (uintptr_t)ctid_get_thread_unsafe((uint32_t)owner);
 	} else {
-		attr->grp_attr_val = 0;
+		/* strip possible bits used by the lock implementations */
+		owner &= ~0x7ul;
 	}
-}
 
+	lsti->lock = lck;
+	lsti->owner_thread_cur = owner;
+	lsti->owner_cpu = ~0u;
+	os_atomic_store(&lck_spinlock_timeout_in_progress, lsti, release);
 
-/*
- * Routine:     lck_grp_attr_setstat
- */
+	if (owner == 0) {
+		/* if the owner isn't known, just bail */
+		goto out;
+	}
 
-void
-lck_grp_attr_setstat(
-	lck_grp_attr_t  *attr)
-{
-#pragma unused(attr)
-	os_atomic_or(&attr->grp_attr_val, LCK_GRP_ATTR_STAT, relaxed);
-}
-
-
-/*
- * Routine:     lck_grp_attr_free
- */
-
-void
-lck_grp_attr_free(
-	lck_grp_attr_t  *attr)
-{
-	zfree(ZV_LCK_GRP_ATTR, attr);
-}
-
-
-/*
- * Routine: lck_grp_alloc_init
- */
-
-lck_grp_t *
-lck_grp_alloc_init(
-	const char*     grp_name,
-	lck_grp_attr_t  *attr)
-{
-	lck_grp_t       *grp;
-
-	grp = zalloc(ZV_LCK_GRP);
-	lck_grp_init(grp, grp_name, attr);
-	return grp;
-}
-
-/*
- * Routine: lck_grp_init
- */
-
-void
-lck_grp_init(lck_grp_t * grp, const char * grp_name, lck_grp_attr_t * attr)
-{
-	/* make sure locking infrastructure has been initialized */
-	assert(lck_grp_cnt > 0);
-
-	bzero((void *)grp, sizeof(lck_grp_t));
-
-	(void)strlcpy(grp->lck_grp_name, grp_name, LCK_GRP_MAX_NAME);
-
-	if (attr != LCK_GRP_ATTR_NULL) {
-		grp->lck_grp_attr = attr->grp_attr_val;
-	} else {
-		grp->lck_grp_attr = 0;
-		if (LcksOpts & enaLkStat) {
-			grp->lck_grp_attr |= LCK_GRP_ATTR_STAT;
-		}
-		if (LcksOpts & enaLkTimeStat) {
-			grp->lck_grp_attr |= LCK_GRP_ATTR_TIME_STAT;
+	for (uint32_t i = 0; i <= ml_early_cpu_max_number(); i++) {
+		cpu_data_t *data = cpu_datap(i);
+		if (data && (uintptr_t)data->cpu_active_thread == owner) {
+			lsti->owner_cpu = i;
+			os_atomic_store(&lck_spinlock_timeout_in_progress, lsti, release);
+#if __x86_64__
+			if ((uint32_t)cpu_number() != i) {
+				/* Cause NMI and panic on the owner's cpu */
+				NMIPI_panic(cpu_to_cpumask(i), SPINLOCK_TIMEOUT);
+			}
+#endif
+			break;
 		}
 	}
 
-	if (grp->lck_grp_attr & LCK_GRP_ATTR_STAT) {
-		lck_grp_stats_t *stats = &grp->lck_grp_stats;
-
-#if LOCK_STATS
-		lck_grp_stat_enable(&stats->lgss_spin_held);
-		lck_grp_stat_enable(&stats->lgss_spin_miss);
-#endif /* LOCK_STATS */
-
-		lck_grp_stat_enable(&stats->lgss_mtx_held);
-		lck_grp_stat_enable(&stats->lgss_mtx_miss);
-		lck_grp_stat_enable(&stats->lgss_mtx_direct_wait);
-		lck_grp_stat_enable(&stats->lgss_mtx_wait);
-	}
-	if (grp->lck_grp_attr & LCK_GRP_ATTR_TIME_STAT) {
-#if LOCK_STATS
-		lck_grp_stats_t *stats = &grp->lck_grp_stats;
-		lck_grp_stat_enable(&stats->lgss_spin_spin);
-#endif /* LOCK_STATS */
-	}
-
-	os_ref_init(&grp->lck_grp_refcnt, NULL);
-
-	lck_mtx_lock(&lck_grp_lock);
-	enqueue_tail(&lck_grp_queue, (queue_entry_t)grp);
-	lck_grp_cnt++;
-	lck_mtx_unlock(&lck_grp_lock);
+out:
+	return lsti;
 }
 
-/*
- * Routine:     lck_grp_free
- */
-
-void
-lck_grp_free(
-	lck_grp_t       *grp)
-{
-	lck_mtx_lock(&lck_grp_lock);
-	lck_grp_cnt--;
-	(void)remque((queue_entry_t)grp);
-	lck_mtx_unlock(&lck_grp_lock);
-	lck_grp_deallocate(grp);
-}
-
-
-/*
- * Routine:     lck_grp_reference
- */
-
-void
-lck_grp_reference(
-	lck_grp_t       *grp)
-{
-	os_ref_retain(&grp->lck_grp_refcnt);
-}
-
-
-/*
- * Routine:     lck_grp_deallocate
- */
-
-void
-lck_grp_deallocate(
-	lck_grp_t       *grp)
-{
-	if (os_ref_release(&grp->lck_grp_refcnt) != 0) {
-		return;
-	}
-
-	zfree(ZV_LCK_GRP, grp);
-}
-
-/*
- * Routine:	lck_grp_lckcnt_incr
- */
-
-void
-lck_grp_lckcnt_incr(
-	lck_grp_t       *grp,
-	lck_type_t      lck_type)
-{
-	unsigned int    *lckcnt;
-
-	switch (lck_type) {
-	case LCK_TYPE_SPIN:
-		lckcnt = &grp->lck_grp_spincnt;
-		break;
-	case LCK_TYPE_MTX:
-		lckcnt = &grp->lck_grp_mtxcnt;
-		break;
-	case LCK_TYPE_RW:
-		lckcnt = &grp->lck_grp_rwcnt;
-		break;
-	case LCK_TYPE_TICKET:
-		lckcnt = &grp->lck_grp_ticketcnt;
-		break;
-	default:
-		return panic("lck_grp_lckcnt_incr(): invalid lock type: %d\n", lck_type);
-	}
-
-	os_atomic_inc(lckcnt, relaxed);
-}
-
-/*
- * Routine:	lck_grp_lckcnt_decr
- */
-
-void
-lck_grp_lckcnt_decr(
-	lck_grp_t       *grp,
-	lck_type_t      lck_type)
-{
-	unsigned int    *lckcnt;
-	int             updated;
-
-	switch (lck_type) {
-	case LCK_TYPE_SPIN:
-		lckcnt = &grp->lck_grp_spincnt;
-		break;
-	case LCK_TYPE_MTX:
-		lckcnt = &grp->lck_grp_mtxcnt;
-		break;
-	case LCK_TYPE_RW:
-		lckcnt = &grp->lck_grp_rwcnt;
-		break;
-	case LCK_TYPE_TICKET:
-		lckcnt = &grp->lck_grp_ticketcnt;
-		break;
-	default:
-		panic("lck_grp_lckcnt_decr(): invalid lock type: %d\n", lck_type);
-		return;
-	}
-
-	updated = os_atomic_dec(lckcnt, relaxed);
-	assert(updated >= 0);
-}
-
-/*
- * Routine:	lck_attr_alloc_init
- */
-
-lck_attr_t *
-lck_attr_alloc_init(
-	void)
-{
-	lck_attr_t      *attr;
-
-	attr = zalloc(ZV_LCK_ATTR);
-	lck_attr_setdefault(attr);
-	return attr;
-}
-
-
-/*
- * Routine:	lck_attr_setdefault
- */
-
-void
-lck_attr_setdefault(
-	lck_attr_t      *attr)
-{
-#if __arm__ || __arm64__
-	/* <rdar://problem/4404579>: Using LCK_ATTR_DEBUG here causes panic at boot time for arm */
-	attr->lck_attr_val =  LCK_ATTR_NONE;
-#elif __i386__ || __x86_64__
-#if     !DEBUG
-	if (LcksOpts & enaLkDeb) {
-		attr->lck_attr_val =  LCK_ATTR_DEBUG;
-	} else {
-		attr->lck_attr_val =  LCK_ATTR_NONE;
-	}
-#else
-	attr->lck_attr_val =  LCK_ATTR_DEBUG;
-#endif  /* !DEBUG */
-#else
-#error Unknown architecture.
-#endif  /* __arm__ */
-}
-
-
-/*
- * Routine:	lck_attr_setdebug
- */
-void
-lck_attr_setdebug(
-	lck_attr_t      *attr)
-{
-	os_atomic_or(&attr->lck_attr_val, LCK_ATTR_DEBUG, relaxed);
-}
-
-/*
- * Routine:	lck_attr_setdebug
- */
-void
-lck_attr_cleardebug(
-	lck_attr_t      *attr)
-{
-	os_atomic_andnot(&attr->lck_attr_val, LCK_ATTR_DEBUG, relaxed);
-}
-
-
-/*
- * Routine:	lck_attr_rw_shared_priority
- */
-void
-lck_attr_rw_shared_priority(
-	lck_attr_t      *attr)
-{
-	os_atomic_or(&attr->lck_attr_val, LCK_ATTR_RW_SHARED_PRIORITY, relaxed);
-}
-
-
-/*
- * Routine:	lck_attr_free
- */
-void
-lck_attr_free(
-	lck_attr_t      *attr)
-{
-	zfree(ZV_LCK_ATTR, attr);
-}
+#pragma mark - HW locks
 
 /*
  * Routine:	hw_lock_init
@@ -503,6 +342,7 @@ hw_lock_init(hw_lock_t lock)
 	ordered_store_hw(lock, 0);
 }
 
+__result_use_check
 static inline bool
 hw_lock_trylock_contended(hw_lock_t lock, uintptr_t newval)
 {
@@ -522,10 +362,172 @@ hw_lock_trylock_contended(hw_lock_t lock, uintptr_t newval)
 		wait_for_event(); // clears the monitor so we don't need give_up()
 		return false;
 	}
-#endif // OS_ATOMIC_HAS_LLSC
-	return os_atomic_cmpxchg(&lock->lock_data, 0, newval, acquire);
+#endif
+	return lock_cmpxchg(&lock->lock_data, 0, newval, acquire);
 #endif // !OS_ATOMIC_USE_LLSC
 }
+
+__result_use_check
+static inline bool
+hw_lock_trylock_bit(uint32_t *target, unsigned int bit, bool wait)
+{
+	uint32_t mask = 1u << bit;
+
+#if OS_ATOMIC_USE_LLSC || !OS_ATOMIC_HAS_LLSC
+	uint32_t oldval, newval;
+	os_atomic_rmw_loop(target, oldval, newval, acquire, {
+		newval = oldval | mask;
+		if (__improbable(oldval & mask)) {
+#if OS_ATOMIC_HAS_LLSC
+		        if (wait) {
+		                wait_for_event(); // clears the monitor so we don't need give_up()
+			} else {
+		                os_atomic_clear_exclusive();
+			}
+#else
+		        if (wait) {
+		                cpu_pause();
+			}
+#endif
+		        return false;
+		}
+	});
+	return true;
+#else
+	uint32_t oldval = os_atomic_load_exclusive(target, relaxed);
+	if (__improbable(oldval & mask)) {
+		if (wait) {
+			wait_for_event(); // clears the monitor so we don't need give_up()
+		} else {
+			os_atomic_clear_exclusive();
+		}
+		return false;
+	}
+	return (os_atomic_or_orig(target, mask, acquire) & mask) == 0;
+#endif // !OS_ATOMIC_USE_LLSC && OS_ATOMIC_HAS_LLSC
+}
+
+static hw_spin_timeout_status_t
+hw_spin_timeout_panic(void *_lock, hw_spin_timeout_t to, hw_spin_state_t st)
+{
+	hw_lock_t lock  = _lock;
+	uintptr_t owner = lock->lock_data & ~0x7ul;
+	lck_spinlock_to_info_t lsti;
+
+	if (!spinlock_timeout_panic) {
+		/* keep spinning rather than panicing */
+		return HW_LOCK_TIMEOUT_CONTINUE;
+	}
+
+	if (pmap_in_ppl()) {
+		/*
+		 * This code is used by the PPL and can't write to globals.
+		 */
+		panic("Spinlock[%p] " HW_SPIN_TIMEOUT_FMT "; "
+		    "current owner: %p, " HW_SPIN_TIMEOUT_DETAILS_FMT,
+		    lock, HW_SPIN_TIMEOUT_ARG(to, st),
+		    (void *)owner, HW_SPIN_TIMEOUT_DETAILS_ARG(to, st));
+	}
+
+	// Capture the actual time spent blocked, which may be higher than the timeout
+	// if a misbehaving interrupt stole this thread's CPU time.
+	lsti = lck_spinlock_timeout_hit(lock, owner);
+	panic("Spinlock[%p] " HW_SPIN_TIMEOUT_FMT "; "
+	    "current owner: %p (on cpu %d), "
+#if DEBUG || DEVELOPMENT
+	    "initial owner: %p, "
+#endif /* DEBUG || DEVELOPMENT */
+	    HW_SPIN_TIMEOUT_DETAILS_FMT,
+	    lock, HW_SPIN_TIMEOUT_ARG(to, st),
+	    (void *)lsti->owner_thread_cur, lsti->owner_cpu,
+#if DEBUG || DEVELOPMENT
+	    (void *)lsti->owner_thread_orig,
+#endif /* DEBUG || DEVELOPMENT */
+	    HW_SPIN_TIMEOUT_DETAILS_ARG(to, st));
+}
+
+const struct hw_spin_policy hw_lock_spin_policy = {
+	.hwsp_name              = "hw_lock_t",
+	.hwsp_timeout_atomic    = &lock_panic_timeout,
+	.hwsp_op_timeout        = hw_spin_timeout_panic,
+};
+
+static hw_spin_timeout_status_t
+hw_spin_always_return(void *_lock, hw_spin_timeout_t to, hw_spin_state_t st)
+{
+#pragma unused(_lock, to, st)
+	return HW_LOCK_TIMEOUT_RETURN;
+}
+
+const struct hw_spin_policy hw_lock_spin_panic_policy = {
+	.hwsp_name              = "hw_lock_t[panic]",
+#if defined(__x86_64__)
+	.hwsp_timeout           = &LockTimeOutTSC,
+#else
+	.hwsp_timeout_atomic    = &LockTimeOut,
+#endif
+	.hwsp_timeout_shift     = 2,
+	.hwsp_op_timeout        = hw_spin_always_return,
+};
+
+#if DEBUG || DEVELOPMENT
+static machine_timeout_t hw_lock_test_to;
+const struct hw_spin_policy hw_lock_test_give_up_policy = {
+	.hwsp_name              = "testing policy",
+#if defined(__x86_64__)
+	.hwsp_timeout           = &LockTimeOutTSC,
+#else
+	.hwsp_timeout_atomic    = &LockTimeOut,
+#endif
+	.hwsp_timeout_shift     = 2,
+	.hwsp_op_timeout        = hw_spin_always_return,
+};
+
+__startup_func
+static void
+hw_lock_test_to_init(void)
+{
+	uint64_t timeout;
+
+	nanoseconds_to_absolutetime(100 * NSEC_PER_USEC, &timeout);
+#if defined(__x86_64__)
+	timeout = tmrCvt(timeout, tscFCvtn2t);
+#endif
+	os_atomic_init(&hw_lock_test_to, timeout);
+}
+STARTUP(TIMEOUTS, STARTUP_RANK_FIRST, hw_lock_test_to_init);
+#endif
+
+static hw_spin_timeout_status_t
+hw_lock_bit_timeout_panic(void *_lock, hw_spin_timeout_t to, hw_spin_state_t st)
+{
+	hw_lock_bit_t *lock = _lock;
+
+	if (!spinlock_timeout_panic) {
+		/* keep spinning rather than panicing */
+		return HW_LOCK_TIMEOUT_CONTINUE;
+	}
+
+	panic("Spinlock[%p] " HW_SPIN_TIMEOUT_FMT "; "
+	    "current value: 0x%08x, " HW_SPIN_TIMEOUT_DETAILS_FMT,
+	    lock, HW_SPIN_TIMEOUT_ARG(to, st),
+	    *lock, HW_SPIN_TIMEOUT_DETAILS_ARG(to, st));
+}
+
+static const struct hw_spin_policy hw_lock_bit_policy = {
+	.hwsp_name              = "hw_lock_bit_t",
+	.hwsp_timeout_atomic    = &lock_panic_timeout,
+	.hwsp_op_timeout        = hw_lock_bit_timeout_panic,
+};
+
+#if __arm64__
+const uint64_t hw_lock_bit_timeout_2s = 0x3000000;
+const struct hw_spin_policy hw_lock_bit_policy_2s = {
+	.hwsp_name              = "hw_lock_bit_t",
+	.hwsp_timeout           = &hw_lock_bit_timeout_2s,
+	.hwsp_op_timeout        = hw_lock_bit_timeout_panic,
+};
+#endif
 
 /*
  *	Routine: hw_lock_lock_contended
@@ -534,113 +536,151 @@ hw_lock_trylock_contended(hw_lock_t lock, uintptr_t newval)
  *	timeout is in mach_absolute_time ticks. Called with
  *	preemption disabled.
  */
-static unsigned int NOINLINE
-hw_lock_lock_contended(hw_lock_t lock, uintptr_t data, uint64_t timeout, boolean_t do_panic LCK_GRP_ARG(lck_grp_t *grp))
+static hw_lock_status_t NOINLINE
+hw_lock_lock_contended(
+	hw_lock_t               lock,
+	uintptr_t               data,
+	hw_spin_policy_t        pol
+	LCK_GRP_ARG(lck_grp_t *grp))
 {
-	uint64_t        end = 0;
-	uintptr_t       holder = lock->lock_data;
-	int             i;
+	hw_spin_timeout_t to = hw_spin_compute_timeout(pol);
+	hw_spin_state_t   state = { };
+	hw_lock_status_t  rc = HW_LOCK_CONTENDED;
 
-	if (timeout == 0) {
-		timeout = LOCK_PANIC_TIMEOUT;
+	if (HW_LOCK_STATE_TO_THREAD(lock->lock_data) ==
+	    HW_LOCK_STATE_TO_THREAD(data) && LOCK_CORRECTNESS_PANIC()) {
+		panic("hwlock: thread %p is trying to lock %p recursively",
+		    HW_LOCK_STATE_TO_THREAD(data), lock);
 	}
+
 #if CONFIG_DTRACE || LOCK_STATS
 	uint64_t begin = 0;
 	boolean_t stat_enabled = lck_grp_spin_spin_enabled(lock LCK_GRP_ARG(grp));
-#endif /* CONFIG_DTRACE || LOCK_STATS */
 
-#if LOCK_STATS || CONFIG_DTRACE
 	if (__improbable(stat_enabled)) {
 		begin = mach_absolute_time();
 	}
-#endif /* LOCK_STATS || CONFIG_DTRACE */
-	for (;;) {
-		for (i = 0; i < LOCK_SNOOP_SPINS; i++) {
-			cpu_pause();
-#if (!__ARM_ENABLE_WFE_) || (LOCK_PRETEST)
-			holder = ordered_load_hw(lock);
-			if (holder != 0) {
-				continue;
-			}
-#endif
-			if (hw_lock_trylock_contended(lock, data)) {
-#if CONFIG_DTRACE || LOCK_STATS
-				if (__improbable(stat_enabled)) {
-					lck_grp_spin_update_spin(lock LCK_GRP_ARG(grp), mach_absolute_time() - begin);
-				}
-				lck_grp_spin_update_miss(lock LCK_GRP_ARG(grp));
 #endif /* CONFIG_DTRACE || LOCK_STATS */
-				return 1;
-			}
-		}
-		if (end == 0) {
-			end = ml_get_timebase() + timeout;
-		} else if (ml_get_timebase() >= end) {
-			break;
-		}
-	}
-	if (do_panic) {
-		// Capture the actual time spent blocked, which may be higher than the timeout
-		// if a misbehaving interrupt stole this thread's CPU time.
-		panic("Spinlock timeout after %llu ticks, %p = %lx",
-		    (ml_get_timebase() - end + timeout), lock, holder);
-	}
-	return 0;
-}
 
-void *
-hw_wait_while_equals(void **address, void *current)
-{
-	void *v;
-	uint64_t end = 0;
+	if (!hw_spin_in_ppl(to)) {
+		/*
+		 * This code is used by the PPL and can't write to globals.
+		 */
+		lck_spinlock_timeout_set_orig_owner(lock->lock_data);
+	}
 
-	for (;;) {
-		for (int i = 0; i < LOCK_SNOOP_SPINS; i++) {
+	do {
+		for (uint32_t i = 0; i < LOCK_SNOOP_SPINS; i++) {
 			cpu_pause();
-#if OS_ATOMIC_HAS_LLSC
-			v = os_atomic_load_exclusive(address, relaxed);
-			if (__probable(v != current)) {
-				os_atomic_clear_exclusive();
-				return v;
+			if (hw_lock_trylock_contended(lock, data)) {
+				lck_grp_spin_update_held(lock LCK_GRP_ARG(grp));
+				rc = HW_LOCK_ACQUIRED;
+				goto end;
 			}
-			wait_for_event();
-#else
-			v = os_atomic_load(address, relaxed);
-			if (__probable(v != current)) {
-				return v;
-			}
-#endif // OS_ATOMIC_HAS_LLSC
 		}
-		if (end == 0) {
-			end = ml_get_timebase() + LOCK_PANIC_TIMEOUT;
-		} else if (ml_get_timebase() >= end) {
-			panic("Wait while equals timeout @ *%p == %p", address, v);
-		}
+	} while (hw_spin_should_keep_spinning(lock, pol, to, &state));
+
+end:
+#if CONFIG_DTRACE || LOCK_STATS
+	if (__improbable(stat_enabled)) {
+		lck_grp_spin_update_spin(lock LCK_GRP_ARG(grp),
+		    mach_absolute_time() - begin);
 	}
+	lck_grp_spin_update_miss(lock LCK_GRP_ARG(grp));
+#endif /* CONFIG_DTRACE || LOCK_STATS */
+	return rc;
 }
 
-static inline void
-hw_lock_lock_internal(hw_lock_t lock, thread_t thread LCK_GRP_ARG(lck_grp_t *grp))
+static hw_spin_timeout_status_t
+hw_wait_while_equals32_panic(void *_lock, hw_spin_timeout_t to, hw_spin_state_t st)
 {
-	uintptr_t       state;
+	uint32_t *address = _lock;
 
-	state = LCK_MTX_THREAD_TO_STATE(thread) | PLATFORM_LCK_ILOCK;
-#if     LOCK_PRETEST
-	if (ordered_load_hw(lock)) {
-		goto contended;
+	if (!spinlock_timeout_panic) {
+		/* keep spinning rather than panicing */
+		return HW_LOCK_TIMEOUT_CONTINUE;
 	}
-#endif  // LOCK_PRETEST
-	if (hw_lock_trylock_contended(lock, state)) {
-		goto end;
-	}
-#if     LOCK_PRETEST
-contended:
-#endif  // LOCK_PRETEST
-	hw_lock_lock_contended(lock, state, 0, spinlock_timeout_panic LCK_GRP_ARG(grp));
-end:
-	lck_grp_spin_update_held(lock LCK_GRP_ARG(grp));
 
-	return;
+	panic("wait_while_equals32[%p] " HW_SPIN_TIMEOUT_FMT "; "
+	    "current value: 0x%08x, " HW_SPIN_TIMEOUT_DETAILS_FMT,
+	    address, HW_SPIN_TIMEOUT_ARG(to, st),
+	    *address, HW_SPIN_TIMEOUT_DETAILS_ARG(to, st));
+}
+
+static const struct hw_spin_policy hw_wait_while_equals32_policy = {
+	.hwsp_name              = "hw_wait_while_equals32",
+	.hwsp_timeout_atomic    = &lock_panic_timeout,
+	.hwsp_op_timeout        = hw_wait_while_equals32_panic,
+};
+
+static hw_spin_timeout_status_t
+hw_wait_while_equals64_panic(void *_lock, hw_spin_timeout_t to, hw_spin_state_t st)
+{
+	uint64_t *address = _lock;
+
+	if (!spinlock_timeout_panic) {
+		/* keep spinning rather than panicing */
+		return HW_LOCK_TIMEOUT_CONTINUE;
+	}
+
+	panic("wait_while_equals64[%p] " HW_SPIN_TIMEOUT_FMT "; "
+	    "current value: 0x%016llx, " HW_SPIN_TIMEOUT_DETAILS_FMT,
+	    address, HW_SPIN_TIMEOUT_ARG(to, st),
+	    *address, HW_SPIN_TIMEOUT_DETAILS_ARG(to, st));
+}
+
+static const struct hw_spin_policy hw_wait_while_equals64_policy = {
+	.hwsp_name              = "hw_wait_while_equals64",
+	.hwsp_timeout_atomic    = &lock_panic_timeout,
+	.hwsp_op_timeout        = hw_wait_while_equals64_panic,
+};
+
+uint32_t
+hw_wait_while_equals32(uint32_t *address, uint32_t current)
+{
+	hw_spin_policy_t  pol   = &hw_wait_while_equals32_policy;
+	hw_spin_timeout_t to    = hw_spin_compute_timeout(pol);
+	hw_spin_state_t   state = { };
+	uint32_t          v;
+
+	while (__improbable(!hw_spin_wait_until(address, v, v != current))) {
+		hw_spin_should_keep_spinning(address, pol, to, &state);
+	}
+
+	return v;
+}
+
+uint64_t
+hw_wait_while_equals64(uint64_t *address, uint64_t current)
+{
+	hw_spin_policy_t  pol   = &hw_wait_while_equals64_policy;
+	hw_spin_timeout_t to    = hw_spin_compute_timeout(pol);
+	hw_spin_state_t   state = { };
+	uint64_t          v;
+
+	while (__improbable(!hw_spin_wait_until(address, v, v != current))) {
+		hw_spin_should_keep_spinning(address, pol, to, &state);
+	}
+
+	return v;
+}
+
+__result_use_check
+static inline hw_lock_status_t
+hw_lock_to_internal(
+	hw_lock_t               lock,
+	thread_t                thread,
+	hw_spin_policy_t        pol
+	LCK_GRP_ARG(lck_grp_t *grp))
+{
+	uintptr_t state = HW_LOCK_THREAD_TO_STATE(thread);
+
+	if (__probable(hw_lock_trylock_contended(lock, state))) {
+		lck_grp_spin_update_held(lock LCK_GRP_ARG(grp));
+		return HW_LOCK_ACQUIRED;
+	}
+
+	return hw_lock_lock_contended(lock, state, pol LCK_GRP_ARG(grp));
 }
 
 /*
@@ -653,8 +693,9 @@ void
 (hw_lock_lock)(hw_lock_t lock LCK_GRP_ARG(lck_grp_t *grp))
 {
 	thread_t thread = current_thread();
-	disable_preemption_for_thread(thread);
-	hw_lock_lock_internal(lock, thread LCK_GRP_ARG(grp));
+	lock_disable_preemption_for_thread(thread);
+	(void)hw_lock_to_internal(lock, thread, &hw_lock_spin_policy
+	    LCK_GRP_ARG(grp));
 }
 
 /*
@@ -666,54 +707,25 @@ void
 (hw_lock_lock_nopreempt)(hw_lock_t lock LCK_GRP_ARG(lck_grp_t *grp))
 {
 	thread_t thread = current_thread();
-	if (__improbable(!preemption_disabled_for_thread(thread))) {
-		panic("Attempt to take no-preempt spinlock %p in preemptible context", lock);
-	}
-	hw_lock_lock_internal(lock, thread LCK_GRP_ARG(grp));
-}
-
-static inline unsigned int
-hw_lock_to_internal(hw_lock_t lock, uint64_t timeout, thread_t thread
-    LCK_GRP_ARG(lck_grp_t *grp))
-{
-	uintptr_t state;
-	unsigned int success = 0;
-
-	state = LCK_MTX_THREAD_TO_STATE(thread) | PLATFORM_LCK_ILOCK;
-#if     LOCK_PRETEST
-	if (ordered_load_hw(lock)) {
-		goto contended;
-	}
-#endif  // LOCK_PRETEST
-	if (hw_lock_trylock_contended(lock, state)) {
-		success = 1;
-		goto end;
-	}
-#if     LOCK_PRETEST
-contended:
-#endif  // LOCK_PRETEST
-	success = hw_lock_lock_contended(lock, state, timeout, FALSE LCK_GRP_ARG(grp));
-end:
-	if (success) {
-		lck_grp_spin_update_held(lock LCK_GRP_ARG(grp));
-	}
-	return success;
+	__lck_require_preemption_disabled(lock, thread);
+	(void)hw_lock_to_internal(lock, thread, &hw_lock_spin_policy
+	    LCK_GRP_ARG(grp));
 }
 
 /*
  *	Routine: hw_lock_to
  *
  *	Acquire lock, spinning until it becomes available or timeout.
- *	Timeout is in mach_absolute_time ticks, return with
+ *	Timeout is in mach_absolute_time ticks (TSC in Intel), return with
  *	preemption disabled.
  */
 unsigned
 int
-(hw_lock_to)(hw_lock_t lock, uint64_t timeout LCK_GRP_ARG(lck_grp_t *grp))
+(hw_lock_to)(hw_lock_t lock, hw_spin_policy_t pol LCK_GRP_ARG(lck_grp_t *grp))
 {
 	thread_t thread = current_thread();
-	disable_preemption_for_thread(thread);
-	return hw_lock_to_internal(lock, timeout, thread LCK_GRP_ARG(grp));
+	lock_disable_preemption_for_thread(thread);
+	return (unsigned)hw_lock_to_internal(lock, thread, pol LCK_GRP_ARG(grp));
 }
 
 /*
@@ -725,13 +737,23 @@ int
  */
 unsigned
 int
-(hw_lock_to_nopreempt)(hw_lock_t lock, uint64_t timeout LCK_GRP_ARG(lck_grp_t *grp))
+(hw_lock_to_nopreempt)(hw_lock_t lock, hw_spin_policy_t pol LCK_GRP_ARG(lck_grp_t *grp))
 {
 	thread_t thread = current_thread();
-	if (__improbable(!preemption_disabled_for_thread(thread))) {
-		panic("Attempt to test no-preempt spinlock %p in preemptible context", lock);
+	__lck_require_preemption_disabled(lock, thread);
+	return (unsigned)hw_lock_to_internal(lock, thread, pol LCK_GRP_ARG(grp));
+}
+
+__result_use_check
+static inline unsigned int
+hw_lock_try_internal(hw_lock_t lock, thread_t thread LCK_GRP_ARG(lck_grp_t *grp))
+{
+	if (__probable(lock_cmpxchg(&lock->lock_data, 0,
+	    HW_LOCK_THREAD_TO_STATE(thread), acquire))) {
+		lck_grp_spin_update_held(lock LCK_GRP_ARG(grp));
+		return true;
 	}
-	return hw_lock_to_internal(lock, timeout, thread LCK_GRP_ARG(grp));
+	return false;
 }
 
 /*
@@ -739,37 +761,15 @@ int
  *
  *	returns with preemption disabled on success.
  */
-static inline unsigned int
-hw_lock_try_internal(hw_lock_t lock, thread_t thread LCK_GRP_ARG(lck_grp_t *grp))
-{
-	int             success = 0;
-
-#if     LOCK_PRETEST
-	if (ordered_load_hw(lock)) {
-		goto failed;
-	}
-#endif  // LOCK_PRETEST
-	success = os_atomic_cmpxchg(&lock->lock_data, 0,
-	    LCK_MTX_THREAD_TO_STATE(thread) | PLATFORM_LCK_ILOCK, acquire);
-
-#if     LOCK_PRETEST
-failed:
-#endif  // LOCK_PRETEST
-	if (success) {
-		lck_grp_spin_update_held(lock LCK_GRP_ARG(grp));
-	}
-	return success;
-}
-
 unsigned
 int
 (hw_lock_try)(hw_lock_t lock LCK_GRP_ARG(lck_grp_t *grp))
 {
 	thread_t thread = current_thread();
-	disable_preemption_for_thread(thread);
+	lock_disable_preemption_for_thread(thread);
 	unsigned int success = hw_lock_try_internal(lock, thread LCK_GRP_ARG(grp));
 	if (!success) {
-		enable_preemption();
+		lock_enable_preemption();
 	}
 	return success;
 }
@@ -779,11 +779,19 @@ int
 (hw_lock_try_nopreempt)(hw_lock_t lock LCK_GRP_ARG(lck_grp_t *grp))
 {
 	thread_t thread = current_thread();
-	if (__improbable(!preemption_disabled_for_thread(thread))) {
-		panic("Attempt to test no-preempt spinlock %p in preemptible context", lock);
-	}
+	__lck_require_preemption_disabled(lock, thread);
 	return hw_lock_try_internal(lock, thread LCK_GRP_ARG(grp));
 }
+
+#if DEBUG || DEVELOPMENT
+__abortlike
+static void
+__hw_lock_unlock_unowned_panic(hw_lock_t lock)
+{
+	panic("hwlock: thread %p is trying to lock %p recursively",
+	    current_thread(), lock);
+}
+#endif /* DEBUG || DEVELOPMENT */
 
 /*
  *	Routine: hw_lock_unlock
@@ -793,11 +801,14 @@ int
 static inline void
 hw_lock_unlock_internal(hw_lock_t lock)
 {
+#if DEBUG || DEVELOPMENT
+	if (HW_LOCK_STATE_TO_THREAD(lock->lock_data) != current_thread() &&
+	    LOCK_CORRECTNESS_PANIC()) {
+		__hw_lock_unlock_unowned_panic(lock);
+	}
+#endif /* DEBUG || DEVELOPMENT */
+
 	os_atomic_store(&lock->lock_data, 0, release);
-#if __arm__ || __arm64__
-	// ARM tests are only for open-source exclusion
-	set_event();
-#endif  // __arm__ || __arm64__
 #if     CONFIG_DTRACE
 	LOCKSTAT_RECORD(LS_LCK_SPIN_UNLOCK_RELEASE, lock, 0);
 #endif /* CONFIG_DTRACE */
@@ -807,16 +818,39 @@ void
 (hw_lock_unlock)(hw_lock_t lock)
 {
 	hw_lock_unlock_internal(lock);
-	enable_preemption();
+	lock_enable_preemption();
 }
 
 void
 (hw_lock_unlock_nopreempt)(hw_lock_t lock)
 {
-	if (__improbable(!preemption_disabled_for_thread(current_thread()))) {
-		panic("Attempt to release no-preempt spinlock %p in preemptible context", lock);
-	}
 	hw_lock_unlock_internal(lock);
+}
+
+void
+hw_lock_assert(__assert_only hw_lock_t lock, __assert_only unsigned int type)
+{
+#if MACH_ASSERT
+	thread_t thread, holder;
+
+	holder = HW_LOCK_STATE_TO_THREAD(lock->lock_data);
+	thread = current_thread();
+
+	if (type == LCK_ASSERT_OWNED) {
+		if (holder == 0) {
+			panic("Lock not owned %p = %p", lock, holder);
+		}
+		if (holder != thread) {
+			panic("Lock not owned by current thread %p = %p", lock, holder);
+		}
+	} else if (type == LCK_ASSERT_NOTOWNED) {
+		if (holder != THREAD_NULL && holder == thread) {
+			panic("Lock owned by current thread %p = %p", lock, holder);
+		}
+	} else {
+		panic("hw_lock_assert(): invalid arg (%u)", type);
+	}
+#endif /* MACH_ASSERT */
 }
 
 /*
@@ -829,110 +863,121 @@ hw_lock_held(hw_lock_t lock)
 	return ordered_load_hw(lock) != 0;
 }
 
-static unsigned int
-hw_lock_bit_to_contended(hw_lock_bit_t *lock, uint32_t mask, uint32_t timeout LCK_GRP_ARG(lck_grp_t *grp));
-
-static inline unsigned int
-hw_lock_bit_to_internal(hw_lock_bit_t *lock, unsigned int bit, uint32_t timeout LCK_GRP_ARG(lck_grp_t *grp))
+static hw_lock_status_t NOINLINE
+hw_lock_bit_to_contended(
+	hw_lock_bit_t          *lock,
+	uint32_t                bit,
+	hw_spin_policy_t        pol
+	LCK_GRP_ARG(lck_grp_t *grp))
 {
-	unsigned int success = 0;
-	uint32_t        mask = (1 << bit);
+	hw_spin_timeout_t to = hw_spin_compute_timeout(pol);
+	hw_spin_state_t   state = { };
+	hw_lock_status_t  rc = HW_LOCK_CONTENDED;
 
-	if (__improbable(!hw_atomic_test_and_set32(lock, mask, mask, memory_order_acquire, FALSE))) {
-		success = hw_lock_bit_to_contended(lock, mask, timeout LCK_GRP_ARG(grp));
-	} else {
-		success = 1;
-	}
-
-	if (success) {
-		lck_grp_spin_update_held(lock LCK_GRP_ARG(grp));
-	}
-
-	return success;
-}
-
-unsigned
-int
-(hw_lock_bit_to)(hw_lock_bit_t * lock, unsigned int bit, uint32_t timeout LCK_GRP_ARG(lck_grp_t *grp))
-{
-	_disable_preemption();
-	return hw_lock_bit_to_internal(lock, bit, timeout LCK_GRP_ARG(grp));
-}
-
-static unsigned int NOINLINE
-hw_lock_bit_to_contended(hw_lock_bit_t *lock, uint32_t mask, uint32_t timeout LCK_GRP_ARG(lck_grp_t *grp))
-{
-	uint64_t        end = 0;
-	int             i;
 #if CONFIG_DTRACE || LOCK_STATS
 	uint64_t begin = 0;
 	boolean_t stat_enabled = lck_grp_spin_spin_enabled(lock LCK_GRP_ARG(grp));
-#endif /* CONFIG_DTRACE || LOCK_STATS */
 
-#if LOCK_STATS || CONFIG_DTRACE
 	if (__improbable(stat_enabled)) {
 		begin = mach_absolute_time();
 	}
 #endif /* LOCK_STATS || CONFIG_DTRACE */
-	for (;;) {
-		for (i = 0; i < LOCK_SNOOP_SPINS; i++) {
-			// Always load-exclusive before wfe
-			// This grabs the monitor and wakes up on a release event
-			if (hw_atomic_test_and_set32(lock, mask, mask, memory_order_acquire, TRUE)) {
+
+	do {
+		for (int i = 0; i < LOCK_SNOOP_SPINS; i++) {
+			rc = hw_lock_trylock_bit(lock, bit, true);
+
+			if (rc == HW_LOCK_ACQUIRED) {
+				lck_grp_spin_update_held(lock LCK_GRP_ARG(grp));
 				goto end;
 			}
 		}
-		if (end == 0) {
-			end = ml_get_timebase() + timeout;
-		} else if (ml_get_timebase() >= end) {
-			break;
-		}
-	}
-	return 0;
+
+		assert(rc == HW_LOCK_CONTENDED);
+	} while (hw_spin_should_keep_spinning(lock, pol, to, &state));
+
 end:
 #if CONFIG_DTRACE || LOCK_STATS
 	if (__improbable(stat_enabled)) {
-		lck_grp_spin_update_spin(lock LCK_GRP_ARG(grp), mach_absolute_time() - begin);
+		lck_grp_spin_update_spin(lock LCK_GRP_ARG(grp),
+		    mach_absolute_time() - begin);
 	}
 	lck_grp_spin_update_miss(lock LCK_GRP_ARG(grp));
 #endif /* CONFIG_DTRACE || LCK_GRP_STAT */
-
-	return 1;
+	return rc;
 }
 
+__result_use_check
+static inline unsigned int
+hw_lock_bit_to_internal(
+	hw_lock_bit_t          *lock,
+	unsigned int            bit,
+	hw_spin_policy_t        pol
+	LCK_GRP_ARG(lck_grp_t *grp))
+{
+	if (__probable(hw_lock_trylock_bit(lock, bit, true))) {
+		lck_grp_spin_update_held(lock LCK_GRP_ARG(grp));
+		return HW_LOCK_ACQUIRED;
+	}
+
+	return (unsigned)hw_lock_bit_to_contended(lock, bit, pol LCK_GRP_ARG(grp));
+}
+
+/*
+ *	Routine: hw_lock_bit_to
+ *
+ *	Acquire bit lock, spinning until it becomes available or timeout.
+ *	Timeout is in mach_absolute_time ticks (TSC in Intel), return with
+ *	preemption disabled.
+ */
+unsigned
+int
+(hw_lock_bit_to)(
+	hw_lock_bit_t          * lock,
+	uint32_t                bit,
+	hw_spin_policy_t        pol
+	LCK_GRP_ARG(lck_grp_t *grp))
+{
+	_disable_preemption();
+	return hw_lock_bit_to_internal(lock, bit, pol LCK_GRP_ARG(grp));
+}
+
+/*
+ *	Routine: hw_lock_bit
+ *
+ *	Acquire bit lock, spinning until it becomes available,
+ *	return with preemption disabled.
+ */
 void
 (hw_lock_bit)(hw_lock_bit_t * lock, unsigned int bit LCK_GRP_ARG(lck_grp_t *grp))
 {
-	if (hw_lock_bit_to(lock, bit, LOCK_PANIC_TIMEOUT, LCK_GRP_PROBEARG(grp))) {
-		return;
-	}
-	panic("hw_lock_bit(): timed out (%p)", lock);
+	_disable_preemption();
+	(void)hw_lock_bit_to_internal(lock, bit, &hw_lock_bit_policy LCK_GRP_ARG(grp));
 }
 
+/*
+ *	Routine: hw_lock_bit_nopreempt
+ *
+ *	Acquire bit lock, spinning until it becomes available.
+ */
 void
 (hw_lock_bit_nopreempt)(hw_lock_bit_t * lock, unsigned int bit LCK_GRP_ARG(lck_grp_t *grp))
 {
-	if (__improbable(get_preemption_level() == 0)) {
-		panic("Attempt to take no-preempt bitlock %p in preemptible context", lock);
-	}
-	if (hw_lock_bit_to_internal(lock, bit, LOCK_PANIC_TIMEOUT LCK_GRP_ARG(grp))) {
-		return;
-	}
-	panic("hw_lock_bit_nopreempt(): timed out (%p)", lock);
+	__lck_require_preemption_disabled(lock, current_thread());
+	(void)hw_lock_bit_to_internal(lock, bit, &hw_lock_bit_policy LCK_GRP_ARG(grp));
 }
+
 
 unsigned
 int
 (hw_lock_bit_try)(hw_lock_bit_t * lock, unsigned int bit LCK_GRP_ARG(lck_grp_t *grp))
 {
-	uint32_t        mask = (1 << bit);
-	boolean_t       success = FALSE;
+	boolean_t success = false;
 
 	_disable_preemption();
-	// TODO: consider weak (non-looping) atomic test-and-set
-	success = hw_atomic_test_and_set32(lock, mask, mask, memory_order_acquire, FALSE);
+	success = hw_lock_trylock_bit(lock, bit, false);
 	if (!success) {
-		_enable_preemption();
+		lock_enable_preemption();
 	}
 
 	if (success) {
@@ -945,12 +990,7 @@ int
 static inline void
 hw_unlock_bit_internal(hw_lock_bit_t *lock, unsigned int bit)
 {
-	uint32_t        mask = (1 << bit);
-
-	os_atomic_andnot(lock, mask, release);
-#if __arm__
-	set_event();
-#endif
+	os_atomic_andnot(lock, 1u << bit, release);
 #if CONFIG_DTRACE
 	LOCKSTAT_RECORD(LS_LCK_SPIN_UNLOCK_RELEASE, lock, bit);
 #endif
@@ -966,17 +1006,18 @@ void
 hw_unlock_bit(hw_lock_bit_t * lock, unsigned int bit)
 {
 	hw_unlock_bit_internal(lock, bit);
-	_enable_preemption();
+	lock_enable_preemption();
 }
 
 void
 hw_unlock_bit_nopreempt(hw_lock_bit_t * lock, unsigned int bit)
 {
-	if (__improbable(get_preemption_level() == 0)) {
-		panic("Attempt to release no-preempt bitlock %p in preemptible context", lock);
-	}
+	__lck_require_preemption_disabled(lock, current_thread());
 	hw_unlock_bit_internal(lock, bit);
 }
+
+
+#pragma mark - lck_*_sleep
 
 /*
  * Routine:	lck_spin_sleep
@@ -992,7 +1033,7 @@ lck_spin_sleep_grp(
 	wait_result_t   res;
 
 	if ((lck_sleep_action & ~LCK_SLEEP_MASK) != 0) {
-		panic("Invalid lock sleep action %x\n", lck_sleep_action);
+		panic("Invalid lock sleep action %x", lck_sleep_action);
 	}
 
 	res = assert_wait(event, interruptible);
@@ -1033,7 +1074,7 @@ lck_spin_sleep_deadline(
 	wait_result_t   res;
 
 	if ((lck_sleep_action & ~LCK_SLEEP_MASK) != 0) {
-		panic("Invalid lock sleep action %x\n", lck_sleep_action);
+		panic("Invalid lock sleep action %x", lck_sleep_action);
 	}
 
 	res = assert_wait_deadline(event, interruptible, deadline);
@@ -1060,24 +1101,24 @@ lck_mtx_sleep(
 	event_t                 event,
 	wait_interrupt_t        interruptible)
 {
-	wait_result_t   res;
-	thread_t                thread = current_thread();
+	wait_result_t           res;
+	thread_pri_floor_t      token;
 
 	KERNEL_DEBUG(MACHDBG_CODE(DBG_MACH_LOCKS, LCK_MTX_SLEEP_CODE) | DBG_FUNC_START,
 	    VM_KERNEL_UNSLIDE_OR_PERM(lck), (int)lck_sleep_action, VM_KERNEL_UNSLIDE_OR_PERM(event), (int)interruptible, 0);
 
 	if ((lck_sleep_action & ~LCK_SLEEP_MASK) != 0) {
-		panic("Invalid lock sleep action %x\n", lck_sleep_action);
+		panic("Invalid lock sleep action %x", lck_sleep_action);
 	}
 
 	if (lck_sleep_action & LCK_SLEEP_PROMOTED_PRI) {
 		/*
-		 * We overload the RW lock promotion to give us a priority ceiling
+		 * We get a priority floor
 		 * during the time that this thread is asleep, so that when it
 		 * is re-awakened (and not yet contending on the mutex), it is
 		 * runnable at a reasonably high priority.
 		 */
-		thread->rwlock_count++;
+		token = thread_priority_floor_start();
 	}
 
 	res = assert_wait(event, interruptible);
@@ -1098,10 +1139,7 @@ lck_mtx_sleep(
 	}
 
 	if (lck_sleep_action & LCK_SLEEP_PROMOTED_PRI) {
-		if ((thread->rwlock_count-- == 1 /* field now 0 */) && (thread->sched_flags & TH_SFLAG_RW_PROMOTED)) {
-			/* sched_flags checked without lock, but will be rechecked while clearing */
-			lck_rw_clear_promotion(thread, unslide_for_kdebug(event));
-		}
+		thread_priority_floor_end(&token);
 	}
 
 	KERNEL_DEBUG(MACHDBG_CODE(DBG_MACH_LOCKS, LCK_MTX_SLEEP_CODE) | DBG_FUNC_END, (int)res, 0, 0, 0, 0);
@@ -1121,21 +1159,21 @@ lck_mtx_sleep_deadline(
 	wait_interrupt_t        interruptible,
 	uint64_t                deadline)
 {
-	wait_result_t   res;
-	thread_t                thread = current_thread();
+	wait_result_t           res;
+	thread_pri_floor_t      token;
 
 	KERNEL_DEBUG(MACHDBG_CODE(DBG_MACH_LOCKS, LCK_MTX_SLEEP_DEADLINE_CODE) | DBG_FUNC_START,
 	    VM_KERNEL_UNSLIDE_OR_PERM(lck), (int)lck_sleep_action, VM_KERNEL_UNSLIDE_OR_PERM(event), (int)interruptible, 0);
 
 	if ((lck_sleep_action & ~LCK_SLEEP_MASK) != 0) {
-		panic("Invalid lock sleep action %x\n", lck_sleep_action);
+		panic("Invalid lock sleep action %x", lck_sleep_action);
 	}
 
 	if (lck_sleep_action & LCK_SLEEP_PROMOTED_PRI) {
 		/*
 		 * See lck_mtx_sleep().
 		 */
-		thread->rwlock_count++;
+		token = thread_priority_floor_start();
 	}
 
 	res = assert_wait_deadline(event, interruptible, deadline);
@@ -1154,558 +1192,12 @@ lck_mtx_sleep_deadline(
 	}
 
 	if (lck_sleep_action & LCK_SLEEP_PROMOTED_PRI) {
-		if ((thread->rwlock_count-- == 1 /* field now 0 */) && (thread->sched_flags & TH_SFLAG_RW_PROMOTED)) {
-			/* sched_flags checked without lock, but will be rechecked while clearing */
-			lck_rw_clear_promotion(thread, unslide_for_kdebug(event));
-		}
+		thread_priority_floor_end(&token);
 	}
 
 	KERNEL_DEBUG(MACHDBG_CODE(DBG_MACH_LOCKS, LCK_MTX_SLEEP_DEADLINE_CODE) | DBG_FUNC_END, (int)res, 0, 0, 0, 0);
 
 	return res;
-}
-
-/*
- * Lock Boosting Invariants:
- *
- * The lock owner is always promoted to the max priority of all its waiters.
- * Max priority is capped at MAXPRI_PROMOTE.
- *
- * The last waiter is not given a promotion when it wakes up or acquires the lock.
- * When the last waiter is waking up, a new contender can always come in and
- * steal the lock without having to wait for the last waiter to make forward progress.
- */
-
-/*
- * Routine: lck_mtx_lock_wait
- *
- * Invoked in order to wait on contention.
- *
- * Called with the interlock locked and
- * returns it unlocked.
- *
- * Always aggressively sets the owning thread to promoted,
- * even if it's the same or higher priority
- * This prevents it from lowering its own priority while holding a lock
- *
- * TODO: Come up with a more efficient way to handle same-priority promotions
- *      <rdar://problem/30737670> ARM mutex contention logic could avoid taking the thread lock
- */
-void
-lck_mtx_lock_wait(
-	lck_mtx_t                       *lck,
-	thread_t                        holder,
-	struct turnstile                **ts)
-{
-	thread_t                thread = current_thread();
-	lck_mtx_t               *mutex;
-	__kdebug_only uintptr_t trace_lck = unslide_for_kdebug(lck);
-
-#if     CONFIG_DTRACE
-	uint64_t                sleep_start = 0;
-
-	if (lockstat_probemap[LS_LCK_MTX_LOCK_BLOCK] || lockstat_probemap[LS_LCK_MTX_EXT_LOCK_BLOCK]) {
-		sleep_start = mach_absolute_time();
-	}
-#endif
-
-	if (lck->lck_mtx_tag != LCK_MTX_TAG_INDIRECT) {
-		mutex = lck;
-	} else {
-		mutex = &lck->lck_mtx_ptr->lck_mtx;
-	}
-
-	KERNEL_DEBUG(MACHDBG_CODE(DBG_MACH_LOCKS, LCK_MTX_LCK_WAIT_CODE) | DBG_FUNC_START,
-	    trace_lck, (uintptr_t)thread_tid(thread), 0, 0, 0);
-
-	assert(thread->waiting_for_mutex == NULL);
-	thread->waiting_for_mutex = mutex;
-	mutex->lck_mtx_waiters++;
-
-	if (*ts == NULL) {
-		*ts = turnstile_prepare((uintptr_t)mutex, NULL, TURNSTILE_NULL, TURNSTILE_KERNEL_MUTEX);
-	}
-
-	struct turnstile *turnstile = *ts;
-	thread_set_pending_block_hint(thread, kThreadWaitKernelMutex);
-	turnstile_update_inheritor(turnstile, holder, (TURNSTILE_DELAYED_UPDATE | TURNSTILE_INHERITOR_THREAD));
-
-	waitq_assert_wait64(&turnstile->ts_waitq, CAST_EVENT64_T(LCK_MTX_EVENT(mutex)), THREAD_UNINT | THREAD_WAIT_NOREPORT_USER, TIMEOUT_WAIT_FOREVER);
-
-	lck_mtx_ilk_unlock(mutex);
-
-	turnstile_update_inheritor_complete(turnstile, TURNSTILE_INTERLOCK_NOT_HELD);
-
-	thread_block(THREAD_CONTINUE_NULL);
-
-	thread->waiting_for_mutex = NULL;
-
-	KERNEL_DEBUG(MACHDBG_CODE(DBG_MACH_LOCKS, LCK_MTX_LCK_WAIT_CODE) | DBG_FUNC_END, 0, 0, 0, 0, 0);
-#if     CONFIG_DTRACE
-	/*
-	 * Record the DTrace lockstat probe for blocking, block time
-	 * measured from when we were entered.
-	 */
-	if (sleep_start) {
-		if (lck->lck_mtx_tag != LCK_MTX_TAG_INDIRECT) {
-			LOCKSTAT_RECORD(LS_LCK_MTX_LOCK_BLOCK, lck,
-			    mach_absolute_time() - sleep_start);
-		} else {
-			LOCKSTAT_RECORD(LS_LCK_MTX_EXT_LOCK_BLOCK, lck,
-			    mach_absolute_time() - sleep_start);
-		}
-	}
-#endif
-}
-
-/*
- * Routine:     lck_mtx_lock_acquire
- *
- * Invoked on acquiring the mutex when there is
- * contention.
- *
- * Returns the current number of waiters.
- *
- * Called with the interlock locked.
- */
-int
-lck_mtx_lock_acquire(
-	lck_mtx_t               *lck,
-	struct turnstile        *ts)
-{
-	thread_t                thread = current_thread();
-	lck_mtx_t               *mutex;
-
-	if (lck->lck_mtx_tag != LCK_MTX_TAG_INDIRECT) {
-		mutex = lck;
-	} else {
-		mutex = &lck->lck_mtx_ptr->lck_mtx;
-	}
-
-	assert(thread->waiting_for_mutex == NULL);
-
-	if (mutex->lck_mtx_waiters > 0) {
-		if (ts == NULL) {
-			ts = turnstile_prepare((uintptr_t)mutex, NULL, TURNSTILE_NULL, TURNSTILE_KERNEL_MUTEX);
-		}
-
-		turnstile_update_inheritor(ts, thread, (TURNSTILE_IMMEDIATE_UPDATE | TURNSTILE_INHERITOR_THREAD));
-		turnstile_update_inheritor_complete(ts, TURNSTILE_INTERLOCK_HELD);
-	}
-
-	if (ts != NULL) {
-		turnstile_complete((uintptr_t)mutex, NULL, NULL, TURNSTILE_KERNEL_MUTEX);
-	}
-
-	return mutex->lck_mtx_waiters;
-}
-
-/*
- * Routine:     lck_mtx_unlock_wakeup
- *
- * Invoked on unlock when there is contention.
- *
- * Called with the interlock locked.
- *
- * NOTE: callers should call turnstile_clenup after
- * dropping the interlock.
- */
-boolean_t
-lck_mtx_unlock_wakeup(
-	lck_mtx_t                       *lck,
-	thread_t                        holder)
-{
-	thread_t                thread = current_thread();
-	lck_mtx_t               *mutex;
-	__kdebug_only uintptr_t trace_lck = unslide_for_kdebug(lck);
-	struct turnstile *ts;
-	kern_return_t did_wake;
-
-	if (lck->lck_mtx_tag != LCK_MTX_TAG_INDIRECT) {
-		mutex = lck;
-	} else {
-		mutex = &lck->lck_mtx_ptr->lck_mtx;
-	}
-
-	if (thread != holder) {
-		panic("lck_mtx_unlock_wakeup: mutex %p holder %p\n", mutex, holder);
-	}
-
-	KERNEL_DEBUG(MACHDBG_CODE(DBG_MACH_LOCKS, LCK_MTX_UNLCK_WAKEUP_CODE) | DBG_FUNC_START,
-	    trace_lck, (uintptr_t)thread_tid(thread), 0, 0, 0);
-
-	assert(mutex->lck_mtx_waiters > 0);
-	assert(thread->waiting_for_mutex == NULL);
-
-	ts = turnstile_prepare((uintptr_t)mutex, NULL, TURNSTILE_NULL, TURNSTILE_KERNEL_MUTEX);
-
-	if (mutex->lck_mtx_waiters > 1) {
-		/* WAITQ_PROMOTE_ON_WAKE will call turnstile_update_inheritor on the wokenup thread */
-		did_wake = waitq_wakeup64_one(&ts->ts_waitq, CAST_EVENT64_T(LCK_MTX_EVENT(mutex)), THREAD_AWAKENED, WAITQ_PROMOTE_ON_WAKE);
-	} else {
-		did_wake = waitq_wakeup64_one(&ts->ts_waitq, CAST_EVENT64_T(LCK_MTX_EVENT(mutex)), THREAD_AWAKENED, WAITQ_ALL_PRIORITIES);
-		turnstile_update_inheritor(ts, NULL, TURNSTILE_IMMEDIATE_UPDATE);
-	}
-	assert(did_wake == KERN_SUCCESS);
-
-	turnstile_update_inheritor_complete(ts, TURNSTILE_INTERLOCK_HELD);
-	turnstile_complete((uintptr_t)mutex, NULL, NULL, TURNSTILE_KERNEL_MUTEX);
-
-	mutex->lck_mtx_waiters--;
-
-	KERNEL_DEBUG(MACHDBG_CODE(DBG_MACH_LOCKS, LCK_MTX_UNLCK_WAKEUP_CODE) | DBG_FUNC_END, 0, 0, 0, 0, 0);
-
-	return mutex->lck_mtx_waiters > 0;
-}
-
-/*
- * Routine:     mutex_pause
- *
- * Called by former callers of simple_lock_pause().
- */
-#define MAX_COLLISION_COUNTS    32
-#define MAX_COLLISION   8
-
-unsigned int max_collision_count[MAX_COLLISION_COUNTS];
-
-uint32_t collision_backoffs[MAX_COLLISION] = {
-	10, 50, 100, 200, 400, 600, 800, 1000
-};
-
-
-void
-mutex_pause(uint32_t collisions)
-{
-	wait_result_t wait_result;
-	uint32_t        back_off;
-
-	if (collisions >= MAX_COLLISION_COUNTS) {
-		collisions = MAX_COLLISION_COUNTS - 1;
-	}
-	max_collision_count[collisions]++;
-
-	if (collisions >= MAX_COLLISION) {
-		collisions = MAX_COLLISION - 1;
-	}
-	back_off = collision_backoffs[collisions];
-
-	wait_result = assert_wait_timeout((event_t)mutex_pause, THREAD_UNINT, back_off, NSEC_PER_USEC);
-	assert(wait_result == THREAD_WAITING);
-
-	wait_result = thread_block(THREAD_CONTINUE_NULL);
-	assert(wait_result == THREAD_TIMED_OUT);
-}
-
-
-unsigned int mutex_yield_wait = 0;
-unsigned int mutex_yield_no_wait = 0;
-
-void
-lck_mtx_yield(
-	lck_mtx_t   *lck)
-{
-	int     waiters;
-
-#if DEBUG
-	lck_mtx_assert(lck, LCK_MTX_ASSERT_OWNED);
-#endif /* DEBUG */
-
-	if (lck->lck_mtx_tag == LCK_MTX_TAG_INDIRECT) {
-		waiters = lck->lck_mtx_ptr->lck_mtx.lck_mtx_waiters;
-	} else {
-		waiters = lck->lck_mtx_waiters;
-	}
-
-	if (!waiters) {
-		mutex_yield_no_wait++;
-	} else {
-		mutex_yield_wait++;
-		lck_mtx_unlock(lck);
-		mutex_pause(0);
-		lck_mtx_lock(lck);
-	}
-}
-
-
-/*
- * Routine:	lck_rw_sleep
- */
-wait_result_t
-lck_rw_sleep(
-	lck_rw_t                *lck,
-	lck_sleep_action_t      lck_sleep_action,
-	event_t                 event,
-	wait_interrupt_t        interruptible)
-{
-	wait_result_t   res;
-	lck_rw_type_t   lck_rw_type;
-	thread_t                thread = current_thread();
-
-	if ((lck_sleep_action & ~LCK_SLEEP_MASK) != 0) {
-		panic("Invalid lock sleep action %x\n", lck_sleep_action);
-	}
-
-	if (lck_sleep_action & LCK_SLEEP_PROMOTED_PRI) {
-		/*
-		 * Although we are dropping the RW lock, the intent in most cases
-		 * is that this thread remains as an observer, since it may hold
-		 * some secondary resource, but must yield to avoid deadlock. In
-		 * this situation, make sure that the thread is boosted to the
-		 * RW lock ceiling while blocked, so that it can re-acquire the
-		 * RW lock at that priority.
-		 */
-		thread->rwlock_count++;
-	}
-
-	res = assert_wait(event, interruptible);
-	if (res == THREAD_WAITING) {
-		lck_rw_type = lck_rw_done(lck);
-		res = thread_block(THREAD_CONTINUE_NULL);
-		if (!(lck_sleep_action & LCK_SLEEP_UNLOCK)) {
-			if (!(lck_sleep_action & (LCK_SLEEP_SHARED | LCK_SLEEP_EXCLUSIVE))) {
-				lck_rw_lock(lck, lck_rw_type);
-			} else if (lck_sleep_action & LCK_SLEEP_EXCLUSIVE) {
-				lck_rw_lock_exclusive(lck);
-			} else {
-				lck_rw_lock_shared(lck);
-			}
-		}
-	} else if (lck_sleep_action & LCK_SLEEP_UNLOCK) {
-		(void)lck_rw_done(lck);
-	}
-
-	if (lck_sleep_action & LCK_SLEEP_PROMOTED_PRI) {
-		if ((thread->rwlock_count-- == 1 /* field now 0 */) && (thread->sched_flags & TH_SFLAG_RW_PROMOTED)) {
-			/* sched_flags checked without lock, but will be rechecked while clearing */
-
-			/* Only if the caller wanted the lck_rw_t returned unlocked should we drop to 0 */
-			assert(lck_sleep_action & LCK_SLEEP_UNLOCK);
-
-			lck_rw_clear_promotion(thread, unslide_for_kdebug(event));
-		}
-	}
-
-	return res;
-}
-
-
-/*
- * Routine:	lck_rw_sleep_deadline
- */
-wait_result_t
-lck_rw_sleep_deadline(
-	lck_rw_t                *lck,
-	lck_sleep_action_t      lck_sleep_action,
-	event_t                 event,
-	wait_interrupt_t        interruptible,
-	uint64_t                deadline)
-{
-	wait_result_t   res;
-	lck_rw_type_t   lck_rw_type;
-	thread_t                thread = current_thread();
-
-	if ((lck_sleep_action & ~LCK_SLEEP_MASK) != 0) {
-		panic("Invalid lock sleep action %x\n", lck_sleep_action);
-	}
-
-	if (lck_sleep_action & LCK_SLEEP_PROMOTED_PRI) {
-		thread->rwlock_count++;
-	}
-
-	res = assert_wait_deadline(event, interruptible, deadline);
-	if (res == THREAD_WAITING) {
-		lck_rw_type = lck_rw_done(lck);
-		res = thread_block(THREAD_CONTINUE_NULL);
-		if (!(lck_sleep_action & LCK_SLEEP_UNLOCK)) {
-			if (!(lck_sleep_action & (LCK_SLEEP_SHARED | LCK_SLEEP_EXCLUSIVE))) {
-				lck_rw_lock(lck, lck_rw_type);
-			} else if (lck_sleep_action & LCK_SLEEP_EXCLUSIVE) {
-				lck_rw_lock_exclusive(lck);
-			} else {
-				lck_rw_lock_shared(lck);
-			}
-		}
-	} else if (lck_sleep_action & LCK_SLEEP_UNLOCK) {
-		(void)lck_rw_done(lck);
-	}
-
-	if (lck_sleep_action & LCK_SLEEP_PROMOTED_PRI) {
-		if ((thread->rwlock_count-- == 1 /* field now 0 */) && (thread->sched_flags & TH_SFLAG_RW_PROMOTED)) {
-			/* sched_flags checked without lock, but will be rechecked while clearing */
-
-			/* Only if the caller wanted the lck_rw_t returned unlocked should we drop to 0 */
-			assert(lck_sleep_action & LCK_SLEEP_UNLOCK);
-
-			lck_rw_clear_promotion(thread, unslide_for_kdebug(event));
-		}
-	}
-
-	return res;
-}
-
-/*
- * Reader-writer lock promotion
- *
- * We support a limited form of reader-writer
- * lock promotion whose effects are:
- *
- *   * Qualifying threads have decay disabled
- *   * Scheduler priority is reset to a floor of
- *     of their statically assigned priority
- *     or MINPRI_RWLOCK
- *
- * The rationale is that lck_rw_ts do not have
- * a single owner, so we cannot apply a directed
- * priority boost from all waiting threads
- * to all holding threads without maintaining
- * lists of all shared owners and all waiting
- * threads for every lock.
- *
- * Instead (and to preserve the uncontended fast-
- * path), acquiring (or attempting to acquire)
- * a RW lock in shared or exclusive lock increments
- * a per-thread counter. Only if that thread stops
- * making forward progress (for instance blocking
- * on a mutex, or being preempted) do we consult
- * the counter and apply the priority floor.
- * When the thread becomes runnable again (or in
- * the case of preemption it never stopped being
- * runnable), it has the priority boost and should
- * be in a good position to run on the CPU and
- * release all RW locks (at which point the priority
- * boost is cleared).
- *
- * Care must be taken to ensure that priority
- * boosts are not retained indefinitely, since unlike
- * mutex priority boosts (where the boost is tied
- * to the mutex lifecycle), the boost is tied
- * to the thread and independent of any particular
- * lck_rw_t. Assertions are in place on return
- * to userspace so that the boost is not held
- * indefinitely.
- *
- * The routines that increment/decrement the
- * per-thread counter should err on the side of
- * incrementing any time a preemption is possible
- * and the lock would be visible to the rest of the
- * system as held (so it should be incremented before
- * interlocks are dropped/preemption is enabled, or
- * before a CAS is executed to acquire the lock).
- *
- */
-
-/*
- * lck_rw_clear_promotion: Undo priority promotions when the last RW
- * lock is released by a thread (if a promotion was active)
- */
-void
-lck_rw_clear_promotion(thread_t thread, uintptr_t trace_obj)
-{
-	assert(thread->rwlock_count == 0);
-
-	/* Cancel any promotions if the thread had actually blocked while holding a RW lock */
-	spl_t s = splsched();
-	thread_lock(thread);
-
-	if (thread->sched_flags & TH_SFLAG_RW_PROMOTED) {
-		sched_thread_unpromote_reason(thread, TH_SFLAG_RW_PROMOTED, trace_obj);
-	}
-
-	thread_unlock(thread);
-	splx(s);
-}
-
-/*
- * Callout from context switch if the thread goes
- * off core with a positive rwlock_count
- *
- * Called at splsched with the thread locked
- */
-void
-lck_rw_set_promotion_locked(thread_t thread)
-{
-	if (LcksOpts & disLkRWPrio) {
-		return;
-	}
-
-	assert(thread->rwlock_count > 0);
-
-	if (!(thread->sched_flags & TH_SFLAG_RW_PROMOTED)) {
-		sched_thread_promote_reason(thread, TH_SFLAG_RW_PROMOTED, 0);
-	}
-}
-
-kern_return_t
-host_lockgroup_info(
-	host_t                                  host,
-	lockgroup_info_array_t  *lockgroup_infop,
-	mach_msg_type_number_t  *lockgroup_infoCntp)
-{
-	lockgroup_info_t        *lockgroup_info_base;
-	lockgroup_info_t        *lockgroup_info;
-	vm_offset_t                     lockgroup_info_addr;
-	vm_size_t                       lockgroup_info_size;
-	vm_size_t                       lockgroup_info_vmsize;
-	lck_grp_t                       *lck_grp;
-	unsigned int            i;
-	vm_map_copy_t           copy;
-	kern_return_t           kr;
-
-	if (host == HOST_NULL) {
-		return KERN_INVALID_HOST;
-	}
-
-	lck_mtx_lock(&lck_grp_lock);
-
-	lockgroup_info_size = lck_grp_cnt * sizeof(*lockgroup_info);
-	lockgroup_info_vmsize = round_page(lockgroup_info_size);
-	kr = kmem_alloc_pageable(ipc_kernel_map,
-	    &lockgroup_info_addr, lockgroup_info_vmsize, VM_KERN_MEMORY_IPC);
-	if (kr != KERN_SUCCESS) {
-		lck_mtx_unlock(&lck_grp_lock);
-		return kr;
-	}
-
-	lockgroup_info_base = (lockgroup_info_t *) lockgroup_info_addr;
-	lck_grp = (lck_grp_t *)queue_first(&lck_grp_queue);
-	lockgroup_info = lockgroup_info_base;
-
-	for (i = 0; i < lck_grp_cnt; i++) {
-		lockgroup_info->lock_spin_cnt = lck_grp->lck_grp_spincnt;
-		lockgroup_info->lock_rw_cnt = lck_grp->lck_grp_rwcnt;
-		lockgroup_info->lock_mtx_cnt = lck_grp->lck_grp_mtxcnt;
-
-#if LOCK_STATS
-		lockgroup_info->lock_spin_held_cnt = lck_grp->lck_grp_stats.lgss_spin_held.lgs_count;
-		lockgroup_info->lock_spin_miss_cnt = lck_grp->lck_grp_stats.lgss_spin_miss.lgs_count;
-#endif /* LOCK_STATS */
-
-		// Historically on x86, held was used for "direct wait" and util for "held"
-		lockgroup_info->lock_mtx_util_cnt = lck_grp->lck_grp_stats.lgss_mtx_held.lgs_count;
-		lockgroup_info->lock_mtx_held_cnt = lck_grp->lck_grp_stats.lgss_mtx_direct_wait.lgs_count;
-		lockgroup_info->lock_mtx_miss_cnt = lck_grp->lck_grp_stats.lgss_mtx_miss.lgs_count;
-		lockgroup_info->lock_mtx_wait_cnt = lck_grp->lck_grp_stats.lgss_mtx_wait.lgs_count;
-
-		(void) strncpy(lockgroup_info->lockgroup_name, lck_grp->lck_grp_name, LOCKGROUP_MAX_NAME);
-
-		lck_grp = (lck_grp_t *)(queue_next((queue_entry_t)(lck_grp)));
-		lockgroup_info++;
-	}
-
-	*lockgroup_infoCntp = lck_grp_cnt;
-	lck_mtx_unlock(&lck_grp_lock);
-
-	if (lockgroup_info_size != lockgroup_info_vmsize) {
-		bzero((char *)lockgroup_info, lockgroup_info_vmsize - lockgroup_info_size);
-	}
-
-	kr = vm_map_copyin(ipc_kernel_map, (vm_map_address_t)lockgroup_info_addr,
-	    (vm_map_size_t)lockgroup_info_size, TRUE, &copy);
-	assert(kr == KERN_SUCCESS);
-
-	*lockgroup_infop = (lockgroup_info_t *) copy;
-
-	return KERN_SUCCESS;
 }
 
 /*
@@ -1715,7 +1207,7 @@ host_lockgroup_info(
  * the latest thread specified as inheritor.
  *
  * The inheritor management is delegated to the caller, the caller needs to store a thread identifier to provide to this functions to specified upon whom
- * direct the push. The inheritor cannot run in user space while holding a push from an event. Therefore is the caller responsibility to call a
+ * direct the push. The inheritor cannot return to user space or exit while holding a push from an event. Therefore is the caller responsibility to call a
  * wakeup_with_inheritor from inheritor before running in userspace or specify another inheritor before letting the old inheritor run in userspace.
  *
  * sleep_with_inheritor requires to hold a locking primitive while invoked, but wakeup_with_inheritor and change_sleep_inheritor don't require it.
@@ -1736,13 +1228,18 @@ host_lockgroup_info(
  * sleep_with_inheritor_turnstile to perform the handoff with the bucket spinlock.
  */
 
-kern_return_t
-wakeup_with_inheritor_and_turnstile_type(event_t event, turnstile_type_t type, wait_result_t result, bool wake_one, lck_wake_action_t action, thread_t *thread_wokenup)
+static kern_return_t
+wakeup_with_inheritor_and_turnstile(
+	event_t                 event,
+	wait_result_t           result,
+	bool                    wake_one,
+	lck_wake_action_t       action,
+	thread_t               *thread_wokenup)
 {
+	turnstile_type_t type = TURNSTILE_SLEEP_INHERITOR;
 	uint32_t index;
 	struct turnstile *ts = NULL;
 	kern_return_t ret = KERN_NOT_WAITING;
-	int priority;
 	thread_t wokeup;
 
 	/*
@@ -1750,21 +1247,23 @@ wakeup_with_inheritor_and_turnstile_type(event_t event, turnstile_type_t type, w
 	 */
 	turnstile_hash_bucket_lock((uintptr_t)event, &index, type);
 
-	ts = turnstile_prepare((uintptr_t)event, NULL, TURNSTILE_NULL, type);
+	ts = turnstile_prepare_hash((uintptr_t)event, type);
 
 	if (wake_one) {
+		waitq_wakeup_flags_t flags = WAITQ_WAKEUP_DEFAULT;
+
 		if (action == LCK_WAKE_DEFAULT) {
-			priority = WAITQ_PROMOTE_ON_WAKE;
+			flags = WAITQ_UPDATE_INHERITOR;
 		} else {
 			assert(action == LCK_WAKE_DO_NOT_TRANSFER_PUSH);
-			priority = WAITQ_ALL_PRIORITIES;
 		}
 
 		/*
-		 * WAITQ_PROMOTE_ON_WAKE will call turnstile_update_inheritor
+		 * WAITQ_UPDATE_INHERITOR will call turnstile_update_inheritor
 		 * if it finds a thread
 		 */
-		wokeup = waitq_wakeup64_identify(&ts->ts_waitq, CAST_EVENT64_T(event), result, priority);
+		wokeup = waitq_wakeup64_identify(&ts->ts_waitq,
+		    CAST_EVENT64_T(event), result, flags);
 		if (wokeup != NULL) {
 			if (thread_wokenup != NULL) {
 				*thread_wokenup = wokeup;
@@ -1783,8 +1282,8 @@ wakeup_with_inheritor_and_turnstile_type(event_t event, turnstile_type_t type, w
 			ret = KERN_NOT_WAITING;
 		}
 	} else {
-		ret = waitq_wakeup64_all(&ts->ts_waitq, CAST_EVENT64_T(event), result, WAITQ_ALL_PRIORITIES);
-		turnstile_update_inheritor(ts, TURNSTILE_INHERITOR_NULL, TURNSTILE_IMMEDIATE_UPDATE);
+		ret = waitq_wakeup64_all(&ts->ts_waitq, CAST_EVENT64_T(event),
+		    result, WAITQ_UPDATE_INHERITOR);
 	}
 
 	/*
@@ -1811,7 +1310,7 @@ wakeup_with_inheritor_and_turnstile_type(event_t event, turnstile_type_t type, w
 	turnstile_hash_bucket_lock((uintptr_t)NULL, &index, type);
 
 complete:
-	turnstile_complete((uintptr_t)event, NULL, NULL, type);
+	turnstile_complete_hash((uintptr_t)event, type);
 
 	turnstile_hash_bucket_unlock((uintptr_t)NULL, &index, type, 0);
 
@@ -1821,14 +1320,15 @@ complete:
 }
 
 static wait_result_t
-sleep_with_inheritor_and_turnstile_type(event_t event,
-    thread_t inheritor,
-    wait_interrupt_t interruptible,
-    uint64_t deadline,
-    turnstile_type_t type,
-    void (^primitive_lock)(void),
-    void (^primitive_unlock)(void))
+sleep_with_inheritor_and_turnstile(
+	event_t                 event,
+	thread_t                inheritor,
+	wait_interrupt_t        interruptible,
+	uint64_t                deadline,
+	void                  (^primitive_lock)(void),
+	void                  (^primitive_unlock)(void))
 {
+	turnstile_type_t type = TURNSTILE_SLEEP_INHERITOR;
 	wait_result_t ret;
 	uint32_t index;
 	struct turnstile *ts = NULL;
@@ -1841,7 +1341,7 @@ sleep_with_inheritor_and_turnstile_type(event_t event,
 
 	primitive_unlock();
 
-	ts = turnstile_prepare((uintptr_t)event, NULL, TURNSTILE_NULL, type);
+	ts = turnstile_prepare_hash((uintptr_t)event, type);
 
 	thread_set_pending_block_hint(current_thread(), kThreadWaitSleepWithInheritor);
 	/*
@@ -1865,7 +1365,7 @@ sleep_with_inheritor_and_turnstile_type(event_t event,
 
 	turnstile_hash_bucket_lock((uintptr_t)NULL, &index, type);
 
-	turnstile_complete((uintptr_t)event, NULL, NULL, type);
+	turnstile_complete_hash((uintptr_t)event, type);
 
 	turnstile_hash_bucket_unlock((uintptr_t)NULL, &index, type, 0);
 
@@ -1876,20 +1376,39 @@ sleep_with_inheritor_and_turnstile_type(event_t event,
 	return ret;
 }
 
+/*
+ * change_sleep_inheritor is independent from the locking primitive.
+ */
+
+/*
+ * Name: change_sleep_inheritor
+ *
+ * Description: Redirect the push of the waiting threads of event to the new inheritor specified.
+ *
+ * Args:
+ *   Arg1: event to redirect the push.
+ *   Arg2: new inheritor for event.
+ *
+ * Returns: KERN_NOT_WAITING if no threads were waiting, KERN_SUCCESS otherwise.
+ *
+ * Conditions: In case of success, the new inheritor cannot return to user space or exit until another inheritor is specified for the event or a
+ *             wakeup for the event is called.
+ *             NOTE: this cannot be called from interrupt context.
+ */
 kern_return_t
-change_sleep_inheritor_and_turnstile_type(event_t event,
-    thread_t inheritor,
-    turnstile_type_t type)
+change_sleep_inheritor(event_t event, thread_t inheritor)
 {
 	uint32_t index;
 	struct turnstile *ts = NULL;
 	kern_return_t ret =  KERN_SUCCESS;
+	turnstile_type_t type = TURNSTILE_SLEEP_INHERITOR;
+
 	/*
 	 * the hash bucket spinlock is used as turnstile interlock
 	 */
 	turnstile_hash_bucket_lock((uintptr_t)event, &index, type);
 
-	ts = turnstile_prepare((uintptr_t)event, NULL, TURNSTILE_NULL, type);
+	ts = turnstile_prepare_hash((uintptr_t)event, type);
 
 	if (!turnstile_has_waiters(ts)) {
 		ret = KERN_NOT_WAITING;
@@ -1909,7 +1428,7 @@ change_sleep_inheritor_and_turnstile_type(event_t event,
 
 	turnstile_hash_bucket_lock((uintptr_t)NULL, &index, type);
 
-	turnstile_complete((uintptr_t)event, NULL, NULL, type);
+	turnstile_complete_hash((uintptr_t)event, type);
 
 	turnstile_hash_bucket_unlock((uintptr_t)NULL, &index, type, 0);
 
@@ -1918,75 +1437,6 @@ change_sleep_inheritor_and_turnstile_type(event_t event,
 	return ret;
 }
 
-typedef void (^void_block_void)(void);
-
-/*
- * sleep_with_inheritor functions with lck_mtx_t as locking primitive.
- */
-
-wait_result_t
-lck_mtx_sleep_with_inheritor_and_turnstile_type(lck_mtx_t *lock, lck_sleep_action_t lck_sleep_action, event_t event, thread_t inheritor, wait_interrupt_t interruptible, uint64_t deadline, turnstile_type_t type)
-{
-	LCK_MTX_ASSERT(lock, LCK_MTX_ASSERT_OWNED);
-
-	if (lck_sleep_action & LCK_SLEEP_UNLOCK) {
-		return sleep_with_inheritor_and_turnstile_type(event,
-		           inheritor,
-		           interruptible,
-		           deadline,
-		           type,
-		           ^{;},
-		           ^{lck_mtx_unlock(lock);});
-	} else if (lck_sleep_action & LCK_SLEEP_SPIN) {
-		return sleep_with_inheritor_and_turnstile_type(event,
-		           inheritor,
-		           interruptible,
-		           deadline,
-		           type,
-		           ^{lck_mtx_lock_spin(lock);},
-		           ^{lck_mtx_unlock(lock);});
-	} else if (lck_sleep_action & LCK_SLEEP_SPIN_ALWAYS) {
-		return sleep_with_inheritor_and_turnstile_type(event,
-		           inheritor,
-		           interruptible,
-		           deadline,
-		           type,
-		           ^{lck_mtx_lock_spin_always(lock);},
-		           ^{lck_mtx_unlock(lock);});
-	} else {
-		return sleep_with_inheritor_and_turnstile_type(event,
-		           inheritor,
-		           interruptible,
-		           deadline,
-		           type,
-		           ^{lck_mtx_lock(lock);},
-		           ^{lck_mtx_unlock(lock);});
-	}
-}
-
-/*
- * Name: lck_spin_sleep_with_inheritor
- *
- * Description: deschedule the current thread and wait on the waitq associated with event to be woken up.
- *              While waiting, the sched priority of the waiting thread will contribute to the push of the event that will
- *              be directed to the inheritor specified.
- *              An interruptible mode and deadline can be specified to return earlier from the wait.
- *
- * Args:
- *   Arg1: lck_spin_t lock used to protect the sleep. The lock will be dropped while sleeping and reaquired before returning according to the sleep action specified.
- *   Arg2: sleep action. LCK_SLEEP_DEFAULT, LCK_SLEEP_UNLOCK.
- *   Arg3: event to wait on.
- *   Arg4: thread to propagate the event push to.
- *   Arg5: interruptible flag for wait.
- *   Arg6: deadline for wait.
- *
- * Conditions: Lock must be held. Returns with the lock held according to the sleep action specified.
- *             Lock will be dropped while waiting.
- *             The inheritor specified cannot run in user space until another inheritor is specified for the event or a
- *             wakeup for the event is called.
- *
- * Returns: result of the wait.
- */
 wait_result_t
 lck_spin_sleep_with_inheritor(
 	lck_spin_t *lock,
@@ -1997,43 +1447,98 @@ lck_spin_sleep_with_inheritor(
 	uint64_t deadline)
 {
 	if (lck_sleep_action & LCK_SLEEP_UNLOCK) {
-		return sleep_with_inheritor_and_turnstile_type(event, inheritor,
-		           interruptible, deadline, TURNSTILE_SLEEP_INHERITOR,
+		return sleep_with_inheritor_and_turnstile(event, inheritor,
+		           interruptible, deadline,
 		           ^{}, ^{ lck_spin_unlock(lock); });
 	} else {
-		return sleep_with_inheritor_and_turnstile_type(event, inheritor,
-		           interruptible, deadline, TURNSTILE_SLEEP_INHERITOR,
+		return sleep_with_inheritor_and_turnstile(event, inheritor,
+		           interruptible, deadline,
 		           ^{ lck_spin_lock(lock); }, ^{ lck_spin_unlock(lock); });
 	}
 }
 
-/*
- * Name: lck_mtx_sleep_with_inheritor
- *
- * Description: deschedule the current thread and wait on the waitq associated with event to be woken up.
- *              While waiting, the sched priority of the waiting thread will contribute to the push of the event that will
- *              be directed to the inheritor specified.
- *              An interruptible mode and deadline can be specified to return earlier from the wait.
- *
- * Args:
- *   Arg1: lck_mtx_t lock used to protect the sleep. The lock will be dropped while sleeping and reaquired before returning according to the sleep action specified.
- *   Arg2: sleep action. LCK_SLEEP_DEFAULT, LCK_SLEEP_UNLOCK, LCK_SLEEP_SPIN, LCK_SLEEP_SPIN_ALWAYS.
- *   Arg3: event to wait on.
- *   Arg4: thread to propagate the event push to.
- *   Arg5: interruptible flag for wait.
- *   Arg6: deadline for wait.
- *
- * Conditions: Lock must be held. Returns with the lock held according to the sleep action specified.
- *             Lock will be dropped while waiting.
- *             The inheritor specified cannot run in user space until another inheritor is specified for the event or a
- *             wakeup for the event is called.
- *
- * Returns: result of the wait.
- */
 wait_result_t
-lck_mtx_sleep_with_inheritor(lck_mtx_t *lock, lck_sleep_action_t lck_sleep_action, event_t event, thread_t inheritor, wait_interrupt_t interruptible, uint64_t deadline)
+hw_lck_ticket_sleep_with_inheritor(
+	hw_lck_ticket_t *lock,
+	lck_grp_t *grp __unused,
+	lck_sleep_action_t lck_sleep_action,
+	event_t event,
+	thread_t inheritor,
+	wait_interrupt_t interruptible,
+	uint64_t deadline)
 {
-	return lck_mtx_sleep_with_inheritor_and_turnstile_type(lock, lck_sleep_action, event, inheritor, interruptible, deadline, TURNSTILE_SLEEP_INHERITOR);
+	if (lck_sleep_action & LCK_SLEEP_UNLOCK) {
+		return sleep_with_inheritor_and_turnstile(event, inheritor,
+		           interruptible, deadline,
+		           ^{}, ^{ hw_lck_ticket_unlock(lock); });
+	} else {
+		return sleep_with_inheritor_and_turnstile(event, inheritor,
+		           interruptible, deadline,
+		           ^{ hw_lck_ticket_lock(lock, grp); }, ^{ hw_lck_ticket_unlock(lock); });
+	}
+}
+
+wait_result_t
+lck_ticket_sleep_with_inheritor(
+	lck_ticket_t *lock,
+	lck_grp_t *grp,
+	lck_sleep_action_t lck_sleep_action,
+	event_t event,
+	thread_t inheritor,
+	wait_interrupt_t interruptible,
+	uint64_t deadline)
+{
+	if (lck_sleep_action & LCK_SLEEP_UNLOCK) {
+		return sleep_with_inheritor_and_turnstile(event, inheritor,
+		           interruptible, deadline,
+		           ^{}, ^{ lck_ticket_unlock(lock); });
+	} else {
+		return sleep_with_inheritor_and_turnstile(event, inheritor,
+		           interruptible, deadline,
+		           ^{ lck_ticket_lock(lock, grp); }, ^{ lck_ticket_unlock(lock); });
+	}
+}
+
+wait_result_t
+lck_mtx_sleep_with_inheritor(
+	lck_mtx_t              *lock,
+	lck_sleep_action_t      lck_sleep_action,
+	event_t                 event,
+	thread_t                inheritor,
+	wait_interrupt_t        interruptible,
+	uint64_t                deadline)
+{
+	LCK_MTX_ASSERT(lock, LCK_MTX_ASSERT_OWNED);
+
+	if (lck_sleep_action & LCK_SLEEP_UNLOCK) {
+		return sleep_with_inheritor_and_turnstile(event,
+		           inheritor,
+		           interruptible,
+		           deadline,
+		           ^{;},
+		           ^{lck_mtx_unlock(lock);});
+	} else if (lck_sleep_action & LCK_SLEEP_SPIN) {
+		return sleep_with_inheritor_and_turnstile(event,
+		           inheritor,
+		           interruptible,
+		           deadline,
+		           ^{lck_mtx_lock_spin(lock);},
+		           ^{lck_mtx_unlock(lock);});
+	} else if (lck_sleep_action & LCK_SLEEP_SPIN_ALWAYS) {
+		return sleep_with_inheritor_and_turnstile(event,
+		           inheritor,
+		           interruptible,
+		           deadline,
+		           ^{lck_mtx_lock_spin_always(lock);},
+		           ^{lck_mtx_unlock(lock);});
+	} else {
+		return sleep_with_inheritor_and_turnstile(event,
+		           inheritor,
+		           interruptible,
+		           deadline,
+		           ^{lck_mtx_lock(lock);},
+		           ^{lck_mtx_unlock(lock);});
+	}
 }
 
 /*
@@ -2041,167 +1546,78 @@ lck_mtx_sleep_with_inheritor(lck_mtx_t *lock, lck_sleep_action_t lck_sleep_actio
  */
 
 wait_result_t
-lck_rw_sleep_with_inheritor_and_turnstile_type(lck_rw_t *lock, lck_sleep_action_t lck_sleep_action, event_t event, thread_t inheritor, wait_interrupt_t interruptible, uint64_t deadline, turnstile_type_t type)
+lck_rw_sleep_with_inheritor(
+	lck_rw_t               *lock,
+	lck_sleep_action_t      lck_sleep_action,
+	event_t                 event,
+	thread_t                inheritor,
+	wait_interrupt_t        interruptible,
+	uint64_t                deadline)
 {
 	__block lck_rw_type_t lck_rw_type = LCK_RW_TYPE_EXCLUSIVE;
 
 	LCK_RW_ASSERT(lock, LCK_RW_ASSERT_HELD);
 
 	if (lck_sleep_action & LCK_SLEEP_UNLOCK) {
-		return sleep_with_inheritor_and_turnstile_type(event,
+		return sleep_with_inheritor_and_turnstile(event,
 		           inheritor,
 		           interruptible,
 		           deadline,
-		           type,
 		           ^{;},
 		           ^{lck_rw_type = lck_rw_done(lock);});
 	} else if (!(lck_sleep_action & (LCK_SLEEP_SHARED | LCK_SLEEP_EXCLUSIVE))) {
-		return sleep_with_inheritor_and_turnstile_type(event,
+		return sleep_with_inheritor_and_turnstile(event,
 		           inheritor,
 		           interruptible,
 		           deadline,
-		           type,
 		           ^{lck_rw_lock(lock, lck_rw_type);},
 		           ^{lck_rw_type = lck_rw_done(lock);});
 	} else if (lck_sleep_action & LCK_SLEEP_EXCLUSIVE) {
-		return sleep_with_inheritor_and_turnstile_type(event,
+		return sleep_with_inheritor_and_turnstile(event,
 		           inheritor,
 		           interruptible,
 		           deadline,
-		           type,
 		           ^{lck_rw_lock_exclusive(lock);},
 		           ^{lck_rw_type = lck_rw_done(lock);});
 	} else {
-		return sleep_with_inheritor_and_turnstile_type(event,
+		return sleep_with_inheritor_and_turnstile(event,
 		           inheritor,
 		           interruptible,
 		           deadline,
-		           type,
 		           ^{lck_rw_lock_shared(lock);},
 		           ^{lck_rw_type = lck_rw_done(lock);});
 	}
 }
 
 /*
- * Name: lck_rw_sleep_with_inheritor
- *
- * Description: deschedule the current thread and wait on the waitq associated with event to be woken up.
- *              While waiting, the sched priority of the waiting thread will contribute to the push of the event that will
- *              be directed to the inheritor specified.
- *              An interruptible mode and deadline can be specified to return earlier from the wait.
- *
- * Args:
- *   Arg1: lck_rw_t lock used to protect the sleep. The lock will be dropped while sleeping and reaquired before returning according to the sleep action specified.
- *   Arg2: sleep action. LCK_SLEEP_DEFAULT, LCK_SLEEP_SHARED, LCK_SLEEP_EXCLUSIVE.
- *   Arg3: event to wait on.
- *   Arg4: thread to propagate the event push to.
- *   Arg5: interruptible flag for wait.
- *   Arg6: deadline for wait.
- *
- * Conditions: Lock must be held. Returns with the lock held according to the sleep action specified.
- *             Lock will be dropped while waiting.
- *             The inheritor specified cannot run in user space until another inheritor is specified for the event or a
- *             wakeup for the event is called.
- *
- * Returns: result of the wait.
- */
-wait_result_t
-lck_rw_sleep_with_inheritor(lck_rw_t *lock, lck_sleep_action_t lck_sleep_action, event_t event, thread_t inheritor, wait_interrupt_t interruptible, uint64_t deadline)
-{
-	return lck_rw_sleep_with_inheritor_and_turnstile_type(lock, lck_sleep_action, event, inheritor, interruptible, deadline, TURNSTILE_SLEEP_INHERITOR);
-}
-
-/*
  * wakeup_with_inheritor functions are independent from the locking primitive.
  */
 
-/*
- * Name: wakeup_one_with_inheritor
- *
- * Description: wake up one waiter for event if any. The thread woken up will be the one with the higher sched priority waiting on event.
- *              The push for the event will be transferred from the last inheritor to the woken up thread if LCK_WAKE_DEFAULT is specified.
- *              If LCK_WAKE_DO_NOT_TRANSFER_PUSH is specified the push will not be transferred.
- *
- * Args:
- *   Arg1: event to wake from.
- *   Arg2: wait result to pass to the woken up thread.
- *   Arg3: wake flag. LCK_WAKE_DEFAULT or LCK_WAKE_DO_NOT_TRANSFER_PUSH.
- *   Arg4: pointer for storing the thread wokenup.
- *
- * Returns: KERN_NOT_WAITING if no threads were waiting, KERN_SUCCESS otherwise.
- *
- * Conditions: The new inheritor wokenup cannot run in user space until another inheritor is specified for the event or a
- *             wakeup for the event is called.
- *             A reference for the wokenup thread is acquired.
- *             NOTE: this cannot be called from interrupt context.
- */
 kern_return_t
 wakeup_one_with_inheritor(event_t event, wait_result_t result, lck_wake_action_t action, thread_t *thread_wokenup)
 {
-	return wakeup_with_inheritor_and_turnstile_type(event,
-	           TURNSTILE_SLEEP_INHERITOR,
+	return wakeup_with_inheritor_and_turnstile(event,
 	           result,
 	           TRUE,
 	           action,
 	           thread_wokenup);
 }
 
-/*
- * Name: wakeup_all_with_inheritor
- *
- * Description: wake up all waiters waiting for event. The old inheritor will lose the push.
- *
- * Args:
- *   Arg1: event to wake from.
- *   Arg2: wait result to pass to the woken up threads.
- *
- * Returns: KERN_NOT_WAITING if no threads were waiting, KERN_SUCCESS otherwise.
- *
- * Conditions: NOTE: this cannot be called from interrupt context.
- */
 kern_return_t
 wakeup_all_with_inheritor(event_t event, wait_result_t result)
 {
-	return wakeup_with_inheritor_and_turnstile_type(event,
-	           TURNSTILE_SLEEP_INHERITOR,
+	return wakeup_with_inheritor_and_turnstile(event,
 	           result,
 	           FALSE,
 	           0,
 	           NULL);
 }
 
-/*
- * change_sleep_inheritor is independent from the locking primitive.
- */
-
-/*
- * Name: change_sleep_inheritor
- *
- * Description: Redirect the push of the waiting threads of event to the new inheritor specified.
- *
- * Args:
- *   Arg1: event to redirect the push.
- *   Arg2: new inheritor for event.
- *
- * Returns: KERN_NOT_WAITING if no threads were waiting, KERN_SUCCESS otherwise.
- *
- * Conditions: In case of success, the new inheritor cannot run in user space until another inheritor is specified for the event or a
- *             wakeup for the event is called.
- *             NOTE: this cannot be called from interrupt context.
- */
-kern_return_t
-change_sleep_inheritor(event_t event, thread_t inheritor)
-{
-	return change_sleep_inheritor_and_turnstile_type(event,
-	           inheritor,
-	           TURNSTILE_SLEEP_INHERITOR);
-}
-
 void
 kdp_sleep_with_inheritor_find_owner(struct waitq * waitq, __unused event64_t event, thread_waitinfo_t * waitinfo)
 {
 	assert(waitinfo->wait_type == kThreadWaitSleepWithInheritor);
-	assert(waitq_is_turnstile_queue(waitq));
+	assert(waitq_type(waitq) == WQT_TURNSTILE);
 	waitinfo->owner = 0;
 	waitinfo->context = 0;
 
@@ -2214,7 +1630,356 @@ kdp_sleep_with_inheritor_find_owner(struct waitq * waitq, __unused event64_t eve
 	waitinfo->owner = thread_tid(turnstile->ts_inheritor);
 }
 
+static_assert(SWI_COND_OWNER_BITS == CTID_SIZE_BIT);
+static_assert(sizeof(cond_swi_var32_s) == sizeof(uint32_t));
+static_assert(sizeof(cond_swi_var64_s) == sizeof(uint64_t));
+
+static wait_result_t
+cond_sleep_with_inheritor_and_turnstile_type(
+	cond_swi_var_t cond,
+	bool (^cond_sleep_check)(ctid_t*),
+	wait_interrupt_t interruptible,
+	uint64_t deadline,
+	turnstile_type_t type)
+{
+	wait_result_t ret;
+	uint32_t index;
+	struct turnstile *ts = NULL;
+	ctid_t ctid = 0;
+	thread_t inheritor;
+
+	/*
+	 * the hash bucket spinlock is used as turnstile interlock,
+	 * lock it before checking the sleep condition
+	 */
+	turnstile_hash_bucket_lock((uintptr_t)cond, &index, type);
+
+	/*
+	 * In case the sleep check succeeds, the block will
+	 * provide us the ctid observed on the variable.
+	 */
+	if (!cond_sleep_check(&ctid)) {
+		turnstile_hash_bucket_unlock((uintptr_t)NULL, &index, type, 0);
+		return THREAD_NOT_WAITING;
+	}
+
+	/*
+	 * We can translate the ctid to a thread_t only
+	 * if cond_sleep_check succeded.
+	 */
+	inheritor = ctid_get_thread(ctid);
+	assert(inheritor != NULL);
+
+	ts = turnstile_prepare_hash((uintptr_t)cond, type);
+
+	thread_set_pending_block_hint(current_thread(), kThreadWaitSleepWithInheritor);
+	/*
+	 * We need TURNSTILE_DELAYED_UPDATE because we will call
+	 * waitq_assert_wait64 after.
+	 */
+	turnstile_update_inheritor(ts, inheritor, (TURNSTILE_DELAYED_UPDATE | TURNSTILE_INHERITOR_THREAD));
+
+	ret = waitq_assert_wait64(&ts->ts_waitq, CAST_EVENT64_T(cond), interruptible, deadline);
+
+	turnstile_hash_bucket_unlock((uintptr_t)NULL, &index, type, 0);
+
+	/*
+	 * Update new and old inheritor chains outside the interlock;
+	 */
+	turnstile_update_inheritor_complete(ts, TURNSTILE_INTERLOCK_NOT_HELD);
+	if (ret == THREAD_WAITING) {
+		ret = thread_block(THREAD_CONTINUE_NULL);
+	}
+
+	turnstile_hash_bucket_lock((uintptr_t)NULL, &index, type);
+
+	turnstile_complete_hash((uintptr_t)cond, type);
+
+	turnstile_hash_bucket_unlock((uintptr_t)NULL, &index, type, 0);
+
+	turnstile_cleanup();
+	return ret;
+}
+
+/*
+ * Name: cond_sleep_with_inheritor32_mask
+ *
+ * Description: Conditionally sleeps with inheritor, with condition variable of 32bits.
+ *              Allows a thread to conditionally sleep while indicating which thread should
+ *              inherit the priority push associated with the condition.
+ *              The condition should be expressed through a cond_swi_var32_s pointer.
+ *              The condition needs to be populated by the caller with the ctid of the
+ *              thread that should inherit the push. The remaining bits of the condition
+ *              can be used by the caller to implement its own synchronization logic.
+ *              A copy of the condition value observed by the caller when it decided to call
+ *              this function should be provided to prevent races with matching wakeups.
+ *              This function will atomically check the value stored in the condition against
+ *              the expected/observed one provided only for the bits that are set in the mask.
+ *              If the check doesn't pass the thread will not sleep and the function will return.
+ *              The ctid provided in the condition will be used only after a successful
+ *              check.
+ *
+ * Args:
+ *   Arg1: cond_swi_var32_s pointer that stores the condition to check.
+ *   Arg2: cond_swi_var32_s observed value to check for conditionally sleep.
+ *   Arg3: mask to apply to the condition to check.
+ *   Arg4: interruptible flag for wait.
+ *   Arg5: deadline for wait.
+ *
+ * Conditions: The inheritor specified cannot return to user space or exit until another inheritor is specified for the cond or a
+ *             wakeup for the cond is called.
+ *
+ * Returns: result of the wait.
+ */
+static wait_result_t
+cond_sleep_with_inheritor32_mask(cond_swi_var_t cond, cond_swi_var32_s expected_cond, uint32_t check_mask, wait_interrupt_t interruptible, uint64_t deadline)
+{
+	bool (^cond_sleep_check)(uint32_t*) = ^(ctid_t *ctid) {
+		cond_swi_var32_s cond_val = {.cond32_data = os_atomic_load((uint32_t*) cond, relaxed)};
+		bool ret;
+		if ((cond_val.cond32_data & check_mask) == (expected_cond.cond32_data & check_mask)) {
+			ret = true;
+			*ctid = cond_val.cond32_owner;
+		} else {
+			ret = false;
+		}
+		return ret;
+	};
+
+	return cond_sleep_with_inheritor_and_turnstile_type(cond, cond_sleep_check, interruptible, deadline, TURNSTILE_SLEEP_INHERITOR);
+}
+
+/*
+ * Name: cond_sleep_with_inheritor64_mask
+ *
+ * Description: Conditionally sleeps with inheritor, with condition variable of 64bits.
+ *              Allows a thread to conditionally sleep while indicating which thread should
+ *              inherit the priority push associated with the condition.
+ *              The condition should be expressed through a cond_swi_var64_s pointer.
+ *              The condition needs to be populated by the caller with the ctid of the
+ *              thread that should inherit the push. The remaining bits of the condition
+ *              can be used by the caller to implement its own synchronization logic.
+ *              A copy of the condition value observed by the caller when it decided to call
+ *              this function should be provided to prevent races with matching wakeups.
+ *              This function will atomically check the value stored in the condition against
+ *              the expected/observed one provided only for the bits that are set in the mask.
+ *              If the check doesn't pass the thread will not sleep and the function will return.
+ *              The ctid provided in the condition will be used only after a successful
+ *              check.
+ *
+ * Args:
+ *   Arg1: cond_swi_var64_s pointer that stores the condition to check.
+ *   Arg2: cond_swi_var64_s observed value to check for conditionally sleep.
+ *   Arg3: mask to apply to the condition to check.
+ *   Arg4: interruptible flag for wait.
+ *   Arg5: deadline for wait.
+ *
+ * Conditions: The inheritor specified cannot return to user space or exit until another inheritor is specified for the cond or a
+ *             wakeup for the cond is called.
+ *
+ * Returns: result of the wait.
+ */
+wait_result_t
+cond_sleep_with_inheritor64_mask(cond_swi_var_t cond, cond_swi_var64_s expected_cond, uint64_t check_mask, wait_interrupt_t interruptible, uint64_t deadline)
+{
+	bool (^cond_sleep_check)(uint32_t*) = ^(ctid_t *ctid) {
+		cond_swi_var64_s cond_val = {.cond64_data = os_atomic_load((uint64_t*) cond, relaxed)};
+		bool ret;
+		if ((cond_val.cond64_data & check_mask) == (expected_cond.cond64_data & check_mask)) {
+			ret = true;
+			*ctid = cond_val.cond64_owner;
+		} else {
+			ret = false;
+		}
+		return ret;
+	};
+
+	return cond_sleep_with_inheritor_and_turnstile_type(cond, cond_sleep_check, interruptible, deadline, TURNSTILE_SLEEP_INHERITOR);
+}
+
+/*
+ * Name: cond_sleep_with_inheritor32
+ *
+ * Description: Conditionally sleeps with inheritor, with condition variable of 32bits.
+ *              Allows a thread to conditionally sleep while indicating which thread should
+ *              inherit the priority push associated with the condition.
+ *              The condition should be expressed through a cond_swi_var32_s pointer.
+ *              The condition needs to be populated by the caller with the ctid of the
+ *              thread that should inherit the push. The remaining bits of the condition
+ *              can be used by the caller to implement its own synchronization logic.
+ *              A copy of the condition value observed by the caller when it decided to call
+ *              this function should be provided to prevent races with matching wakeups.
+ *              This function will atomically check the value stored in the condition against
+ *              the expected/observed one provided. If the check doesn't pass the thread will not
+ *              sleep and the function will return.
+ *              The ctid provided in the condition will be used only after a successful
+ *              check.
+ *
+ * Args:
+ *   Arg1: cond_swi_var32_s pointer that stores the condition to check.
+ *   Arg2: cond_swi_var32_s observed value to check for conditionally sleep.
+ *   Arg3: interruptible flag for wait.
+ *   Arg4: deadline for wait.
+ *
+ * Conditions: The inheritor specified cannot return to user space or exit until another inheritor is specified for the cond or a
+ *             wakeup for the cond is called.
+ *
+ * Returns: result of the wait.
+ */
+wait_result_t
+cond_sleep_with_inheritor32(cond_swi_var_t cond, cond_swi_var32_s expected_cond, wait_interrupt_t interruptible, uint64_t deadline)
+{
+	return cond_sleep_with_inheritor32_mask(cond, expected_cond, ~0u, interruptible, deadline);
+}
+
+/*
+ * Name: cond_sleep_with_inheritor64
+ *
+ * Description: Conditionally sleeps with inheritor, with condition variable of 64bits.
+ *              Allows a thread to conditionally sleep while indicating which thread should
+ *              inherit the priority push associated with the condition.
+ *              The condition should be expressed through a cond_swi_var64_s pointer.
+ *              The condition needs to be populated by the caller with the ctid of the
+ *              thread that should inherit the push. The remaining bits of the condition
+ *              can be used by the caller to implement its own synchronization logic.
+ *              A copy of the condition value observed by the caller when it decided to call
+ *              this function should be provided to prevent races with matching wakeups.
+ *              This function will atomically check the value stored in the condition against
+ *              the expected/observed one provided. If the check doesn't pass the thread will not
+ *              sleep and the function will return.
+ *              The ctid provided in the condition will be used only after a successful
+ *              check.
+ *
+ * Args:
+ *   Arg1: cond_swi_var64_s pointer that stores the condition to check.
+ *   Arg2: cond_swi_var64_s observed value to check for conditionally sleep.
+ *   Arg3: interruptible flag for wait.
+ *   Arg4: deadline for wait.
+ *
+ * Conditions: The inheritor specified cannot return to user space or exit until another inheritor is specified for the cond or a
+ *             wakeup for the cond is called.
+ *
+ * Returns: result of the wait.
+ */
+wait_result_t
+cond_sleep_with_inheritor64(cond_swi_var_t cond, cond_swi_var64_s expected_cond, wait_interrupt_t interruptible, uint64_t deadline)
+{
+	return cond_sleep_with_inheritor64_mask(cond, expected_cond, ~0ull, interruptible, deadline);
+}
+
+/*
+ * Name: cond_wakeup_one_with_inheritor
+ *
+ * Description: Wake up one waiter waiting on the condition (if any).
+ *              The thread woken up will be the one with the higher sched priority waiting on the condition.
+ *              The push for the condition will be transferred from the last inheritor to the woken up thread.
+ *
+ * Args:
+ *   Arg1: condition to wake from.
+ *   Arg2: wait result to pass to the woken up thread.
+ *   Arg3: pointer for storing the thread wokenup.
+ *
+ * Returns: KERN_NOT_WAITING if no threads were waiting, KERN_SUCCESS otherwise.
+ *
+ * Conditions: The new inheritor wokenup cannot return to user space or exit until another inheritor is specified for the
+ *             condition or a wakeup for the event is called.
+ *             A reference for the wokenup thread is acquired.
+ *             NOTE: this cannot be called from interrupt context.
+ */
+kern_return_t
+cond_wakeup_one_with_inheritor(cond_swi_var_t cond, wait_result_t result, lck_wake_action_t action, thread_t *thread_wokenup)
+{
+	return wakeup_with_inheritor_and_turnstile((event_t)cond,
+	           result,
+	           TRUE,
+	           action,
+	           thread_wokenup);
+}
+
+/*
+ * Name: cond_wakeup_all_with_inheritor
+ *
+ * Description: Wake up all waiters waiting on the same condition. The old inheritor will lose the push.
+ *
+ * Args:
+ *   Arg1: condition to wake from.
+ *   Arg2: wait result to pass to the woken up threads.
+ *
+ * Returns: KERN_NOT_WAITING if no threads were waiting, KERN_SUCCESS otherwise.
+ *
+ * Conditions: NOTE: this cannot be called from interrupt context.
+ */
+kern_return_t
+cond_wakeup_all_with_inheritor(cond_swi_var_t cond, wait_result_t result)
+{
+	return wakeup_with_inheritor_and_turnstile((event_t)cond,
+	           result,
+	           FALSE,
+	           0,
+	           NULL);
+}
+
+
+#pragma mark - gates
+
+#define GATE_TYPE        3
+#define GATE_ILOCK_BIT   0
+#define GATE_WAITERS_BIT 1
+
+#define GATE_ILOCK (1 << GATE_ILOCK_BIT)
+#define GATE_WAITERS (1 << GATE_WAITERS_BIT)
+
+#define gate_ilock(gate) hw_lock_bit((hw_lock_bit_t*)(&(gate)->gt_data), GATE_ILOCK_BIT, LCK_GRP_NULL)
+#define gate_iunlock(gate) hw_unlock_bit((hw_lock_bit_t*)(&(gate)->gt_data), GATE_ILOCK_BIT)
+#define gate_has_waiter_bit(state) ((state & GATE_WAITERS) != 0)
+#define ordered_load_gate(gate) os_atomic_load(&(gate)->gt_data, compiler_acq_rel)
+#define ordered_store_gate(gate, value)  os_atomic_store(&(gate)->gt_data, value, compiler_acq_rel)
+
+#define GATE_THREAD_MASK (~(uintptr_t)(GATE_ILOCK | GATE_WAITERS))
+#define GATE_STATE_TO_THREAD(state) (thread_t)((state) & GATE_THREAD_MASK)
+#define GATE_STATE_MASKED(state) (uintptr_t)((state) & GATE_THREAD_MASK)
+#define GATE_THREAD_TO_STATE(thread) ((uintptr_t)(thread))
+
+#define GATE_DESTROYED GATE_STATE_MASKED(0xdeadbeefdeadbeef)
+
+#define GATE_EVENT(gate)     ((event_t) gate)
+#define EVENT_TO_GATE(event) ((gate_t *) event)
+
 typedef void (*void_func_void)(void);
+
+__abortlike
+static void
+gate_verify_tag_panic(gate_t *gate)
+{
+	panic("Gate used is invalid. gate %p data %lx turnstile %p refs %d flags %x ", gate, gate->gt_data, gate->gt_turnstile, gate->gt_refs, gate->gt_flags);
+}
+
+__abortlike
+static void
+gate_verify_destroy_panic(gate_t *gate)
+{
+	panic("Gate used was destroyed. gate %p data %lx turnstile %p refs %d flags %x", gate, gate->gt_data, gate->gt_turnstile, gate->gt_refs, gate->gt_flags);
+}
+
+static void
+gate_verify(gate_t *gate)
+{
+	if (gate->gt_type != GATE_TYPE) {
+		gate_verify_tag_panic(gate);
+	}
+	if (GATE_STATE_MASKED(gate->gt_data) == GATE_DESTROYED) {
+		gate_verify_destroy_panic(gate);
+	}
+
+	assert(gate->gt_refs > 0);
+}
+
+__abortlike
+static void
+gate_already_owned_panic(gate_t *gate, thread_t holder)
+{
+	panic("Trying to close a gate already closed gate %p holder %p current_thread %p", gate, holder, current_thread());
+}
 
 static kern_return_t
 gate_try_close(gate_t *gate)
@@ -2222,10 +1987,11 @@ gate_try_close(gate_t *gate)
 	uintptr_t state;
 	thread_t holder;
 	kern_return_t ret;
-	__assert_only bool waiters;
 	thread_t thread = current_thread();
 
-	if (os_atomic_cmpxchg(&gate->gate_data, 0, GATE_THREAD_TO_STATE(thread), acquire)) {
+	gate_verify(gate);
+
+	if (os_atomic_cmpxchg(&gate->gt_data, 0, GATE_THREAD_TO_STATE(thread), acquire)) {
 		return KERN_SUCCESS;
 	}
 
@@ -2234,8 +2000,7 @@ gate_try_close(gate_t *gate)
 	holder = GATE_STATE_TO_THREAD(state);
 
 	if (holder == NULL) {
-		waiters = gate_has_waiters(state);
-		assert(waiters == FALSE);
+		assert(gate_has_waiter_bit(state) == FALSE);
 
 		state = GATE_THREAD_TO_STATE(current_thread());
 		state |= GATE_ILOCK;
@@ -2243,7 +2008,7 @@ gate_try_close(gate_t *gate)
 		ret = KERN_SUCCESS;
 	} else {
 		if (holder == current_thread()) {
-			panic("Trying to close a gate already owned by current thread %p", current_thread());
+			gate_already_owned_panic(gate, holder);
 		}
 		ret = KERN_FAILURE;
 	}
@@ -2257,10 +2022,11 @@ gate_close(gate_t* gate)
 {
 	uintptr_t state;
 	thread_t holder;
-	__assert_only bool waiters;
 	thread_t thread = current_thread();
 
-	if (os_atomic_cmpxchg(&gate->gate_data, 0, GATE_THREAD_TO_STATE(thread), acquire)) {
+	gate_verify(gate);
+
+	if (os_atomic_cmpxchg(&gate->gt_data, 0, GATE_THREAD_TO_STATE(thread), acquire)) {
 		return;
 	}
 
@@ -2269,11 +2035,10 @@ gate_close(gate_t* gate)
 	holder = GATE_STATE_TO_THREAD(state);
 
 	if (holder != NULL) {
-		panic("Closing a gate already owned by %p from current thread %p", holder, current_thread());
+		gate_already_owned_panic(gate, holder);
 	}
 
-	waiters = gate_has_waiters(state);
-	assert(waiters == FALSE);
+	assert(gate_has_waiter_bit(state) == FALSE);
 
 	state = GATE_THREAD_TO_STATE(thread);
 	state |= GATE_ILOCK;
@@ -2287,11 +2052,12 @@ gate_open_turnstile(gate_t *gate)
 {
 	struct turnstile *ts = NULL;
 
-	ts = turnstile_prepare((uintptr_t)gate, &gate->turnstile, TURNSTILE_NULL, TURNSTILE_KERNEL_MUTEX);
-	waitq_wakeup64_all(&ts->ts_waitq, CAST_EVENT64_T(GATE_EVENT(gate)), THREAD_AWAKENED, WAITQ_ALL_PRIORITIES);
-	turnstile_update_inheritor(ts, TURNSTILE_INHERITOR_NULL, TURNSTILE_IMMEDIATE_UPDATE);
+	ts = turnstile_prepare((uintptr_t)gate, &gate->gt_turnstile,
+	    TURNSTILE_NULL, TURNSTILE_KERNEL_MUTEX);
+	waitq_wakeup64_all(&ts->ts_waitq, CAST_EVENT64_T(GATE_EVENT(gate)),
+	    THREAD_AWAKENED, WAITQ_UPDATE_INHERITOR);
 	turnstile_update_inheritor_complete(ts, TURNSTILE_INTERLOCK_HELD);
-	turnstile_complete((uintptr_t)gate, &gate->turnstile, NULL, TURNSTILE_KERNEL_MUTEX);
+	turnstile_complete((uintptr_t)gate, &gate->gt_turnstile, NULL, TURNSTILE_KERNEL_MUTEX);
 	/*
 	 * We can do the cleanup while holding the interlock.
 	 * It is ok because:
@@ -2302,6 +2068,17 @@ gate_open_turnstile(gate_t *gate)
 	turnstile_cleanup();
 }
 
+__abortlike
+static void
+gate_not_owned_panic(gate_t *gate, thread_t holder, bool open)
+{
+	if (open) {
+		panic("Trying to open a gate %p owned by %p from current_thread %p", gate, holder, current_thread());
+	} else {
+		panic("Trying to handoff a gate %p owned by %p from current_thread %p", gate, holder, current_thread());
+	}
+}
+
 static void
 gate_open(gate_t *gate)
 {
@@ -2310,17 +2087,18 @@ gate_open(gate_t *gate)
 	bool waiters;
 	thread_t thread = current_thread();
 
-	if (os_atomic_cmpxchg(&gate->gate_data, GATE_THREAD_TO_STATE(thread), 0, release)) {
+	gate_verify(gate);
+	if (os_atomic_cmpxchg(&gate->gt_data, GATE_THREAD_TO_STATE(thread), 0, release)) {
 		return;
 	}
 
 	gate_ilock(gate);
 	state = ordered_load_gate(gate);
 	holder = GATE_STATE_TO_THREAD(state);
-	waiters = gate_has_waiters(state);
+	waiters = gate_has_waiter_bit(state);
 
 	if (holder != thread) {
-		panic("Opening gate owned by %p from current thread %p", holder, thread);
+		gate_not_owned_panic(gate, holder, true);
 	}
 
 	if (waiters) {
@@ -2343,11 +2121,12 @@ gate_handoff_turnstile(gate_t *gate,
 	kern_return_t ret = KERN_FAILURE;
 	thread_t hp_thread;
 
-	ts = turnstile_prepare((uintptr_t)gate, &gate->turnstile, TURNSTILE_NULL, TURNSTILE_KERNEL_MUTEX);
+	ts = turnstile_prepare((uintptr_t)gate, &gate->gt_turnstile, TURNSTILE_NULL, TURNSTILE_KERNEL_MUTEX);
 	/*
 	 * Wake up the higest priority thread waiting on the gate
 	 */
-	hp_thread = waitq_wakeup64_identify(&ts->ts_waitq, CAST_EVENT64_T(GATE_EVENT(gate)), THREAD_AWAKENED, WAITQ_PROMOTE_ON_WAKE);
+	hp_thread = waitq_wakeup64_identify(&ts->ts_waitq, CAST_EVENT64_T(GATE_EVENT(gate)),
+	    THREAD_AWAKENED, WAITQ_UPDATE_INHERITOR);
 
 	if (hp_thread != NULL) {
 		/*
@@ -2381,7 +2160,7 @@ gate_handoff_turnstile(gate_t *gate,
 		ret = KERN_NOT_WAITING;
 	}
 
-	turnstile_complete((uintptr_t)gate, &gate->turnstile, NULL, TURNSTILE_KERNEL_MUTEX);
+	turnstile_complete((uintptr_t)gate, &gate->gt_turnstile, NULL, TURNSTILE_KERNEL_MUTEX);
 
 	/*
 	 * We can do the cleanup while holding the interlock.
@@ -2408,9 +2187,10 @@ gate_handoff(gate_t *gate,
 	thread_t thread = current_thread();
 
 	assert(flags == GATE_HANDOFF_OPEN_IF_NO_WAITERS || flags == GATE_HANDOFF_DEFAULT);
+	gate_verify(gate);
 
 	if (flags == GATE_HANDOFF_OPEN_IF_NO_WAITERS) {
-		if (os_atomic_cmpxchg(&gate->gate_data, GATE_THREAD_TO_STATE(thread), 0, release)) {
+		if (os_atomic_cmpxchg(&gate->gt_data, GATE_THREAD_TO_STATE(thread), 0, release)) {
 			//gate opened but there were no waiters, so return KERN_NOT_WAITING.
 			return KERN_NOT_WAITING;
 		}
@@ -2419,10 +2199,10 @@ gate_handoff(gate_t *gate,
 	gate_ilock(gate);
 	state = ordered_load_gate(gate);
 	holder = GATE_STATE_TO_THREAD(state);
-	waiters = gate_has_waiters(state);
+	waiters = gate_has_waiter_bit(state);
 
 	if (holder != current_thread()) {
-		panic("Handing off gate owned by %p from current thread %p", holder, current_thread());
+		gate_not_owned_panic(gate, holder, false);
 	}
 
 	if (waiters) {
@@ -2460,17 +2240,28 @@ gate_steal_turnstile(gate_t *gate,
 {
 	struct turnstile *ts = NULL;
 
-	ts = turnstile_prepare((uintptr_t)gate, &gate->turnstile, TURNSTILE_NULL, TURNSTILE_KERNEL_MUTEX);
+	ts = turnstile_prepare((uintptr_t)gate, &gate->gt_turnstile, TURNSTILE_NULL, TURNSTILE_KERNEL_MUTEX);
 
 	turnstile_update_inheritor(ts, new_inheritor, (TURNSTILE_IMMEDIATE_UPDATE | TURNSTILE_INHERITOR_THREAD));
 	turnstile_update_inheritor_complete(ts, TURNSTILE_INTERLOCK_HELD);
-	turnstile_complete((uintptr_t)gate, &gate->turnstile, NULL, TURNSTILE_KERNEL_MUTEX);
+	turnstile_complete((uintptr_t)gate, &gate->gt_turnstile, NULL, TURNSTILE_KERNEL_MUTEX);
 
 	/*
 	 * turnstile_cleanup might need to update the chain of the old holder.
 	 * This operation should happen without the turnstile interlock held.
 	 */
 	return turnstile_cleanup;
+}
+
+__abortlike
+static void
+gate_not_closed_panic(gate_t *gate, bool wait)
+{
+	if (wait) {
+		panic("Trying to wait on a not closed gate %p from current_thread %p", gate, current_thread());
+	} else {
+		panic("Trying to steal a not closed gate %p from current_thread %p", gate, current_thread());
+	}
 }
 
 static void
@@ -2483,12 +2274,17 @@ gate_steal(gate_t *gate)
 
 	void_func_void func_after_interlock_unlock;
 
+	gate_verify(gate);
+
 	gate_ilock(gate);
 	state = ordered_load_gate(gate);
 	holder = GATE_STATE_TO_THREAD(state);
-	waiters = gate_has_waiters(state);
+	waiters = gate_has_waiter_bit(state);
 
-	assert(holder != NULL);
+	if (holder == NULL) {
+		gate_not_closed_panic(gate, false);
+	}
+
 	state = GATE_THREAD_TO_STATE(thread) | GATE_ILOCK;
 	if (waiters) {
 		state |= GATE_WAITERS;
@@ -2514,7 +2310,7 @@ gate_wait_turnstile(gate_t *gate,
 	struct turnstile *ts;
 	uintptr_t state;
 
-	ts = turnstile_prepare((uintptr_t)gate, &gate->turnstile, TURNSTILE_NULL, TURNSTILE_KERNEL_MUTEX);
+	ts = turnstile_prepare((uintptr_t)gate, &gate->gt_turnstile, TURNSTILE_NULL, TURNSTILE_KERNEL_MUTEX);
 
 	turnstile_update_inheritor(ts, holder, (TURNSTILE_DELAYED_UPDATE | TURNSTILE_INHERITOR_THREAD));
 	waitq_assert_wait64(&ts->ts_waitq, CAST_EVENT64_T(GATE_EVENT(gate)), interruptible, deadline);
@@ -2548,13 +2344,26 @@ gate_wait_turnstile(gate_t *gate,
 		}
 	}
 
-	turnstile_complete((uintptr_t)gate, &gate->turnstile, NULL, TURNSTILE_KERNEL_MUTEX);
+	turnstile_complete((uintptr_t)gate, &gate->gt_turnstile, NULL, TURNSTILE_KERNEL_MUTEX);
 
 	/*
 	 * turnstile_cleanup might need to update the chain of the old holder.
 	 * This operation should happen without the turnstile primitive interlock held.
 	 */
 	return turnstile_cleanup;
+}
+
+static void
+gate_free_internal(gate_t *gate)
+{
+	zfree(KT_GATE, gate);
+}
+
+__abortlike
+static void
+gate_too_many_refs_panic(gate_t *gate)
+{
+	panic("Too many refs taken on gate. gate %p data %lx turnstile %p refs %d flags %x", gate, gate->gt_data, gate->gt_turnstile, gate->gt_refs, gate->gt_flags);
 }
 
 static gate_wait_result_t
@@ -2571,15 +2380,24 @@ gate_wait(gate_t* gate,
 	thread_t holder;
 	bool waiters;
 
+	gate_verify(gate);
 
 	gate_ilock(gate);
 	state = ordered_load_gate(gate);
 	holder = GATE_STATE_TO_THREAD(state);
 
 	if (holder == NULL) {
-		panic("Trying to wait on open gate thread %p gate %p", current_thread(), gate);
+		gate_not_closed_panic(gate, true);
 	}
 
+	/*
+	 * Get a ref on the gate so it will not
+	 * be freed while we are coming back from the sleep.
+	 */
+	if (gate->gt_refs == UINT16_MAX) {
+		gate_too_many_refs_panic(gate);
+	}
+	gate->gt_refs++;
 	state |= GATE_WAITERS;
 	ordered_store_gate(gate, state);
 
@@ -2644,7 +2462,22 @@ gate_wait(gate_t* gate,
 		break;
 	}
 
+	assert(gate->gt_refs > 0);
+	uint32_t ref = --gate->gt_refs;
+	bool to_free = gate->gt_alloc;
 	gate_iunlock(gate);
+
+	if (GATE_STATE_MASKED(state) == GATE_DESTROYED) {
+		if (to_free == true) {
+			assert(!waiters);
+			if (ref == 0) {
+				gate_free_internal(gate);
+			}
+			ret = GATE_OPENED;
+		} else {
+			gate_verify_destroy_panic(gate);
+		}
+	}
 
 	/*
 	 * turnstile func that needs to be executed without
@@ -2656,11 +2489,14 @@ gate_wait(gate_t* gate,
 
 	return ret;
 }
+
 static void
 gate_assert(gate_t *gate, int flags)
 {
 	uintptr_t state;
 	thread_t holder;
+
+	gate_verify(gate);
 
 	gate_ilock(gate);
 	state = ordered_load_gate(gate);
@@ -2683,18 +2519,141 @@ gate_assert(gate_t *gate, int flags)
 	gate_iunlock(gate);
 }
 
+enum {
+	GT_INIT_DEFAULT = 0,
+	GT_INIT_ALLOC
+};
+
 static void
-gate_init(gate_t *gate)
+gate_init(gate_t *gate, uint type)
 {
-	gate->gate_data = 0;
-	gate->turnstile = NULL;
+	bzero(gate, sizeof(gate_t));
+
+	gate->gt_data = 0;
+	gate->gt_turnstile = NULL;
+	gate->gt_refs = 1;
+	switch (type) {
+	case GT_INIT_ALLOC:
+		gate->gt_alloc = 1;
+		break;
+	default:
+		gate->gt_alloc = 0;
+		break;
+	}
+	gate->gt_type = GATE_TYPE;
+	gate->gt_flags_pad = 0;
+}
+
+static gate_t*
+gate_alloc_init(void)
+{
+	gate_t *gate;
+	gate = zalloc_flags(KT_GATE, Z_WAITOK | Z_NOFAIL);
+	gate_init(gate, GT_INIT_ALLOC);
+	return gate;
+}
+
+__abortlike
+static void
+gate_destroy_owned_panic(gate_t *gate, thread_t holder)
+{
+	panic("Trying to destroy a gate owned by %p. Gate %p", holder, gate);
+}
+
+__abortlike
+static void
+gate_destroy_waiter_panic(gate_t *gate)
+{
+	panic("Trying to destroy a gate with waiters. Gate %p data %lx turnstile %p", gate, gate->gt_data, gate->gt_turnstile);
+}
+
+static uint16_t
+gate_destroy_internal(gate_t *gate)
+{
+	uintptr_t state;
+	thread_t holder;
+	uint16_t ref;
+
+	gate_ilock(gate);
+	state = ordered_load_gate(gate);
+	holder = GATE_STATE_TO_THREAD(state);
+
+	/*
+	 * The gate must be open
+	 * and all the threads must
+	 * have been woken up by this time
+	 */
+	if (holder != NULL) {
+		gate_destroy_owned_panic(gate, holder);
+	}
+	if (gate_has_waiter_bit(state)) {
+		gate_destroy_waiter_panic(gate);
+	}
+
+	assert(gate->gt_refs > 0);
+
+	ref = --gate->gt_refs;
+
+	/*
+	 * Mark the gate as destroyed.
+	 * The interlock bit still need
+	 * to be available to let the
+	 * last wokenup threads to clear
+	 * the wait.
+	 */
+	state = GATE_DESTROYED;
+	state |= GATE_ILOCK;
+	ordered_store_gate(gate, state);
+	gate_iunlock(gate);
+	return ref;
+}
+
+__abortlike
+static void
+gate_destroy_panic(gate_t *gate)
+{
+	panic("Trying to destroy a gate that was allocated by gate_alloc_init(). gate_free() should be used instead, gate %p thread %p", gate, current_thread());
 }
 
 static void
-gate_destroy(__assert_only gate_t *gate)
+gate_destroy(gate_t *gate)
 {
-	assert(gate->gate_data == 0);
-	assert(gate->turnstile == NULL);
+	gate_verify(gate);
+	if (gate->gt_alloc == 1) {
+		gate_destroy_panic(gate);
+	}
+	gate_destroy_internal(gate);
+}
+
+__abortlike
+static void
+gate_free_panic(gate_t *gate)
+{
+	panic("Trying to free a gate that was not allocated by gate_alloc_init(), gate %p thread %p", gate, current_thread());
+}
+
+static void
+gate_free(gate_t *gate)
+{
+	uint16_t ref;
+
+	gate_verify(gate);
+
+	if (gate->gt_alloc == 0) {
+		gate_free_panic(gate);
+	}
+
+	ref = gate_destroy_internal(gate);
+	/*
+	 * Some of the threads waiting on the gate
+	 * might still need to run after being woken up.
+	 * They will access the gate to cleanup the
+	 * state, so we cannot free it.
+	 * The last waiter will free the gate in this case.
+	 */
+	if (ref == 0) {
+		gate_free_internal(gate);
+	}
 }
 
 /*
@@ -2710,13 +2669,32 @@ void
 lck_rw_gate_init(lck_rw_t *lock, gate_t *gate)
 {
 	(void) lock;
-	gate_init(gate);
+	gate_init(gate, GT_INIT_DEFAULT);
+}
+
+/*
+ * Name: lck_rw_gate_alloc_init
+ *
+ * Description: allocates and initializes a gate_t.
+ *
+ * Args:
+ *   Arg1: lck_rw_t lock used to protect the gate.
+ *
+ * Returns:
+ *         gate_t allocated.
+ */
+gate_t*
+lck_rw_gate_alloc_init(lck_rw_t *lock)
+{
+	(void) lock;
+	return gate_alloc_init();
 }
 
 /*
  * Name: lck_rw_gate_destroy
  *
- * Description: destroys a variable previously initialized.
+ * Description: destroys a variable previously initialized
+ *              with lck_rw_gate_init().
  *
  * Args:
  *   Arg1: lck_rw_t lock used to protect the gate.
@@ -2727,6 +2705,25 @@ lck_rw_gate_destroy(lck_rw_t *lock, gate_t *gate)
 {
 	(void) lock;
 	gate_destroy(gate);
+}
+
+/*
+ * Name: lck_rw_gate_free
+ *
+ * Description: destroys and tries to free a gate previously allocated
+ *              with lck_rw_gate_alloc_init().
+ *              The gate free might be delegated to the last thread returning
+ *              from the gate_wait().
+ *
+ * Args:
+ *   Arg1: lck_rw_t lock used to protect the gate.
+ *   Arg2: pointer to the gate obtained with lck_rw_gate_alloc_init().
+ */
+void
+lck_rw_gate_free(lck_rw_t *lock, gate_t *gate)
+{
+	(void) lock;
+	gate_free(gate);
 }
 
 /*
@@ -2834,7 +2831,7 @@ lck_rw_gate_open(__assert_only lck_rw_t *lock, gate_t *gate)
  *
  */
 kern_return_t
-lck_rw_gate_handoff(__assert_only lck_rw_t *lock, gate_t *gate, int flags)
+lck_rw_gate_handoff(__assert_only lck_rw_t *lock, gate_t *gate, gate_handoff_flags_t flags)
 {
 	LCK_RW_ASSERT(lock, LCK_RW_ASSERT_HELD);
 
@@ -2878,7 +2875,7 @@ lck_rw_gate_steal(__assert_only lck_rw_t *lock, gate_t *gate)
  * Args:
  *   Arg1: lck_rw_t lock used to protect the gate.
  *   Arg2: pointer to the gate data declared with decl_lck_rw_gate_data.
- *   Arg3: sleep action. LCK_SLEEP_DEFAULT, LCK_SLEEP_SHARED, LCK_SLEEP_EXCLUSIVE.
+ *   Arg3: sleep action. LCK_SLEEP_DEFAULT, LCK_SLEEP_SHARED, LCK_SLEEP_EXCLUSIVE, LCK_SLEEP_UNLOCK.
  *   Arg3: interruptible flag for wait.
  *   Arg4: deadline
  *
@@ -2888,12 +2885,11 @@ lck_rw_gate_steal(__assert_only lck_rw_t *lock, gate_t *gate)
  *
  * Returns: Reason why the thread was woken up.
  *          GATE_HANDOFF - the current thread was handed off the ownership of the gate.
- *                         A matching lck_rw_gate_open() or lck_rw_gate_handoff() needs to be called later on
+ *                         A matching lck_rw_gate_open() or lck_rw_gate_handoff() needs to be called later on.
  *                         to wake up possible waiters on the gate before returning to userspace.
  *          GATE_OPENED - the gate was opened by the holder.
  *          GATE_TIMED_OUT - the thread was woken up by a timeout.
  *          GATE_INTERRUPTED - the thread was interrupted while sleeping.
- *
  */
 gate_wait_result_t
 lck_rw_gate_wait(lck_rw_t *lock, gate_t *gate, lck_sleep_action_t lck_sleep_action, wait_interrupt_t interruptible, uint64_t deadline)
@@ -2943,7 +2939,7 @@ lck_rw_gate_wait(lck_rw_t *lock, gate_t *gate, lck_sleep_action_t lck_sleep_acti
  *         GATE_ASSERT_HELD - the gate is currently closed and the current thread is the holder
  */
 void
-lck_rw_gate_assert(__assert_only lck_rw_t *lock, gate_t *gate, int flags)
+lck_rw_gate_assert(__assert_only lck_rw_t *lock, gate_t *gate, gate_assert_flags_t flags)
 {
 	LCK_RW_ASSERT(lock, LCK_RW_ASSERT_HELD);
 
@@ -2964,13 +2960,32 @@ void
 lck_mtx_gate_init(lck_mtx_t *lock, gate_t *gate)
 {
 	(void) lock;
-	gate_init(gate);
+	gate_init(gate, GT_INIT_DEFAULT);
+}
+
+/*
+ * Name: lck_mtx_gate_alloc_init
+ *
+ * Description: allocates and initializes a gate_t.
+ *
+ * Args:
+ *   Arg1: lck_mtx_t lock used to protect the gate.
+ *
+ * Returns:
+ *         gate_t allocated.
+ */
+gate_t*
+lck_mtx_gate_alloc_init(lck_mtx_t *lock)
+{
+	(void) lock;
+	return gate_alloc_init();
 }
 
 /*
  * Name: lck_mtx_gate_destroy
  *
  * Description: destroys a variable previously initialized
+ *              with lck_mtx_gate_init().
  *
  * Args:
  *   Arg1: lck_mtx_t lock used to protect the gate.
@@ -2981,6 +2996,25 @@ lck_mtx_gate_destroy(lck_mtx_t *lock, gate_t *gate)
 {
 	(void) lock;
 	gate_destroy(gate);
+}
+
+/*
+ * Name: lck_mtx_gate_free
+ *
+ * Description: destroys and tries to free a gate previously allocated
+ *	        with lck_mtx_gate_alloc_init().
+ *              The gate free might be delegated to the last thread returning
+ *              from the gate_wait().
+ *
+ * Args:
+ *   Arg1: lck_mtx_t lock used to protect the gate.
+ *   Arg2: pointer to the gate obtained with lck_rw_gate_alloc_init().
+ */
+void
+lck_mtx_gate_free(lck_mtx_t *lock, gate_t *gate)
+{
+	(void) lock;
+	gate_free(gate);
 }
 
 /*
@@ -3065,19 +3099,19 @@ lck_mtx_gate_open(__assert_only lck_mtx_t *lock, gate_t *gate)
 /*
  * Name: lck_mtx_gate_handoff
  *
- * Description: Set the current ownership of the gate. The waiter with highest sched
+ * Description: Tries to transfer the ownership of the gate. The waiter with highest sched
  *              priority will be selected as the new holder of the gate, and woken up,
  *              with the gate remaining in the closed state throughout.
  *              If no waiters are present, the gate will be kept closed and KERN_NOT_WAITING
  *              will be returned.
- *              OPEN_ON_FAILURE flag can be used to specify if the gate should be opened in
+ *              GATE_HANDOFF_OPEN_IF_NO_WAITERS flag can be used to specify if the gate should be opened in
  *              case no waiters were found.
  *
  *
  * Args:
  *   Arg1: lck_mtx_t lock used to protect the gate.
  *   Arg2: pointer to the gate data declared with decl_lck_mtx_gate_data.
- *   Arg3: flags - GATE_NO_FALGS or OPEN_ON_FAILURE
+ *   Arg3: flags - GATE_HANDOFF_DEFAULT or GATE_HANDOFF_OPEN_IF_NO_WAITERS
  *
  * Conditions: Lock must be held. Returns with the lock held.
  *             The current thread must be the holder of the gate.
@@ -3088,7 +3122,7 @@ lck_mtx_gate_open(__assert_only lck_mtx_t *lock, gate_t *gate)
  *
  */
 kern_return_t
-lck_mtx_gate_handoff(__assert_only lck_mtx_t *lock, gate_t *gate, int flags)
+lck_mtx_gate_handoff(__assert_only lck_mtx_t *lock, gate_t *gate, gate_handoff_flags_t flags)
 {
 	LCK_MTX_ASSERT(lock, LCK_MTX_ASSERT_OWNED);
 
@@ -3147,7 +3181,6 @@ lck_mtx_gate_steal(__assert_only lck_mtx_t *lock, gate_t *gate)
  *          GATE_OPENED - the gate was opened by the holder.
  *          GATE_TIMED_OUT - the thread was woken up by a timeout.
  *          GATE_INTERRUPTED - the thread was interrupted while sleeping.
- *
  */
 gate_wait_result_t
 lck_mtx_gate_wait(lck_mtx_t *lock, gate_t *gate, lck_sleep_action_t lck_sleep_action, wait_interrupt_t interruptible, uint64_t deadline)
@@ -3195,7 +3228,7 @@ lck_mtx_gate_wait(lck_mtx_t *lock, gate_t *gate, lck_sleep_action_t lck_sleep_ac
  *         GATE_ASSERT_HELD - the gate is currently closed and the current thread is the holder
  */
 void
-lck_mtx_gate_assert(__assert_only lck_mtx_t *lock, gate_t *gate, int flags)
+lck_mtx_gate_assert(__assert_only lck_mtx_t *lock, gate_t *gate, gate_assert_flags_t flags)
 {
 	LCK_MTX_ASSERT(lock, LCK_MTX_ASSERT_OWNED);
 
@@ -3203,33 +3236,6 @@ lck_mtx_gate_assert(__assert_only lck_mtx_t *lock, gate_t *gate, int flags)
 }
 
 #pragma mark - LCK_*_DECLARE support
-
-__startup_func
-void
-lck_grp_attr_startup_init(struct lck_grp_attr_startup_spec *sp)
-{
-	lck_grp_attr_t *attr = sp->grp_attr;
-	lck_grp_attr_setdefault(attr);
-	attr->grp_attr_val |= sp->grp_attr_set_flags;
-	attr->grp_attr_val &= ~sp->grp_attr_clear_flags;
-}
-
-__startup_func
-void
-lck_grp_startup_init(struct lck_grp_startup_spec *sp)
-{
-	lck_grp_init(sp->grp, sp->grp_name, sp->grp_attr);
-}
-
-__startup_func
-void
-lck_attr_startup_init(struct lck_attr_startup_spec *sp)
-{
-	lck_attr_t *attr = sp->lck_attr;
-	lck_attr_setdefault(attr);
-	attr->lck_attr_val |= sp->lck_attr_set_flags;
-	attr->lck_attr_val &= ~sp->lck_attr_clear_flags;
-}
 
 __startup_func
 void
@@ -3242,11 +3248,7 @@ __startup_func
 void
 lck_mtx_startup_init(struct lck_mtx_startup_spec *sp)
 {
-	if (sp->lck_ext) {
-		lck_mtx_init_ext(sp->lck, sp->lck_ext, sp->lck_grp, sp->lck_attr);
-	} else {
-		lck_mtx_init(sp->lck, sp->lck_grp, sp->lck_attr);
-	}
+	lck_mtx_init(sp->lck, sp->lck_grp, sp->lck_attr);
 }
 
 __startup_func
@@ -3261,4 +3263,11 @@ void
 usimple_lock_startup_init(struct usimple_lock_startup_spec *sp)
 {
 	simple_lock_init(sp->lck, sp->lck_init_arg);
+}
+
+__startup_func
+void
+lck_ticket_startup_init(struct lck_ticket_startup_spec *sp)
+{
+	lck_ticket_init(sp->lck, sp->lck_grp);
 }

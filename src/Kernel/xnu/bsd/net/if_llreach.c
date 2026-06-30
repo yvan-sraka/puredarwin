@@ -134,8 +134,7 @@
 #include <netinet6/in6_var.h>
 #include <netinet6/nd6.h>
 
-static ZONE_DECLARE(iflr_zone, "if_llreach", sizeof(struct if_llreach),
-    ZC_ZFREE_CLEARMEM);
+static KALLOC_TYPE_DEFINE(iflr_zone, struct if_llreach, NET_KT_DEFAULT);
 
 static struct if_llreach *iflr_alloc(zalloc_flags_t);
 static void iflr_free(struct if_llreach *);
@@ -456,7 +455,7 @@ iflr_alloc(zalloc_flags_t how)
 	struct if_llreach *lr = zalloc_flags(iflr_zone, how | Z_ZERO);
 
 	if (lr) {
-		lck_mtx_init(&lr->lr_lock, ifnet_lock_group, ifnet_lock_attr);
+		lck_mtx_init(&lr->lr_lock, &ifnet_lock_group, &ifnet_lock_attr);
 		lr->lr_debug |= IFD_ALLOC;
 	}
 	return lr;
@@ -482,7 +481,7 @@ iflr_free(struct if_llreach *lr)
 	lr->lr_debug &= ~IFD_ALLOC;
 	IFLR_UNLOCK(lr);
 
-	lck_mtx_destroy(&lr->lr_lock, ifnet_lock_group);
+	lck_mtx_destroy(&lr->lr_lock, &ifnet_lock_group);
 	zfree(iflr_zone, lr);
 }
 

@@ -42,15 +42,19 @@
 #define SHARED_REGION_NESTING_MIN_I386          0x00200000ULL
 #define SHARED_REGION_NESTING_MAX_I386          0xFFE00000ULL
 
-#define SHARED_REGION_BASE_X86_64               0x00007FFF00000000ULL
-#define SHARED_REGION_SIZE_X86_64               0x00000000FFE00000ULL
-#define SHARED_REGION_NESTING_BASE_X86_64       0x00007FFF00000000ULL
-#define SHARED_REGION_NESTING_SIZE_X86_64       0x00000000FFE00000ULL
+/*
+ * Note the shared region size here seems odd for x86.
+ * The size is chosen to end the address space at a boundary
+ * that the arm64 pmap uses for pmap->max. We use this
+ * limit to prevent problems with Rosetta. Given how large
+ * the region is now, the few fewer megabytes shouldn't matter.
+ */
+#define SHARED_REGION_BASE_X86_64               0x00007FF800000000ULL
+#define SHARED_REGION_SIZE_X86_64               0x00000007FE000000ULL
+#define SHARED_REGION_NESTING_BASE_X86_64       0x00007FF800000000ULL
+#define SHARED_REGION_NESTING_SIZE_X86_64       0x00000007FE000000ULL
 #define SHARED_REGION_NESTING_MIN_X86_64        0x0000000000200000ULL
 #define SHARED_REGION_NESTING_MAX_X86_64        0xFFFFFFFFFFE00000ULL
-
-#ifdef XNU_KERNEL_PRIVATE
-#endif
 
 #define SHARED_REGION_BASE_PPC                  0x90000000ULL
 #define SHARED_REGION_SIZE_PPC                  0x20000000ULL
@@ -74,9 +78,9 @@
 #define SHARED_REGION_NESTING_MAX_ARM           ?
 
 #define SHARED_REGION_BASE_ARM64_32             0x1A000000ULL
-#define SHARED_REGION_SIZE_ARM64_32             0x40000000ULL
+#define SHARED_REGION_SIZE_ARM64_32             0xa6000000ULL /* up to 0xc0000000 */
 #define SHARED_REGION_NESTING_BASE_ARM64_32     0x1A000000ULL
-#define SHARED_REGION_NESTING_SIZE_ARM64_32     0x40000000ULL
+#define SHARED_REGION_NESTING_SIZE_ARM64_32     0xa6000000ULL
 #define SHARED_REGION_NESTING_MIN_ARM64_32      ?
 #define SHARED_REGION_NESTING_MAX_ARM64_32      ?
 
@@ -138,14 +142,23 @@
 
 void post_sys_powersource(int);
 
+/*
+ * RSR interfaces for use by APFS
+ */
+extern boolean_t (*rsr_check_vnode)(void *vnode);
+extern uint32_t rsr_get_version(void);
+extern void rsr_bump_version(void);
+
 #endif /* KERNEL_PRIVATE */
+
 /*
  * The shared_region_* declarations are a private interface between dyld and the kernel.
  */
 
 /*
- * This is used by legacy shared_region_map_and_slide_np() interface.
- * We build a shared_file_mapping_slide_np from this.
+ * This was used for the no longer present shared_region_map_and_slide_np() interface.
+ * The struct got used by other external projects to represent shared cache info, so
+ * it's left behind for now.
  */
 struct shared_file_mapping_np {
 	mach_vm_address_t       sfm_address;
@@ -156,12 +169,18 @@ struct shared_file_mapping_np {
 };
 
 struct shared_file_mapping_slide_np {
-	mach_vm_address_t       sms_address;     /* address at which to create mapping */
-	mach_vm_size_t          sms_size;        /* size of region to map */
-	mach_vm_offset_t        sms_file_offset; /* offset into file to be mapped */
-	user_addr_t             sms_slide_size;  /* size of data at sms_slide_start */
-	user_addr_t             sms_slide_start; /* address from which to get relocation data */
-	vm_prot_t               sms_max_prot;    /* protections, plus flags, see below */
+	/* address at which to create mapping */
+	mach_vm_address_t       sms_address __kernel_data_semantics;
+	/* size of region to map */
+	mach_vm_size_t          sms_size;
+	/* offset into file to be mapped */
+	mach_vm_offset_t        sms_file_offset __kernel_data_semantics;
+	/* size of data at sms_slide_start */
+	user_addr_t             sms_slide_size;
+	/* address from which to get relocation data */
+	user_addr_t             sms_slide_start;
+	/* protections, plus flags, see below */
+	vm_prot_t               sms_max_prot;
 	vm_prot_t               sms_init_prot;
 };
 struct shared_file_np {

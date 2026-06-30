@@ -432,7 +432,7 @@ public:
  * panic on cast failure.
  */
 #define OSRequiredCast(type, inst)  \
-    (type *) OSMetaClassBase::requiredMetaCast((inst), OSTypeID(type))
+    ((type *) OSMetaClassBase::requiredMetaCast((inst), OSTypeID(type)))
 
 /*!
  * @define OSCheckTypeInst
@@ -2074,34 +2074,42 @@ public:
 	className :: className () : superclassName (&gMetaClass)    \
 	{ gMetaClass.instanceConstructed(); }
 
+#ifdef KERNEL_PRIVATE
 #define OSDefineOperatorMethods(className)                      \
-	void * className::operator new(size_t size)                 \
-	{ return OSObject::operator new(size); }                    \
-	void className::operator delete(void *mem, size_t size)     \
-	{ return OSObject::operator delete(mem, size); }
+	static KALLOC_TYPE_DEFINE(className ## _ktv, className,     \
+	    KT_DEFAULT);                                            \
+	void * className::operator new(size_t size) {               \
+	  return OSObject_typed_operator_new(className ## _ktv,     \
+	      size);                                                \
+	}                                                           \
+	void className::operator delete(void *mem, size_t size) {   \
+	  return OSObject_typed_operator_delete(className ## _ktv,  \
+	      mem, size);                                           \
+	}
+#else
+#define OSDefineOperatorMethods(className)                      \
+	void * className::operator new(size_t size) {               \
+	  return OSObject::operator new(size);                      \
+	}                                                           \
+	void className::operator delete(void *mem, size_t size) {   \
+	  return OSObject::operator delete(mem, size);              \
+	}
+#endif
 
 #ifdef KERNEL_PRIVATE
 #define OSDefineOperatorMethodsWithZone(className)              \
 	void * className :: operator new(size_t size) {             \
-	    if(className ## _zone) {                                \
+	    if (className ## _zone) {                               \
 	        return zalloc_flags(className ## _zone,             \
 	                        (zalloc_flags_t) (Z_WAITOK | Z_ZERO));\
 	    } else {                                                \
-	/*
-	 * kIOTracking is on, disabling zones
-	 * for iokit objects
-	 */                                                         \
 	        return OSObject::operator new(size);                \
 	    }                                                       \
 	}                                                           \
 	void className :: operator delete(void *mem, size_t size) { \
-	    if(className ## _zone) {                                \
+	    if (className ## _zone) {                               \
 	        kern_os_zfree(className ## _zone, mem, size);       \
 	    } else {                                                \
-	/*
-	 * kIOTracking is on, disabling zones
-	 * for iokit objects
-	 */                                                         \
 	        return OSObject::operator delete(mem, size);        \
 	    }                                                       \
 	}

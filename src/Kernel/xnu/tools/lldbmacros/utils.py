@@ -3,9 +3,18 @@
 """ Please make sure you read the README file COMPLETELY BEFORE reading anything below.
     It is very critical that you read coding guidelines in Section E in README file. 
 """
-import sys, re, time, getopt, shlex, os, time
+from __future__ import absolute_import, print_function
+
+from builtins import hex
+from builtins import range
+from builtins import object
+
+import sys, re, time, os, time
 import lldb
 import struct
+import six
+
+from core import PY3
 from core.cvalue import *
 from core.configuration import *
 from core.lazytarget import *
@@ -38,17 +47,17 @@ def EnableLLDBAPILogging():
     logfile_name = "/tmp/lldb.%d.log" % int(time.time())
     enable_log_base_cmd = "log enable --file %s " % logfile_name
     cmd_str = enable_log_base_cmd + ' lldb api'
-    print cmd_str
-    print lldb_run_command(cmd_str)
+    print(cmd_str)
+    print(lldb_run_command(cmd_str))
     cmd_str = enable_log_base_cmd + ' gdb-remote packets'
-    print cmd_str
-    print lldb_run_command(cmd_str)
+    print(cmd_str)
+    print(lldb_run_command(cmd_str))
     cmd_str = enable_log_base_cmd + ' kdp-remote packets'
-    print cmd_str
-    print lldb_run_command(cmd_str)
-    print lldb_run_command("version")
-    print "Please collect the logs from %s for filing a radar. If you had encountered an exception in a lldbmacro command please re-run it." % logfile_name
-    print "Please make sure to provide the output of 'version', 'image list' and output of command that failed."
+    print(cmd_str)
+    print(lldb_run_command(cmd_str))
+    print(lldb_run_command("version"))
+    print("Please collect the logs from %s for filing a radar. If you had encountered an exception in a lldbmacro command please re-run it." % logfile_name)
+    print("Please make sure to provide the output of 'version', 'image list' and output of command that failed.")
     return
 
 def GetConnectionProtocol():
@@ -155,7 +164,7 @@ def loadLLDB():
     """
     try:
         import lldb
-        print 'Found LLDB on path'
+        print('Found LLDB on path')
     except:
         platdir = subprocess.check_output('xcodebuild -version -sdk iphoneos PlatformPath'.split())
         offset = platdir.find("Contents/Developer")
@@ -167,13 +176,13 @@ def loadLLDB():
             sys.path.append(lldb_py)
             global lldb
             lldb = __import__('lldb')
-            print 'Found LLDB in SDK'
+            print('Found LLDB in SDK')
         else:
-            print 'Failed to locate lldb.py from', lldb_py
+            print('Failed to locate lldb.py from', lldb_py)
             sys.exit(-1)
     return True
 
-class Logger():
+class Logger(object):
     """ A logging utility """
     def __init__(self, log_file_path="/tmp/xnu.log"):
         self.log_file_handle = open(log_file_path, "w+")
@@ -187,7 +196,7 @@ class Logger():
         
         self.log_file_handle.write(debug_line_str + "\n")
         if self.redirect_to_stdout :
-            print debug_line_str
+            print(debug_line_str)
     
     def write(self, line):
         self.log_debug(line)
@@ -305,25 +314,134 @@ def WriteInt8ToMemoryAddress(intval, addr):
     return False 
 
 _enum_cache = {}
-def GetEnumValue(name):
+def GetEnumValue(enum_name_or_combined, member_name = None):
     """ Finds the value of a particular enum define. Ex kdp_req_t::KDP_VERSION  => 0x3
         params:
-            name : str - name of enum in the format type::name
+            enum_name_or_combined: str
+                name of an enum of the format type::name (legacy)
+                name of an enum type
+            member_name: None, or the name of an enum member
+                   (then enum_name_or_combined is a type name).
         returns:
             int - value of the particular enum.
         raises:
             TypeError - if the enum is not found
     """
-    name = name.strip()
     global _enum_cache
-    if name not in _enum_cache:
-        res = lldb.SBCommandReturnObject()
-        lldb.debugger.GetCommandInterpreter().HandleCommand("p/x (`%s`)" % name, res)
-        if not res.Succeeded():
-            raise TypeError("Enum not found with name: " + name)
-        # the result is of format '(int) $481 = 0x00000003\n'
-        _enum_cache[name] = int( res.GetOutput().split('=')[-1].strip(), 16)
-    return _enum_cache[name]
+    if member_name is None:
+        enum_name, member_name = enum_name_or_combined.strip().split("::")
+    else:
+        enum_name = enum_name_or_combined
+
+    if enum_name not in _enum_cache:
+        ty = GetType(enum_name)
+        d  = {}
+
+        for e in ty.get_enum_members_array():
+            if ty.GetTypeFlags() & lldb.eTypeIsSigned:
+                d[e.GetName()] = e.GetValueAsSigned()
+            else:
+                d[e.GetName()] = e.GetValueAsUnsigned()
+
+        _enum_cache[enum_name] = d
+
+    return _enum_cache[enum_name][member_name]
+
+def GetEnumValues(enum_name, names):
+    """ Finds the values of a particular set of enum defines.
+        params:
+            enum_name: str
+                name of an enum type
+            member_name: str list
+                list of fields to resolve
+        returns:
+            int list - value of the particular enum.
+        raises:
+            TypeError - if the enum is not found
+    """
+    return [GetEnumValue(enum_name, x) for x in names]
+
+_enum_name_cache = {}
+def GetEnumName(enum_name, value, prefix = ''):
+    """ Finds symbolic name for a particular enum integer value
+        params:
+            enum_name - str:   name of an enum type
+            value     - value: the value to decode
+            prefix    - str:   a prefix to strip from the tag
+        returns:
+            str - the symbolic name or UNKNOWN(value)
+        raises:
+            TypeError - if the enum is not found
+    """
+    global _enum_name_cache
+
+    ty = GetType(enum_name)
+
+    if enum_name not in _enum_name_cache:
+        ty_dict  = {}
+
+        for e in ty.get_enum_members_array():
+            if ty.GetTypeFlags() & lldb.eTypeIsSigned:
+                ty_dict[e.GetValueAsSigned()] = e.GetName()
+            else:
+                ty_dict[e.GetValueAsUnsigned()] = e.GetName()
+
+        _enum_name_cache[enum_name] = ty_dict
+    else:
+        ty_dict = _enum_name_cache[enum_name]
+
+    if ty.GetTypeFlags() & lldb.eTypeIsSigned:
+        key = int(value)
+    else:
+        key = unsigned(value)
+
+    name = ty_dict.get(key, "UNKNOWN({:d})".format(key))
+    if name.startswith(prefix):
+        return name[len(prefix):]
+    return name
+
+def GetOptionString(enum_name, value, prefix = ''):
+    """ Tries to format a given value as a combination of options
+        params:
+            enum_name - str:   name of an enum type
+            value     - value: the value to decode
+            prefix    - str:   a prefix to strip from the tag
+        raises:
+            TypeError - if the enum is not found
+    """
+    ty = GetType(enum_name)
+
+    if enum_name not in _enum_name_cache:
+        ty_dict  = {}
+
+        for e in ty.get_enum_members_array():
+            if ty.GetTypeFlags() & lldb.eTypeIsSigned:
+                ty_dict[e.GetValueAsSigned()] = e.GetName()
+            else:
+                ty_dict[e.GetValueAsUnsigned()] = e.GetName()
+
+        _enum_name_cache[enum_name] = ty_dict
+    else:
+        ty_dict = _enum_name_cache[enum_name]
+
+    if ty.GetTypeFlags() & lldb.eTypeIsSigned:
+        v = int(value)
+    else:
+        v = unsigned(value)
+
+    flags = []
+    for bit in range(0, 64):
+        mask = 1 << bit
+        if not v & mask: continue
+        if mask not in ty_dict: continue
+        name = ty_dict[mask]
+        if name.startswith(prefix):
+            name = name[len(prefix):]
+        flags.append(name)
+        v &= ~mask
+    if v:
+        flags.append("UNKNOWN({:d})".format(v))
+    return " ".join(flags)
 
 def ResolveFSPath(path):
     """ expand ~user directories and return absolute path.
@@ -345,7 +463,7 @@ def addDSYM(uuid, info):
     """
     global _dsymlist
     if "DBGSymbolRichExecutable" not in info:
-        print "Error: Unable to find syms for %s" % uuid
+        print("Error: Unable to find syms for %s" % uuid)
         return False
     if not uuid in _dsymlist:
         # add the dsym itself
@@ -384,19 +502,36 @@ def loadDSYM(uuid, load_address, sections=[]):
 
 def RunShellCommand(command):
     """ Run a shell command in subprocess.
-        params: command with arguments to run
+        params: command with arguments to run (a list is preferred, but a string is also supported)
         returns: (exit_code, stdout, stderr)
     """
-    import shlex, subprocess
-    cmd_args = shlex.split(command)
-    output_str = ""
-    exit_code = 0
-    try:
-        output_str = subprocess.check_output(cmd_args, stderr=subprocess.STDOUT)
-    except subprocess.CalledProcessError, e:
-        exit_code = e.returncode
-    finally:
-        return (exit_code, output_str, '')
+    import subprocess
+
+    if not isinstance(command, list):
+        import shlex
+        command = shlex.split(command)
+
+    if PY3:
+        result = subprocess.run(command, capture_output=True, encoding="utf-8")
+        returncode =  result.returncode
+        stdout = result.stdout
+        stderr = result.stderr
+    else:
+        try:
+            process = subprocess.Popen(command, stderr=subprocess.PIPE, stdout=subprocess.PIPE)
+            stdout, stderr = process.communicate()
+            returncode = process.returncode
+        except OSError as e:
+            # This usually happens if the command cannot be found (e.g. ["derp"]), NOT because the command failed
+            returncode = 255
+            stdout = ""
+            stderr = str(e)
+
+    if returncode != 0:
+        print("Failed to run command. Command: {}, "
+              "exit code: {}, stdout: '{}', stderr: '{}'".format(command, returncode, stdout, stderr))
+
+    return (returncode, stdout, stderr)
 
 def dsymForUUID(uuid):
     """ Get dsym informaiton by calling dsymForUUID 
@@ -405,9 +540,11 @@ def dsymForUUID(uuid):
             {} - a dictionary holding dsym information printed by dsymForUUID. 
             None - if failed to find information
     """
-    import subprocess
     import plistlib
-    output = subprocess.check_output(["/usr/local/bin/dsymForUUID", "--copyExecutable", uuid])
+    rc, output, _ = RunShellCommand(["/usr/local/bin/dsymForUUID", "--copyExecutable", uuid])
+    if rc != 0:
+        return None
+
     if output:
         # because of <rdar://12713712>
         #plist = plistlib.readPlistFromString(output)
@@ -427,7 +564,7 @@ def debuglog(s):
     """
     global config
     if config['debug']:
-      print "DEBUG:",s
+      print("DEBUG:",s)
     return None
 
 def IsAppleInternal():
@@ -442,34 +579,38 @@ def IsAppleInternal():
         retval = False
     return retval
 
-def print_hex_data(data, begin_offset=0, desc=""):
+def print_hex_data(data, start=0, desc="", marks={}, prefix=" "):
     """ print on stdout "hexdump -C < data" like output
         params:
             data - bytearray or array of int where each int < 255
-            begin_offset - int offset that should be printed in left column
+            start - int offset that should be printed in left column
             desc - str optional description to print on the first line to describe data
+            mark - dictionary of markers
     """
+
     if desc:
-        print "{}:".format(desc)
-    index = 0
-    total_len = len(data)
-    hex_buf = ""
-    char_buf = ""
-    while index < total_len:
-        hex_buf += " {:02x}".format(data[index])
-        if data[index] < 0x20 or data[index] > 0x7e:
-            char_buf += "."
-        else:
-            char_buf += "{:c}".format(data[index])
-        index += 1
-        if index and index < total_len and index % 8 == 0:
-            hex_buf += " "
-        if index > 1 and index < total_len and (index % 16) == 0:
-            print "{:08x} {: <50s} |{: <16s}|".format(begin_offset + index - 16, hex_buf, char_buf)
-            hex_buf = ""
-            char_buf = ""
-    print "{:08x} {: <50s} |{: <16s}|".format(begin_offset + index - 16, hex_buf, char_buf)
-    return
+        print("{}:".format(desc))
+
+    end = start + len(data)
+
+    for row in range(start & -16, end, 16):
+        line  = ""
+        chars = ""
+
+        for col in range(16):
+            addr = row + col
+
+            if col == 8:
+                line += " "
+            if start <= addr < end:
+                b      = data[addr - start]
+                line  += "{}{:02x}".format(marks.get(addr, ' '), b)
+                chars += chr(b) if 0x20 <= b < 0x80 else '.'
+            else:
+                line  += "   "
+                chars += ' '
+
+        print("{}{:#016x} {}  |{}|".format(prefix, row, line, chars))
 
 def Ones(x):
     return (1 << x)-1

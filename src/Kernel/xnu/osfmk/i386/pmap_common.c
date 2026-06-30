@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2000-2016 Apple Inc. All rights reserved.
+ * Copyright (c) 2000-2022 Apple Inc. All rights reserved.
  *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
  *
@@ -114,7 +114,7 @@ pmap_set_cache_attributes(ppnum_t pn, unsigned int cacheattr)
 
 	current = pmap_phys_attributes[pai] & PHYS_CACHEABILITY_MASK;
 	pmap_phys_attributes[pai] &= ~PHYS_CACHEABILITY_MASK;
-	pmap_phys_attributes[pai] |= template;
+	pmap_phys_attributes[pai] = pmap_phys_attributes[pai] | (char)template;
 
 	UNLOCK_PVH(pai);
 
@@ -316,7 +316,7 @@ pmap_pagetable_corruption_log_setup(void)
 	if (pmap_pagetable_corruption_log_call == NULL) {
 		nanotime_to_absolutetime(PMAP_PAGETABLE_CORRUPTION_INTERVAL, 0, &pmap_pagetable_corruption_interval_abstime);
 		thread_call_setup(&pmap_pagetable_corruption_log_call_data,
-		    (thread_call_func_t) pmap_pagetable_corruption_msg_log,
+		    (thread_call_func_t) (void (*)(void))pmap_pagetable_corruption_msg_log,
 		    (thread_call_param_t) &printf);
 		pmap_pagetable_corruption_log_call = &pmap_pagetable_corruption_log_call_data;
 	}
@@ -488,7 +488,7 @@ phys_attribute_set(
 	}
 
 	LOCK_PVH(pai);
-	pmap_phys_attributes[pai] |= bits;
+	pmap_phys_attributes[pai] = pmap_phys_attributes[pai] | (char)bits;
 	UNLOCK_PVH(pai);
 }
 

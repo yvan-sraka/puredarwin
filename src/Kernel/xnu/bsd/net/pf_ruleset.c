@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2007-2016 Apple Inc. All rights reserved.
+ * Copyright (c) 2007-2021 Apple Inc. All rights reserved.
  *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
  *
@@ -90,8 +90,10 @@
 #define DPFPRINTF(format, x ...)         \
 	if (pf_status.debug >= PF_DEBUG_NOISY)  \
 	        printf(format, ##x)
-#define rs_malloc(x)            _MALLOC(x, M_TEMP, M_WAITOK)
-#define rs_free(x)              _FREE(x, M_TEMP)
+#define rs_malloc_data(size)    kalloc_data(size, Z_WAITOK)
+#define rs_malloc_type(type)    kalloc_type(type, Z_WAITOK | Z_ZERO)
+#define rs_free_data            kfree_data
+#define rs_free_type            kfree_type
 
 #else
 /* Userland equivalents so we can lend code to pfctl et al. */
@@ -101,8 +103,18 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#define rs_malloc(x)             malloc(x)
-#define rs_free(x)               free(x)
+static __inline void*
+rs_malloc_data(size_t size)
+{
+	void* result = malloc(size);
+	if (result != NULL) {
+		memset(result, 0, size);
+	}
+	return result;
+}
+#define rs_malloc_type(type)    ((type*) rs_malloc_data(sizeof(type)))
+#define rs_free_data(ptr, size) free(ptr)
+#define rs_free_type(type, ptr) free(ptr)
 
 #ifdef PFDEBUG
 #include <sys/stdarg.h>
@@ -179,12 +191,35 @@ pf_find_anchor(const char *path)
 {
 	struct pf_anchor        *key, *found;
 
-	key = (struct pf_anchor *)rs_malloc(sizeof(*key));
-	memset(key, 0, sizeof(*key));
+	key = rs_malloc_type(struct pf_anchor);
 	strlcpy(key->path, path, sizeof(key->path));
 	found = RB_FIND(pf_anchor_global, &pf_anchors, key);
-	rs_free(key);
+	rs_free_type(struct pf_anchor, key);
+
+	if (found) {
+		pf_reference_anchor(found);
+	}
 	return found;
+}
+
+int
+pf_reference_anchor(struct pf_anchor *a)
+{
+	ASSERT(a->refcnt >= 0);
+	LCK_MTX_ASSERT(&pf_lock, LCK_MTX_ASSERT_OWNED);
+	return ++a->refcnt;
+}
+
+int
+pf_release_anchor(struct pf_anchor *a)
+{
+	ASSERT(a->refcnt > 0);
+	LCK_MTX_ASSERT(&pf_lock, LCK_MTX_ASSERT_OWNED);
+	int r = --a->refcnt;
+	if (r == 0) {
+		pf_remove_if_empty_ruleset(&a->ruleset);
+	}
+	return r;
 }
 
 struct pf_ruleset *
@@ -227,9 +262,20 @@ pf_find_ruleset_with_owner(const char *path, const char *owner, int is_anchor,
 		    || (is_anchor && !strcmp(anchor->owner, ""))) {
 			return &anchor->ruleset;
 		}
+		pf_release_anchor(anchor);
+		anchor = NULL;
 		*error = EPERM;
 		return NULL;
 	}
+}
+
+int
+pf_release_ruleset(struct pf_ruleset *r)
+{
+	if (r->anchor == NULL) {
+		return 0;
+	}
+	return pf_release_anchor(r->anchor);
 }
 
 struct pf_ruleset *
@@ -249,8 +295,7 @@ pf_find_or_create_ruleset(const char *path)
 	if (ruleset != NULL) {
 		return ruleset;
 	}
-	p = (char *)rs_malloc(MAXPATHLEN);
-	bzero(p, MAXPATHLEN);
+	p = (char *)rs_malloc_data(MAXPATHLEN);
 	strlcpy(p, path, MAXPATHLEN);
 	while (parent == NULL && (q = strrchr(p, '/')) != NULL) {
 		*q = 0;
@@ -266,7 +311,7 @@ pf_find_or_create_ruleset(const char *path)
 	}
 	strlcpy(p, path, MAXPATHLEN);
 	if (!*q) {
-		rs_free(p);
+		rs_free_data(p, MAXPATHLEN);
 		return NULL;
 	}
 	while ((r = strchr(q, '/')) != NULL || *q) {
@@ -276,15 +321,14 @@ pf_find_or_create_ruleset(const char *path)
 		if (!*q || strlen(q) >= PF_ANCHOR_NAME_SIZE ||
 		    (parent != NULL && strlen(parent->path) >=
 		    MAXPATHLEN - PF_ANCHOR_NAME_SIZE - 1)) {
-			rs_free(p);
+			rs_free_data(p, MAXPATHLEN);
 			return NULL;
 		}
-		anchor = (struct pf_anchor *)rs_malloc(sizeof(*anchor));
+		anchor = rs_malloc_type(struct pf_anchor);
 		if (anchor == NULL) {
-			rs_free(p);
+			rs_free_data(p, MAXPATHLEN);
 			return NULL;
 		}
-		memset(anchor, 0, sizeof(*anchor));
 		RB_INIT(&anchor->children);
 		strlcpy(anchor->name, q, sizeof(anchor->name));
 		if (parent != NULL) {
@@ -298,11 +342,12 @@ pf_find_or_create_ruleset(const char *path)
 			printf("pf_find_or_create_ruleset: RB_INSERT1 "
 			    "'%s' '%s' collides with '%s' '%s'\n",
 			    anchor->path, anchor->name, dup->path, dup->name);
-			rs_free(anchor);
-			rs_free(p);
+			rs_free_type(struct pf_anchor, anchor);
+			rs_free_data(p, MAXPATHLEN);
 			return NULL;
 		}
 		if (parent != NULL) {
+			/* reference to parent was already taken by pf_find_anchor() */
 			anchor->parent = parent;
 			if ((dup = RB_INSERT(pf_anchor_node, &parent->children,
 			    anchor)) != NULL) {
@@ -312,13 +357,14 @@ pf_find_or_create_ruleset(const char *path)
 				    dup->path, dup->name);
 				RB_REMOVE(pf_anchor_global, &pf_anchors,
 				    anchor);
-				rs_free(anchor);
-				rs_free(p);
+				rs_free_type(struct pf_anchor, anchor);
+				rs_free_data(p, MAXPATHLEN);
 				return NULL;
 			}
 		}
 		pf_init_ruleset(&anchor->ruleset);
 		anchor->ruleset.anchor = anchor;
+		pf_reference_anchor(anchor);
 		parent = anchor;
 		if (r != NULL) {
 			q = r + 1;
@@ -332,7 +378,7 @@ pf_find_or_create_ruleset(const char *path)
 		}
 #endif
 	}
-	rs_free(p);
+	rs_free_data(p, MAXPATHLEN);
 	return anchor ? &anchor->ruleset : 0;
 }
 
@@ -342,41 +388,58 @@ pf_remove_if_empty_ruleset(struct pf_ruleset *ruleset)
 	struct pf_anchor        *parent;
 	int                      i;
 
-	while (ruleset != NULL) {
-		if (ruleset == &pf_main_ruleset || ruleset->anchor == NULL ||
-		    !RB_EMPTY(&ruleset->anchor->children) ||
-		    ruleset->anchor->refcnt > 0 || ruleset->tables > 0 ||
-		    ruleset->topen) {
-			return;
-		}
-		for (i = 0; i < PF_RULESET_MAX; ++i) {
-			if (!TAILQ_EMPTY(ruleset->rules[i].active.ptr) ||
-			    !TAILQ_EMPTY(ruleset->rules[i].inactive.ptr) ||
-			    ruleset->rules[i].inactive.open) {
-				return;
-			}
-		}
-		RB_REMOVE(pf_anchor_global, &pf_anchors, ruleset->anchor);
-#if DUMMYNET
-		if (strncmp("com.apple.nlc", ruleset->anchor->name,
-		    sizeof("com.apple.nlc")) == 0) {
-			struct dummynet_event dn_event;
-			bzero(&dn_event, sizeof(dn_event));
-			dn_event.dn_event_code = DUMMYNET_NLC_DISABLED;
-			dummynet_event_enqueue_nwk_wq_entry(&dn_event);
-			is_nlc_enabled_glb = FALSE;
-		}
-#endif
-		if ((parent = ruleset->anchor->parent) != NULL) {
-			RB_REMOVE(pf_anchor_node, &parent->children,
-			    ruleset->anchor);
-		}
-		rs_free(ruleset->anchor);
-		if (parent == NULL) {
-			return;
-		}
-		ruleset = &parent->ruleset;
+	if (ruleset == NULL) {
+		return;
 	}
+	/* the main ruleset and anchor even if empty */
+	if (ruleset == &pf_main_ruleset) {
+		return;
+	}
+	/* Each rule, child anchor, and table must take a ref count on the anchor */
+	if (ruleset->anchor == NULL || ruleset->anchor->refcnt > 0) {
+		return;
+	}
+	ASSERT(RB_EMPTY(&ruleset->anchor->children) &&
+	    ruleset->tables == 0);
+	/* if we have uncommitted change for tables, bail */
+	if (ruleset->topen > 0) {
+		return;
+	}
+
+
+	if (ruleset == &pf_main_ruleset || ruleset->anchor == NULL ||
+	    !RB_EMPTY(&ruleset->anchor->children) ||
+	    ruleset->anchor->refcnt > 0 || ruleset->tables > 0 ||
+	    ruleset->topen) {
+		return;
+	}
+	for (i = 0; i < PF_RULESET_MAX; ++i) {
+		if (!TAILQ_EMPTY(ruleset->rules[i].active.ptr) ||
+		    !TAILQ_EMPTY(ruleset->rules[i].inactive.ptr) ||
+		    ruleset->rules[i].inactive.open) {
+			return;
+		}
+	}
+	RB_REMOVE(pf_anchor_global, &pf_anchors, ruleset->anchor);
+#if DUMMYNET
+	if (strncmp("com.apple.nlc", ruleset->anchor->name,
+	    sizeof("com.apple.nlc")) == 0) {
+		struct dummynet_event dn_event;
+		bzero(&dn_event, sizeof(dn_event));
+		dn_event.dn_event_code = DUMMYNET_NLC_DISABLED;
+		dummynet_event_enqueue_nwk_wq_entry(&dn_event);
+		is_nlc_enabled_glb = FALSE;
+	}
+#endif
+	if ((parent = ruleset->anchor->parent) != NULL) {
+		RB_REMOVE(pf_anchor_node, &parent->children,
+		    ruleset->anchor);
+	}
+	rs_free_type(struct pf_anchor, ruleset->anchor);
+	if (parent == NULL) {
+		return;
+	}
+	pf_release_anchor(parent);
 }
 
 int
@@ -392,8 +455,7 @@ pf_anchor_setup(struct pf_rule *r, const struct pf_ruleset *s,
 	if (!name[0]) {
 		return 0;
 	}
-	path = (char *)rs_malloc(MAXPATHLEN);
-	bzero(path, MAXPATHLEN);
+	path = (char *)rs_malloc_data(MAXPATHLEN);
 	if (name[0] == '/') {
 		strlcpy(path, name + 1, MAXPATHLEN);
 	} else {
@@ -407,7 +469,7 @@ pf_anchor_setup(struct pf_rule *r, const struct pf_ruleset *s,
 		while (name[0] == '.' && name[1] == '.' && name[2] == '/') {
 			if (!path[0]) {
 				printf("pf_anchor_setup: .. beyond root\n");
-				rs_free(path);
+				rs_free_data(path, MAXPATHLEN);
 				return 1;
 			}
 			if ((p = strrchr(path, '/')) != NULL) {
@@ -428,13 +490,12 @@ pf_anchor_setup(struct pf_rule *r, const struct pf_ruleset *s,
 		*p = 0;
 	}
 	ruleset = pf_find_or_create_ruleset(path);
-	rs_free(path);
+	rs_free_data(path, MAXPATHLEN);
 	if (ruleset == NULL || ruleset->anchor == NULL) {
 		printf("pf_anchor_setup: ruleset\n");
 		return 1;
 	}
 	r->anchor = ruleset->anchor;
-	r->anchor->refcnt++;
 	return 0;
 }
 
@@ -454,8 +515,7 @@ pf_anchor_copyout(const struct pf_ruleset *rs, const struct pf_rule *r,
 		char    *a, *p;
 		int      i;
 
-		a = (char *)rs_malloc(MAXPATHLEN);
-		bzero(a, MAXPATHLEN);
+		a = (char *)rs_malloc_data(MAXPATHLEN);
 		if (rs->anchor == NULL) {
 			a[0] = 0;
 		} else {
@@ -472,14 +532,14 @@ pf_anchor_copyout(const struct pf_ruleset *rs, const struct pf_rule *r,
 		if (strncmp(a, r->anchor->path, strlen(a))) {
 			printf("pf_anchor_copyout: '%s' '%s'\n", a,
 			    r->anchor->path);
-			rs_free(a);
+			rs_free_data(a, MAXPATHLEN);
 			return 1;
 		}
 		if (strlen(r->anchor->path) > strlen(a)) {
 			strlcat(pr->anchor_call, r->anchor->path + (a[0] ?
 			    strlen(a) + 1 : 0), sizeof(pr->anchor_call));
 		}
-		rs_free(a);
+		rs_free_data(a, MAXPATHLEN);
 	}
 	if (r->anchor_wildcard) {
 		strlcat(pr->anchor_call, pr->anchor_call[0] ? "/*" : "*",
@@ -499,8 +559,6 @@ pf_anchor_remove(struct pf_rule *r)
 		r->anchor = NULL;
 		return;
 	}
-	if (!--r->anchor->refcnt) {
-		pf_remove_if_empty_ruleset(&r->anchor->ruleset);
-	}
+	pf_release_anchor(r->anchor);
 	r->anchor = NULL;
 }

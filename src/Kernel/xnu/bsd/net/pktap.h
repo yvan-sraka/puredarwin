@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2012-2017 Apple Inc. All rights reserved.
+ * Copyright (c) 2012-2021 Apple Inc. All rights reserved.
  *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
  *
@@ -111,17 +111,23 @@ struct pktap_header {
 	uint32_t                pth_frame_post_length;
 	pid_t                   pth_pid;                        /* process ID */
 	char                    pth_comm[MAXCOMLEN + 1];          /* process name */
+	uint8_t                 pth_pad1;
+	uint16_t                pth_trace_tag;
 	uint32_t                pth_svc;                        /* service class */
 	uint16_t                pth_iftype;
 	uint16_t                pth_ifunit;
 	pid_t                   pth_epid;               /* effective process ID */
 	char                    pth_ecomm[MAXCOMLEN + 1]; /* effective command name */
+	uint8_t                 pth_pad2;
+	uint16_t                pth_pad3;
 	uint32_t                pth_flowid;
 	uint32_t                pth_ipproto;
 	struct timeval32        pth_tstamp;
 	uuid_t                  pth_uuid;
 	uuid_t                  pth_euuid;
 };
+
+#define PKTAP_HAS_TRACE_TAG 1
 
 /*
  * The original version 1 of the pktap_header structure always had the field
@@ -221,6 +227,7 @@ struct pktap_buffer_v2_hdr_extra {
 #define PTH_FLAG_SOCKET         0x00020000 /* Packet on a Socket */
 #define PTH_FLAG_NEXUS_CHAN     0x00040000 /* Packet on a nexus channel */
 #define PTH_FLAG_V2_HDR         0x00080000 /* Version 2 of pktap */
+#define PTH_FLAG_WAKE_PKT       0x00100000 /* Packet caused system to ake from sleep */
 
 #ifdef BSD_KERNEL_PRIVATE
 
@@ -241,6 +248,15 @@ extern void pktap_fill_proc_info(struct pktap_header *, protocol_family_t,
     struct mbuf *, u_int32_t, int, struct ifnet *);
 extern void pktap_finalize_proc_info(struct pktap_header *);
 extern void pktap_v2_finalize_proc_info(struct pktap_v2_hdr *);
+#if SKYWALK
+#include <skywalk/os_skywalk.h>
+extern void pktap_input_packet(struct ifnet *, protocol_family_t, uint32_t,
+    pid_t, const char *, pid_t, const char *, kern_packet_t, const void *, size_t,
+    uint8_t, uint32_t, uint32_t);
+extern void pktap_output_packet(struct ifnet *, protocol_family_t, uint32_t,
+    pid_t, const char *, pid_t, const char *, kern_packet_t, const void *, size_t,
+    uint8_t, uint32_t, uint32_t);
+#endif /* SKYWALK */
 extern void convert_to_pktap_header_to_v2(struct bpf_packet *bpf_pkt, bool truncate);
 #endif /* BSD_KERNEL_PRIVATE */
 #endif /* PRIVATE */

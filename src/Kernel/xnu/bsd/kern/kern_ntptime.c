@@ -350,7 +350,7 @@ ntp_adjtime(struct proc *p, struct ntp_adjtime_args *uap, int32_t *retval)
 	modes = ntv.modes;
 	if (modes) {
 		/* Check that this task is entitled to set the time or it is root */
-		if (!IOTaskHasEntitlement(current_task(), SETTIME_ENTITLEMENT)) {
+		if (!IOCurrentTaskHasEntitlement(SETTIME_ENTITLEMENT)) {
 #if CONFIG_MACF
 			error = mac_system_check_settime(kauth_cred_get());
 			if (error) {
@@ -613,8 +613,7 @@ ntp_update_second(int64_t *adjustment, clock_sec_t secs)
  * is selected by the STA_MODE status bit.
  */
 static void
-hardupdate(offset)
-long offset;
+hardupdate(long offset)
 {
 	long mtemp = 0;
 	long time_monitor;
@@ -650,7 +649,11 @@ long offset;
 	time_status &= ~STA_MODE;
 	if (mtemp >= MINSEC && (time_status & STA_FLL || mtemp >
 	    MAXSEC)) {
-		L_LINT(ftemp, (time_monitor << 4) / mtemp);
+		if (time_monitor > 0) {
+			L_LINT(ftemp, (time_monitor << 4) / mtemp);
+		} else {
+			L_LINT(ftemp, -((int64_t)(-(time_monitor)) << 4) / mtemp);
+		}
 		L_RSHIFT(ftemp, SHIFT_FLL + 4);
 		L_ADD(time_freq, ftemp);
 		time_status |= STA_MODE;
@@ -710,7 +713,7 @@ adjtime(struct proc *p, struct adjtime_args *uap, __unused int32_t *retval)
 	int error;
 
 	/* Check that this task is entitled to set the time or it is root */
-	if (!IOTaskHasEntitlement(current_task(), SETTIME_ENTITLEMENT)) {
+	if (!IOCurrentTaskHasEntitlement(SETTIME_ENTITLEMENT)) {
 #if CONFIG_MACF
 		error = mac_system_check_settime(kauth_cred_get());
 		if (error) {

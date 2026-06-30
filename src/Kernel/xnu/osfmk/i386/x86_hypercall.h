@@ -29,8 +29,7 @@
 #ifndef _I386_X86_HYPERCALL_H_
 #define _I386_X86_HYPERCALL_H_
 
-#if DEBUG || DEVELOPMENT
-
+#include <kern/hvg_hypercall.h>
 
 /*
  * Apple Hypercall Calling Convention (x64)
@@ -177,6 +176,17 @@ hvg_hypercall5(const uint64_t code,
 	return hvg_hypercall6(code, rdi, rsi, rdx, rcx, r8, 0, output);
 }
 
-#endif /* DEBUG || DEVELOPMENT */
+static inline long
+kvmcompat_hypercall2(unsigned long code, unsigned long a0, unsigned long a1)
+{
+	long retval;
+	__asm__ __volatile__ (
+		"vmcall"
+		: "=a" (retval)
+		: "a" (code), "b" (a0), "c" (a1)
+		: "memory"
+	);
+	return retval;
+}
 
 #endif /* _I386_X86_HYPERCALL_H_ */

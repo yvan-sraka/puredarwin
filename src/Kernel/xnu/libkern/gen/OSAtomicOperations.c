@@ -29,11 +29,7 @@
 #include <libkern/OSAtomic.h>
 #include <kern/debug.h>
 #include <machine/atomic.h>
-
-enum {
-	false   = 0,
-	true    = 1
-};
+#include <stdbool.h>
 
 #ifndef NULL
 #define NULL ((void *)0)
@@ -42,7 +38,7 @@ enum {
 #define ATOMIC_DEBUG DEBUG
 
 #if ATOMIC_DEBUG
-#define ALIGN_TEST(p, t) do{if((uintptr_t)p&(sizeof(t)-1)) panic("Unaligned atomic pointer %p\n",p);}while(0)
+#define ALIGN_TEST(p, t) do{if((uintptr_t)p&(sizeof(t)-1)) panic("Unaligned atomic pointer %p",p);}while(0)
 #else
 #define ALIGN_TEST(p, t) do{}while(0)
 #endif

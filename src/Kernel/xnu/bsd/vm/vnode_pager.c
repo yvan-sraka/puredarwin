@@ -71,23 +71,17 @@
 
 #include <kern/assert.h>
 #include <sys/kdebug.h>
-#include <nfs/nfs_conf.h>
-#include <nfs/rpcv2.h>
-#include <nfs/nfsproto.h>
 #include <nfs/nfs.h>
 
 #include <vm/vm_protos.h>
 
+#include <sys/kdebug_triage.h>
 #include <vfs/vfs_disk_conditioner.h>
 
 void
 vnode_pager_throttle(void)
 {
-	struct uthread *ut;
-
-	ut = get_bsdthread_info(current_thread());
-
-	if (ut->uu_lowpri_window) {
+	if (current_uthread()->uu_lowpri_window) {
 		throttle_lowpri_io(1);
 	}
 }
@@ -449,13 +443,10 @@ vnode_pageout(struct vnode *vp,
 		 * of it's pages
 		 */
 		for (offset = upl_offset; isize; isize -= PAGE_SIZE, offset += PAGE_SIZE) {
-#if CONFIG_NFS_CLIENT
 			if (vp->v_tag == VT_NFS) {
 				/* check with nfs if page is OK to drop */
 				error = nfs_buf_page_inval(vp, (off_t)f_offset);
-			} else
-#endif /* CONFIG_NFS_CLIENT */
-			{
+			} else {
 				blkno = ubc_offtoblk(vp, (off_t)f_offset);
 				error = buf_invalblkno(vp, blkno, 0);
 			}
@@ -506,13 +497,10 @@ vnode_pageout(struct vnode *vp,
 			 * Note we must not sleep here if the buffer is busy - that is
 			 * a lock inversion which causes deadlock.
 			 */
-#if CONFIG_NFS_CLIENT
 			if (vp->v_tag == VT_NFS) {
 				/* check with nfs if page is OK to drop */
 				error = nfs_buf_page_inval(vp, (off_t)f_offset);
-			} else
-#endif /* CONFIG_NFS_CLIENT */
-			{
+			} else {
 				blkno = ubc_offtoblk(vp, (off_t)f_offset);
 				error = buf_invalblkno(vp, blkno, 0);
 			}
@@ -633,6 +621,7 @@ vnode_pagein(
 			ubc_upl_abort_range(upl, upl_offset, size, UPL_ABORT_FREE_ON_EMPTY | UPL_ABORT_ERROR);
 		}
 
+		ktriage_record(thread_tid(current_thread()), KDBG_TRIAGE_EVENTID(KDBG_TRIAGE_SUBSYS_VM, KDBG_TRIAGE_RESERVED, KDBG_TRIAGE_VM_VNODEPAGEIN_NO_UBCINFO), 0 /* arg */);
 		goto out;
 	}
 	if (upl == (upl_t)NULL) {
@@ -661,6 +650,7 @@ vnode_pagein(
 				set_thread_pagein_error(current_thread(), error);
 				result = PAGER_ERROR;
 				error  = PAGER_ERROR;
+				ktriage_record(thread_tid(current_thread()), KDBG_TRIAGE_EVENTID(KDBG_TRIAGE_SUBSYS_VM, KDBG_TRIAGE_RESERVED, KDBG_TRIAGE_VM_VNODEPAGEIN_FSPAGEIN_FAIL), 0 /* arg */);
 			}
 			goto out;
 		}
@@ -669,6 +659,7 @@ vnode_pagein(
 		if (upl == (upl_t)NULL) {
 			result =  PAGER_ABSENT;
 			error = PAGER_ABSENT;
+			ktriage_record(thread_tid(current_thread()), KDBG_TRIAGE_EVENTID(KDBG_TRIAGE_SUBSYS_VM, KDBG_TRIAGE_RESERVED, KDBG_TRIAGE_VM_VNODEPAGEIN_NO_UPL), 0 /* arg */);
 			goto out;
 		}
 		ubc_upl_range_needed(upl, upl_offset / PAGE_SIZE, 1);
@@ -805,6 +796,7 @@ vnode_pagein(
 				set_thread_pagein_error(current_thread(), error);
 				result = PAGER_ERROR;
 				error  = PAGER_ERROR;
+				ktriage_record(thread_tid(current_thread()), KDBG_TRIAGE_EVENTID(KDBG_TRIAGE_SUBSYS_VM, KDBG_TRIAGE_RESERVED, KDBG_TRIAGE_VM_VNODEPAGEIN_FSPAGEIN_FAIL), 0 /* arg */);
 			}
 		}
 	}
@@ -816,10 +808,4 @@ out:
 	}
 
 	return error;
-}
-
-void *
-upl_get_internal_page_list(upl_t upl)
-{
-	return UPL_GET_INTERNAL_PAGE_LIST(upl);
 }

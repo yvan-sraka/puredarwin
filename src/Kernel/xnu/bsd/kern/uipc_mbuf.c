@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 1998-2020 Apple Inc. All rights reserved.
+ * Copyright (c) 1998-2021 Apple Inc. All rights reserved.
  *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
  *
@@ -107,6 +107,20 @@
 
 #include <sys/mcache.h>
 #include <net/ntstat.h>
+
+#if INET
+extern int dump_tcp_reass_qlen(char *, int);
+extern int tcp_reass_qlen_space(struct socket *);
+#endif /* INET */
+
+#if MPTCP
+extern int dump_mptcp_reass_qlen(char *, int);
+#endif /* MPTCP */
+
+
+#if NETWORKING
+extern int dlil_dump_top_if_qlen(char *, int);
+#endif /* NETWORKING */
 
 /*
  * MBUF IMPLEMENTATION NOTES.
@@ -319,12 +333,6 @@ static uint64_t mb_kmem_one_failed_ts;
 static uint64_t mb_kmem_contig_failed_size;
 static uint64_t mb_kmem_failed_size;
 static uint32_t mb_kmem_stats[6];
-static const char *mb_kmem_stats_labels[] = { "INVALID_ARGUMENT",
-	                                      "INVALID_ADDRESS",
-	                                      "RESOURCE_SHORTAGE",
-	                                      "NO_SPACE",
-	                                      "KERN_FAILURE",
-	                                      "OTHERS" };
 
 /* Global lock */
 static LCK_GRP_DECLARE(mbuf_mlock_grp, "mbuf");
@@ -350,7 +358,7 @@ static ppnum_t mcl_pages;       /* Size of array (# physical pages) */
 static ppnum_t mcl_paddr_base;  /* Handle returned by IOMapper::iovmAlloc() */
 static mcache_t *ref_cache;     /* Cache of cluster reference & flags */
 static mcache_t *mcl_audit_con_cache; /* Audit contents cache */
-static unsigned int mbuf_debug; /* patchable mbuf mcache flags */
+unsigned int mbuf_debug; /* patchable mbuf mcache flags */
 static unsigned int mb_normalized; /* number of packets "normalized" */
 
 #define MB_GROWTH_AGGRESSIVE    1       /* Threshold: 1/2 of total */
@@ -503,8 +511,8 @@ int njcl;                       /* # of clusters for jumbo sizes */
 int njclbytes;                  /* size of a jumbo cluster */
 unsigned char *mbutl;           /* first mapped cluster address */
 unsigned char *embutl;          /* ending virtual address of mclusters */
-int _max_linkhdr;               /* largest link-level header */
-int _max_protohdr;              /* largest protocol header */
+int max_linkhdr;                /* largest link-level header */
+int max_protohdr;              /* largest protocol header */
 int max_hdr;                    /* largest link+protocol header */
 int max_datalen;                /* MHLEN - max_hdr */
 
@@ -675,11 +683,22 @@ static mbuf_table_t mbuf_table[] = {
 
 #define NELEM(a)        (sizeof (a) / sizeof ((a)[0]))
 
+#if SKYWALK
+#define MC_THRESHOLD_SCALE_DOWN_FACTOR  2
+static unsigned int mc_threshold_scale_down_factor =
+    MC_THRESHOLD_SCALE_DOWN_FACTOR;
+#endif /* SKYWALK */
 
 static uint32_t
 m_avgtotal(mbuf_class_t c)
 {
+#if SKYWALK
+	return if_is_fsw_transport_netagent_enabled() ?
+	       (mbuf_table[c].mtbl_avgtotal / mc_threshold_scale_down_factor) :
+	       mbuf_table[c].mtbl_avgtotal;
+#else /* !SKYWALK */
 	return mbuf_table[c].mtbl_avgtotal;
+#endif /* SKYWALK */
 }
 
 static void *mb_waitchan = &mbuf_table; /* wait channel for all caches */
@@ -704,11 +723,7 @@ static char *mbuf_dump_buf;
  * mb_drain_maxint controls the amount of time to wait (in seconds) before
  * consecutive calls to mbuf_drain().
  */
-#if !XNU_TARGET_OS_OSX || DEVELOPMENT || DEBUG
 static unsigned int mb_watchdog = 1;
-#else /* XNU_TARGET_OS_OSX && !DEVELOPMENT && !DEBUG */
-static unsigned int mb_watchdog = 0;
-#endif /* XNU_TARGET_OS_OSX && !DEVELOPMENT && !DEBUG */
 #if !XNU_TARGET_OS_OSX
 static unsigned int mb_drain_maxint = 60;
 #else /* XNU_TARGET_OS_OSX */
@@ -929,6 +944,7 @@ static void mbuf_drain_locked(boolean_t);
 	(m)->m_pkthdr.csum_data = 0;                                    \
 	(m)->m_pkthdr.vlan_tag = 0;                                     \
 	(m)->m_pkthdr.comp_gencnt = 0;                                  \
+	(m)->m_pkthdr.pkt_crumbs = 0;                                     \
 	m_classifier_init(m, 0);                                        \
 	m_tag_init(m, 1);                                               \
 	m_scratch_init(m);                                              \
@@ -955,7 +971,7 @@ static void mbuf_drain_locked(boolean_t);
 	(m)->m_data = (m)->m_ext.ext_buf = (buf);                       \
 	(m)->m_flags |= M_EXT;                                          \
 	m_set_ext((m), (rfa), (free), (arg));                           \
-	(m)->m_ext.ext_size = (size);                                   \
+	(m)->m_ext.ext_size = (u_int)(size);                            \
 	MEXT_MINREF(m) = (min);                                         \
 	MEXT_REF(m) = (ref);                                            \
 	MEXT_PREF(m) = (pref);                                          \
@@ -1188,6 +1204,7 @@ mb_stat_sysctl SYSCTL_HANDLER_ARGS
 			oc->mbcl_mc_waiter_cnt = c->mbcl_mc_waiter_cnt;
 			oc->mbcl_mc_wretry_cnt = c->mbcl_mc_wretry_cnt;
 			oc->mbcl_mc_nwretry_cnt = c->mbcl_mc_nwretry_cnt;
+			oc->mbcl_peak_reported = c->mbcl_peak_reported;
 		}
 		statp = omb_stat;
 		statsz = OMB_STAT_SIZE(NELEM(mbuf_table));
@@ -2936,8 +2953,6 @@ m_vm_error_stats(uint32_t *cnt, uint64_t *ts, uint64_t *size,
 	if (size) {
 		*size = alloc_size;
 	}
-	_CASSERT(sizeof(mb_kmem_stats) / sizeof(mb_kmem_stats[0]) ==
-	    sizeof(mb_kmem_stats_labels) / sizeof(mb_kmem_stats_labels[0]));
 	switch (error) {
 	case KERN_SUCCESS:
 		break;
@@ -2969,7 +2984,7 @@ kmem_mb_alloc(vm_map_t mbmap, int size, int physContig, kern_return_t *err)
 	kern_return_t kr = KERN_SUCCESS;
 
 	if (!physContig) {
-		kr = kernel_memory_allocate(mbmap, &addr, size, 0,
+		kr = kmem_alloc(mbmap, &addr, size,
 		    KMA_KOBJECT | KMA_LOMEM, VM_KERN_MEMORY_MBUF);
 	} else {
 		kr = kmem_alloc_contig(mbmap, &addr, size, PAGE_MASK, 0xfffff,
@@ -3741,7 +3756,9 @@ m_free_paired(struct mbuf *m)
 		if (prefcnt > 1) {
 			return 1;
 		} else if (prefcnt == 1) {
-			(*(m_get_ext_free(m)))(m->m_ext.ext_buf,
+			m_ext_free_func_t m_free_func = m_get_ext_free(m);
+			VERIFY(m_free_func != NULL);
+			(*m_free_func)(m->m_ext.ext_buf,
 			    m->m_ext.ext_size, m_get_ext_arg(m));
 			return 1;
 		} else if (prefcnt == 0) {
@@ -3808,19 +3825,21 @@ m_free(struct mbuf *m)
 	}
 
 	if (m->m_flags & M_EXT) {
-		uint16_t refcnt;
-		uint32_t composite;
-		m_ext_free_func_t m_free_func;
-
 		if (MBUF_IS_PAIRED(m) && m_free_paired(m)) {
 			return n;
 		}
+		/*
+		 * Make sure that we don't touch any ext_ref
+		 * member after we decrement the reference count
+		 * since that may lead to use-after-free
+		 * when we do not hold the last reference.
+		 */
+		const bool composite = !!(MEXT_FLAGS(m) & EXTF_COMPOSITE);
+		const m_ext_free_func_t m_free_func = m_get_ext_free(m);
+		const uint16_t minref = MEXT_MINREF(m);
+		const uint16_t refcnt = m_decref(m);
 
-		refcnt = m_decref(m);
-		composite = (MEXT_FLAGS(m) & EXTF_COMPOSITE);
-		m_free_func = m_get_ext_free(m);
-
-		if (refcnt == MEXT_MINREF(m) && !composite) {
+		if (refcnt == minref && !composite) {
 			if (m_free_func == NULL) {
 				mcache_free(m_cache(MC_CL), m->m_ext.ext_buf);
 			} else if (m_free_func == m_bigfree) {
@@ -3835,7 +3854,7 @@ m_free(struct mbuf *m)
 			}
 			mcache_free(ref_cache, m_get_rfa(m));
 			m_set_ext(m, NULL, NULL, NULL);
-		} else if (refcnt == MEXT_MINREF(m) && composite) {
+		} else if (refcnt == minref && composite) {
 			VERIFY(!(MEXT_FLAGS(m) & EXTF_PAIRED));
 			VERIFY(m->m_type != MT_FREE);
 
@@ -3846,7 +3865,11 @@ m_free(struct mbuf *m)
 			m->m_flags = M_EXT;
 			m->m_len = 0;
 			m->m_next = m->m_nextpkt = NULL;
-
+			/*
+			 * MEXT_FLAGS is safe to access here
+			 * since we are now sure that we held
+			 * the last reference to ext_ref.
+			 */
 			MEXT_FLAGS(m) &= ~EXTF_READONLY;
 
 			/* "Free" into the intermediate cache */
@@ -3878,7 +3901,7 @@ m_free(struct mbuf *m)
 
 __private_extern__ struct mbuf *
 m_clattach(struct mbuf *m, int type, caddr_t extbuf,
-    void (*extfree)(caddr_t, u_int, caddr_t), u_int extsize, caddr_t extarg,
+    void (*extfree)(caddr_t, u_int, caddr_t), size_t extsize, caddr_t extarg,
     int wait, int pair)
 {
 	struct ext_ref *rfa = NULL;
@@ -3894,15 +3917,19 @@ m_clattach(struct mbuf *m, int type, caddr_t extbuf,
 	}
 
 	if (m->m_flags & M_EXT) {
-		u_int16_t refcnt;
-		u_int32_t composite;
-		m_ext_free_func_t m_free_func;
-
-		refcnt = m_decref(m);
-		composite = (MEXT_FLAGS(m) & EXTF_COMPOSITE);
+		/*
+		 * Make sure that we don't touch any ext_ref
+		 * member after we decrement the reference count
+		 * since that may lead to use-after-free
+		 * when we do not hold the last reference.
+		 */
+		const bool composite = !!(MEXT_FLAGS(m) & EXTF_COMPOSITE);
 		VERIFY(!(MEXT_FLAGS(m) & EXTF_PAIRED) && MEXT_PMBUF(m) == NULL);
-		m_free_func = m_get_ext_free(m);
-		if (refcnt == MEXT_MINREF(m) && !composite) {
+		const m_ext_free_func_t m_free_func = m_get_ext_free(m);
+		const uint16_t minref = MEXT_MINREF(m);
+		const uint16_t refcnt = m_decref(m);
+
+		if (refcnt == minref && !composite) {
 			if (m_free_func == NULL) {
 				mcache_free(m_cache(MC_CL), m->m_ext.ext_buf);
 			} else if (m_free_func == m_bigfree) {
@@ -3917,7 +3944,7 @@ m_clattach(struct mbuf *m, int type, caddr_t extbuf,
 			}
 			/* Re-use the reference structure */
 			rfa = m_get_rfa(m);
-		} else if (refcnt == MEXT_MINREF(m) && composite) {
+		} else if (refcnt == minref && composite) {
 			VERIFY(m->m_type != MT_FREE);
 
 			mtype_stat_dec(m->m_type);
@@ -3928,6 +3955,11 @@ m_clattach(struct mbuf *m, int type, caddr_t extbuf,
 			m->m_len = 0;
 			m->m_next = m->m_nextpkt = NULL;
 
+			/*
+			 * MEXT_FLAGS is safe to access here
+			 * since we are now sure that we held
+			 * the last reference to ext_ref.
+			 */
 			MEXT_FLAGS(m) &= ~EXTF_READONLY;
 
 			/* "Free" into the intermediate cache */
@@ -4172,7 +4204,7 @@ m_copy_pkthdr(struct mbuf *to, struct mbuf *from)
  * "from" must have M_PKTHDR set, and "to" must be empty.
  * In particular, this does a deep copy of the packet tags.
  */
-static int
+int
 m_dup_pkthdr(struct mbuf *to, struct mbuf *from, int how)
 {
 	VERIFY(from->m_flags & M_PKTHDR);
@@ -4191,6 +4223,8 @@ m_dup_pkthdr(struct mbuf *to, struct mbuf *from, int how)
 		to->m_data = to->m_pktdat;
 	}
 	to->m_pkthdr = from->m_pkthdr;
+	/* clear TX completion flag so the callback is not called in the copy */
+	to->m_pkthdr.pkt_flags &= ~PKTF_TX_COMPL_TS_REQ;
 	m_redzone_init(to);                     /* setup red zone on dst */
 	m_tag_init(to, 0);                      /* preserve dst static tags */
 	return m_tag_copy_chain(to, from, how);
@@ -4220,6 +4254,7 @@ m_classifier_init(struct mbuf *m, uint32_t pktf_mask)
 	m->m_pkthdr.pkt_proto = 0;
 	m->m_pkthdr.pkt_flowsrc = 0;
 	m->m_pkthdr.pkt_flowid = 0;
+	m->m_pkthdr.pkt_ext_flags = 0;
 	m->m_pkthdr.pkt_flags &= pktf_mask;     /* caller-defined mask */
 	/* preserve service class and interface info for loopback packets */
 	if (!(m->m_pkthdr.pkt_flags & PKTF_LOOP)) {
@@ -4246,6 +4281,7 @@ m_copy_classifier(struct mbuf *to, struct mbuf *from)
 	to->m_pkthdr.pkt_flowsrc = from->m_pkthdr.pkt_flowsrc;
 	to->m_pkthdr.pkt_flowid = from->m_pkthdr.pkt_flowid;
 	to->m_pkthdr.pkt_flags = from->m_pkthdr.pkt_flags;
+	to->m_pkthdr.pkt_ext_flags = from->m_pkthdr.pkt_ext_flags;
 	(void) m_set_service_class(to, from->m_pkthdr.pkt_svc);
 	to->m_pkthdr.pkt_ifainfo  = from->m_pkthdr.pkt_ifainfo;
 }
@@ -4795,9 +4831,6 @@ m_freem_list(struct mbuf *m)
 		while (m != NULL) {
 			struct mbuf *next = m->m_next;
 			mcache_obj_t *o, *rfa;
-			u_int32_t composite;
-			u_int16_t refcnt;
-			m_ext_free_func_t m_free_func;
 
 			if (m->m_type == MT_FREE) {
 				panic("m_free: freeing an already freed mbuf");
@@ -4808,6 +4841,7 @@ m_freem_list(struct mbuf *m)
 				m_redzone_verify(m);
 				/* Free the aux data and tags if there is any */
 				m_tag_delete_chain(m, NULL);
+				m_do_tx_compl_callback(m, NULL);
 			}
 
 			if (!(m->m_flags & M_EXT)) {
@@ -4823,10 +4857,18 @@ m_freem_list(struct mbuf *m)
 			mt_free++;
 
 			o = (mcache_obj_t *)(void *)m->m_ext.ext_buf;
-			refcnt = m_decref(m);
-			composite = (MEXT_FLAGS(m) & EXTF_COMPOSITE);
-			m_free_func = m_get_ext_free(m);
-			if (refcnt == MEXT_MINREF(m) && !composite) {
+			/*
+			 * Make sure that we don't touch any ext_ref
+			 * member after we decrement the reference count
+			 * since that may lead to use-after-free
+			 * when we do not hold the last reference.
+			 */
+			const bool composite = !!(MEXT_FLAGS(m) & EXTF_COMPOSITE);
+			const m_ext_free_func_t m_free_func = m_get_ext_free(m);
+			const uint16_t minref = MEXT_MINREF(m);
+			const uint16_t refcnt = m_decref(m);
+
+			if (refcnt == minref && !composite) {
 				if (m_free_func == NULL) {
 					o->obj_next = mcl_list;
 					mcl_list = o;
@@ -4845,7 +4887,7 @@ m_freem_list(struct mbuf *m)
 				rfa->obj_next = ref_list;
 				ref_list = rfa;
 				m_set_ext(m, NULL, NULL, NULL);
-			} else if (refcnt == MEXT_MINREF(m) && composite) {
+			} else if (refcnt == minref && composite) {
 				VERIFY(!(MEXT_FLAGS(m) & EXTF_PAIRED));
 				VERIFY(m->m_type != MT_FREE);
 				/*
@@ -4869,6 +4911,11 @@ m_freem_list(struct mbuf *m)
 				m->m_len = 0;
 				m->m_next = m->m_nextpkt = NULL;
 
+				/*
+				 * MEXT_FLAGS is safe to access here
+				 * since we are now sure that we held
+				 * the last reference to ext_ref.
+				 */
 				MEXT_FLAGS(m) &= ~EXTF_READONLY;
 
 				/* "Free" into the intermediate cache */
@@ -6782,17 +6829,35 @@ static bool mbuf_watchdog_defunct_active = false;
 static uint32_t
 mbuf_watchdog_socket_space(struct socket *so)
 {
+	uint32_t space = 0;
+
 	if (so == NULL) {
 		return 0;
 	}
 
-	return so->so_snd.sb_mbcnt + so->so_rcv.sb_mbcnt;
+	space = so->so_snd.sb_mbcnt + so->so_rcv.sb_mbcnt;
+
+#if INET
+	if ((SOCK_DOM(so) == PF_INET || SOCK_DOM(so) == PF_INET6) &&
+	    SOCK_PROTO(so) == IPPROTO_TCP) {
+		space += tcp_reass_qlen_space(so);
+	}
+#endif /* INET */
+
+	return space;
 }
 
 struct mbuf_watchdog_defunct_args {
 	struct proc *top_app;
 	uint32_t top_app_space_used;
+	bool non_blocking;
 };
+
+static bool
+proc_fd_trylock(proc_t p)
+{
+	return lck_mtx_try_lock(&p->p_fd.fd_lock);
+}
 
 static int
 mbuf_watchdog_defunct_iterate(proc_t p, void *arg)
@@ -6802,7 +6867,16 @@ mbuf_watchdog_defunct_iterate(proc_t p, void *arg)
 	    (struct mbuf_watchdog_defunct_args *)arg;
 	uint32_t space_used = 0;
 
-	proc_fdlock(p);
+	/*
+	 * Non-blocking is only used when dumping the mbuf usage from the watchdog
+	 */
+	if (args->non_blocking) {
+		if (!proc_fd_trylock(p)) {
+			return PROC_RETURNED;
+		}
+	} else {
+		proc_fdlock(p);
+	}
 	fdt_foreach(fp, p) {
 		struct fileglob *fg = fp->fp_glob;
 		struct socket *so = NULL;
@@ -6810,7 +6884,7 @@ mbuf_watchdog_defunct_iterate(proc_t p, void *arg)
 		if (FILEGLOB_DTYPE(fg) != DTYPE_SOCKET) {
 			continue;
 		}
-		so = (struct socket *)fp->fp_glob->fg_data;
+		so = fg_get_data(fg);
 		/*
 		 * We calculate the space without the socket
 		 * lock because we don't want to be blocked
@@ -6845,6 +6919,7 @@ mbuf_watchdog_defunct(thread_call_param_t arg0, thread_call_param_t arg1)
 	struct mbuf_watchdog_defunct_args args = {};
 	struct fileproc *fp = NULL;
 
+	args.non_blocking = false;
 	proc_iterate(PROC_ALLPROCLIST,
 	    mbuf_watchdog_defunct_iterate, &args, NULL, NULL);
 
@@ -6852,6 +6927,10 @@ mbuf_watchdog_defunct(thread_call_param_t arg0, thread_call_param_t arg1)
 	 * Defunct all sockets from this app.
 	 */
 	if (args.top_app != NULL) {
+		/* Restart the watchdog count. */
+		lck_mtx_lock(mbuf_mlock);
+		microuptime(&mb_wdtstart);
+		lck_mtx_unlock(mbuf_mlock);
 		os_log(OS_LOG_DEFAULT, "%s: defuncting all sockets from %s.%d",
 		    __func__,
 		    proc_name_address(args.top_app),
@@ -6864,8 +6943,10 @@ mbuf_watchdog_defunct(thread_call_param_t arg0, thread_call_param_t arg1)
 			if (FILEGLOB_DTYPE(fg) != DTYPE_SOCKET) {
 				continue;
 			}
-			so = (struct socket *)fp->fp_glob->fg_data;
-			socket_lock(so, 0);
+			so = (struct socket *)fp_get_data(fp);
+			if (!socket_try_lock(so)) {
+				continue;
+			}
 			if (sosetdefunct(args.top_app, so,
 			    SHUTDOWN_SOCKET_LEVEL_DISCONNECT_ALL,
 			    TRUE) == 0) {
@@ -6902,6 +6983,18 @@ mbuf_watchdog(void)
 	microuptime(&now);
 	since = now.tv_sec - mb_wdtstart.tv_sec;
 
+	if (mbuf_watchdog_defunct_active) {
+		/*
+		 * Don't panic the system while we are trying
+		 * to find sockets to defunct.
+		 */
+		return;
+	}
+	if (since >= MB_WDT_MAXTIME) {
+		panic_plain("%s: %d waiters stuck for %u secs\n%s", __func__,
+		    mb_waiters, since, mbuf_dump());
+		/* NOTREACHED */
+	}
 	/*
 	 * Check if we are about to panic the system due
 	 * to lack of mbufs and start defuncting sockets
@@ -6910,7 +7003,7 @@ mbuf_watchdog(void)
 	 * We're always called with the mbuf_mlock held,
 	 * so that also protects mbuf_watchdog_defunct_active.
 	 */
-	if (since >= MB_WDT_MAXTIME / 2 && !mbuf_watchdog_defunct_active) {
+	if (since >= MB_WDT_MAXTIME / 2) {
 		/*
 		 * Start a thread to defunct sockets
 		 * from apps that are over-using their socket
@@ -6927,11 +7020,6 @@ mbuf_watchdog(void)
 			mbuf_watchdog_defunct_active = true;
 			thread_call_enter(defunct_tcall);
 		}
-	}
-	if (since >= MB_WDT_MAXTIME) {
-		panic_plain("%s: %d waiters stuck for %u secs\n%s", __func__,
-		    mb_waiters, since, mbuf_dump());
-		/* NOTREACHED */
 	}
 }
 
@@ -7600,7 +7688,7 @@ mcl_audit_mcheck_panic(struct mbuf *m)
 	MRANGE(m);
 	mca = mcl_audit_buf2mca(MC_MBUF, (mcache_obj_t *)m);
 
-	panic("mcl_audit: freed mbuf %p with type 0x%x (instead of 0x%x)\n%s\n",
+	panic("mcl_audit: freed mbuf %p with type 0x%x (instead of 0x%x)\n%s",
 	    m, (u_int16_t)m->m_type, MT_FREE, mcache_dump_mca(buf, mca));
 	/* NOTREACHED */
 }
@@ -7623,6 +7711,59 @@ mcl_audit_verify_nextptr(void *next, mcache_audit_t *mca)
 	    (next != (void *)MCACHE_FREE_PATTERN || !mclverify)) {
 		mcl_audit_verify_nextptr_panic(next, mca);
 	}
+}
+
+static uintptr_t
+hash_mix(uintptr_t x)
+{
+#ifndef __LP64__
+	x += ~(x << 15);
+	x ^=  (x >> 10);
+	x +=  (x << 3);
+	x ^=  (x >> 6);
+	x += ~(x << 11);
+	x ^=  (x >> 16);
+#else
+	x += ~(x << 32);
+	x ^=  (x >> 22);
+	x += ~(x << 13);
+	x ^=  (x >> 8);
+	x +=  (x << 3);
+	x ^=  (x >> 15);
+	x += ~(x << 27);
+	x ^=  (x >> 31);
+#endif
+	return x;
+}
+
+static uint32_t
+hashbacktrace(uintptr_t* bt, uint32_t depth, uint32_t max_size)
+{
+	uintptr_t hash = 0;
+	uintptr_t mask = max_size - 1;
+
+	while (depth) {
+		hash += bt[--depth];
+	}
+
+	hash = hash_mix(hash) & mask;
+
+	assert(hash < max_size);
+
+	return (uint32_t) hash;
+}
+
+static uint32_t
+hashaddr(uintptr_t pt, uint32_t max_size)
+{
+	uintptr_t hash = 0;
+	uintptr_t mask = max_size - 1;
+
+	hash = hash_mix(pt) & mask;
+
+	assert(hash < max_size);
+
+	return (uint32_t) hash;
 }
 
 /* This function turns on mbuf leak detection */
@@ -7674,7 +7815,7 @@ mleak_logger(u_int32_t num, mcache_obj_t *addr, boolean_t alloc)
 
 	if ((temp % mleak_table.mleak_sample_factor) == 0 && addr != NULL) {
 		uintptr_t bt[MLEAK_STACK_DEPTH];
-		int logged = backtrace(bt, MLEAK_STACK_DEPTH, NULL);
+		unsigned int logged = backtrace(bt, MLEAK_STACK_DEPTH, NULL, NULL);
 		mleak_log(bt, addr, logged, num);
 	}
 }
@@ -7933,7 +8074,7 @@ mbuf_dump(void)
 	mleak_trace_stat_t *mltr;
 	char *c = mbuf_dump_buf;
 	int i, j, k, clen = MBUF_DUMP_BUF_SIZE;
-	bool printed_banner = false;
+	struct mbuf_watchdog_defunct_args args = {};
 
 	mbuf_dump_buf[0] = '\0';
 
@@ -8038,33 +8179,7 @@ mbuf_dump(void)
 	MBUF_DUMP_BUF_CHK();
 
 	net_update_uptime();
-	k = scnprintf(c, clen,
-	    "VM allocation failures: contiguous %u, normal %u, one page %u\n",
-	    mb_kmem_contig_failed, mb_kmem_failed, mb_kmem_one_failed);
-	MBUF_DUMP_BUF_CHK();
-	if (mb_kmem_contig_failed_ts || mb_kmem_failed_ts ||
-	    mb_kmem_one_failed_ts) {
-		k = scnprintf(c, clen,
-		    "VM allocation failure timestamps: contiguous %llu "
-		    "(size %llu), normal %llu (size %llu), one page %llu "
-		    "(now %llu)\n",
-		    mb_kmem_contig_failed_ts, mb_kmem_contig_failed_size,
-		    mb_kmem_failed_ts, mb_kmem_failed_size,
-		    mb_kmem_one_failed_ts, net_uptime());
-		MBUF_DUMP_BUF_CHK();
-		k = scnprintf(c, clen,
-		    "VM return codes: ");
-		MBUF_DUMP_BUF_CHK();
-		for (i = 0;
-		    i < sizeof(mb_kmem_stats) / sizeof(mb_kmem_stats[0]);
-		    i++) {
-			k = scnprintf(c, clen, "%s: %u ", mb_kmem_stats_labels[i],
-			    mb_kmem_stats[i]);
-			MBUF_DUMP_BUF_CHK();
-		}
-		k = scnprintf(c, clen, "\n");
-		MBUF_DUMP_BUF_CHK();
-	}
+
 	k = scnprintf(c, clen,
 	    "worker thread runs: %u, expansions: %llu, cl %llu/%llu, "
 	    "bigcl %llu/%llu, 16k %llu/%llu\n", mbuf_worker_run_cnt,
@@ -8087,40 +8202,38 @@ mbuf_dump(void)
 		MBUF_DUMP_BUF_CHK();
 	}
 
-#if DEBUG || DEVELOPMENT
-	k = scnprintf(c, clen, "\nworker thread log:\n%s\n", mbwdog_logging);
-	MBUF_DUMP_BUF_CHK();
-#endif
-
-	for (j = 0; j < MTRACELARGE_NUM_TRACES; j++) {
-		struct mtracelarge *trace = &mtracelarge_table[j];
-		if (trace->size == 0 || trace->depth == 0) {
-			continue;
-		}
-		if (printed_banner == false) {
-			k = scnprintf(c, clen,
-			    "\nlargest allocation failure backtraces:\n");
-			MBUF_DUMP_BUF_CHK();
-			printed_banner = true;
-		}
-		k = scnprintf(c, clen, "size %llu: < ", trace->size);
-		MBUF_DUMP_BUF_CHK();
-		for (i = 0; i < trace->depth; i++) {
-			if (mleak_stat->ml_isaddr64) {
-				k = scnprintf(c, clen, "0x%0llx ",
-				    (uint64_t)VM_KERNEL_UNSLIDE(
-					    trace->addr[i]));
-			} else {
-				k = scnprintf(c, clen,
-				    "0x%08x ",
-				    (uint32_t)VM_KERNEL_UNSLIDE(
-					    trace->addr[i]));
-			}
-			MBUF_DUMP_BUF_CHK();
-		}
-		k = scnprintf(c, clen, ">\n");
-		MBUF_DUMP_BUF_CHK();
+	/*
+	 * Log where the most mbufs have accumulated:
+	 * - Process socket buffers
+	 * - TCP reassembly queue
+	 * - Interface AQM queue (output) and DLIL input queue
+	 */
+	args.non_blocking = true;
+	proc_iterate(PROC_ALLPROCLIST,
+	    mbuf_watchdog_defunct_iterate, &args, NULL, NULL);
+	if (args.top_app != NULL) {
+		k = scnprintf(c, clen, "\ntop proc mbuf space %u bytes by %s:%d\n",
+		    args.top_app_space_used,
+		    proc_name_address(args.top_app),
+		    proc_pid(args.top_app));
+		proc_rele(args.top_app);
 	}
+	MBUF_DUMP_BUF_CHK();
+
+#if INET
+	k = dump_tcp_reass_qlen(c, clen);
+	MBUF_DUMP_BUF_CHK();
+#endif /* INET */
+
+#if MPTCP
+	k = dump_mptcp_reass_qlen(c, clen);
+	MBUF_DUMP_BUF_CHK();
+#endif /* MPTCP */
+
+#if NETWORKING
+	k = dlil_dump_top_if_qlen(c, clen);
+	MBUF_DUMP_BUF_CHK();
+#endif /* NETWORKING */
 
 	/* mbuf leak detection statistics */
 	mleak_update_stats();
@@ -8196,6 +8309,7 @@ mbuf_dump(void)
 		k = scnprintf(c, clen, "\n");
 		MBUF_DUMP_BUF_CHK();
 	}
+
 done:
 	return mbuf_dump_buf;
 }
@@ -8226,9 +8340,9 @@ m_reinit(struct mbuf *m, int hdr)
 			    "m_data %llx (expected %llx), "
 			    "m_len %d (expected 0)\n",
 			    __func__,
-			    (uint64_t)VM_KERNEL_ADDRPERM(m),
-			    (uint64_t)VM_KERNEL_ADDRPERM(m->m_data),
-			    (uint64_t)VM_KERNEL_ADDRPERM(m->m_dat), m->m_len);
+			    (uint64_t)VM_KERNEL_ADDRPERM((uintptr_t)m),
+			    (uint64_t)VM_KERNEL_ADDRPERM((uintptr_t)m->m_data),
+			    (uint64_t)VM_KERNEL_ADDRPERM((uintptr_t)(m->m_dat)), m->m_len);
 			ret = EBUSY;
 		} else {
 			VERIFY((m->m_flags & M_EXT) || m->m_data == m->m_dat);
@@ -8240,6 +8354,7 @@ m_reinit(struct mbuf *m, int hdr)
 		m_redzone_verify(m);
 		/* Free the aux data and tags if there is any */
 		m_tag_delete_chain(m, NULL);
+		m_do_tx_compl_callback(m, NULL);
 		m->m_flags &= ~M_PKTHDR;
 	}
 
@@ -8350,6 +8465,14 @@ m_scratch_get(struct mbuf *m, u_int8_t **p)
 
 	*p = (u_int8_t *)&pkt->pkt_mpriv;
 	return sizeof(pkt->pkt_mpriv);
+}
+
+void
+m_add_crumb(struct mbuf *m, uint16_t crumb)
+{
+	VERIFY(m->m_flags & M_PKTHDR);
+
+	m->m_pkthdr.pkt_crumbs |= crumb;
 }
 
 static void
@@ -8805,6 +8928,7 @@ m_drain_force_sysctl SYSCTL_HANDLER_ARGS
 }
 
 #if DEBUG || DEVELOPMENT
+__printflike(3, 4)
 static void
 _mbwdog_logger(const char *func, const int line, const char *fmt, ...)
 {
@@ -8829,7 +8953,7 @@ _mbwdog_logger(const char *func, const int line, const char *fmt, ...)
 	len = scnprintf(str, sizeof(str),
 	    "\n%ld.%d (%d/%llx) %s:%d %s",
 	    now.tv_sec, now.tv_usec,
-	    current_proc()->p_pid,
+	    proc_getpid(current_proc()),
 	    (uint64_t)VM_KERNEL_ADDRPERM(current_thread()),
 	    func, line, p);
 	if (len < 0) {
@@ -8845,17 +8969,6 @@ _mbwdog_logger(const char *func, const int line, const char *fmt, ...)
 	mbwdog_logging_used += len;
 }
 
-static int
-sysctl_mbwdog_log SYSCTL_HANDLER_ARGS
-{
-#pragma unused(oidp, arg1, arg2)
-	return SYSCTL_OUT(req, mbwdog_logging, mbwdog_logging_used);
-}
-SYSCTL_DECL(_kern_ipc);
-SYSCTL_PROC(_kern_ipc, OID_AUTO, mbwdog_log,
-    CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
-    0, 0, sysctl_mbwdog_log, "A", "");
-
 #endif // DEBUG || DEVELOPMENT
 
 static void
@@ -8866,7 +8979,7 @@ mtracelarge_register(size_t size)
 	uintptr_t bt[MLEAK_STACK_DEPTH];
 	unsigned int depth;
 
-	depth = backtrace(bt, MLEAK_STACK_DEPTH, NULL);
+	depth = backtrace(bt, MLEAK_STACK_DEPTH, NULL, NULL);
 	/* Check if this entry is already on the list. */
 	for (i = 0; i < MTRACELARGE_NUM_TRACES; i++) {
 		trace = &mtracelarge_table[i];
@@ -8886,8 +8999,37 @@ mtracelarge_register(size_t size)
 	}
 }
 
+#if DEBUG || DEVELOPMENT
+
+static int
+mbuf_wd_dump_sysctl SYSCTL_HANDLER_ARGS
+{
+	char *str;
+
+	ifnet_head_lock_shared();
+	lck_mtx_lock(mbuf_mlock);
+
+	str = mbuf_dump();
+
+	lck_mtx_unlock(mbuf_mlock);
+	ifnet_head_done();
+
+	return sysctl_io_string(req, str, 0, 0, NULL);
+}
+
+#endif /* DEBUG || DEVELOPMENT */
+
 SYSCTL_DECL(_kern_ipc);
 #if DEBUG || DEVELOPMENT
+#if SKYWALK
+SYSCTL_UINT(_kern_ipc, OID_AUTO, mc_threshold_scale_factor,
+    CTLFLAG_RW | CTLFLAG_LOCKED, &mc_threshold_scale_down_factor,
+    MC_THRESHOLD_SCALE_DOWN_FACTOR,
+    "scale down factor for mbuf cache thresholds");
+#endif /* SKYWALK */
+SYSCTL_PROC(_kern_ipc, OID_AUTO, mb_wd_dump,
+    CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
+    0, 0, mbuf_wd_dump_sysctl, "A", "mbuf watchdog dump");
 #endif
 SYSCTL_PROC(_kern_ipc, KIPC_MBSTAT, mbstat,
     CTLTYPE_STRUCT | CTLFLAG_RD | CTLFLAG_LOCKED,

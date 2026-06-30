@@ -41,7 +41,6 @@ __BEGIN_DECLS
 #include <libkern/OSTypes.h>
 #include <libkern/OSReturn.h>
 #else
-#include <CoreFoundation/CoreFoundation.h>
 #include <libkern/OSReturn.h>
 #endif /* KERNEL */
 
@@ -474,6 +473,7 @@ __BEGIN_DECLS
  * This is the CFBundleIdentifier user for the kernel itself.
  */
 #define kOSKextKernelIdentifier                 "__kernel__"
+
 
 /*!
  * @define  kOSKextBundlePackageTypeKext

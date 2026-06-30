@@ -30,19 +30,21 @@
 #include <pexpert/arm64/board_config.h>
 #include "assym.s"
 
+
 #if XNU_MONITOR
-/* Exit path defines; for controlling PPL -> kernel transitions. */
+/*
+ * Exit path defines; for controlling PPL -> kernel transitions.
+ * These should fit within a 32-bit integer, as the PPL trampoline packs them into a 32-bit field.
+ */
 #define PPL_EXIT_DISPATCH   0 /* This is a clean exit after a PPL request. */
 #define PPL_EXIT_PANIC_CALL 1 /* The PPL has called panic. */
 #define PPL_EXIT_BAD_CALL   2 /* The PPL request failed. */
 #define PPL_EXIT_EXCEPTION  3 /* The PPL took an exception. */
 
-
 #define KERNEL_MODE_ELR      ELR_GL11
 #define KERNEL_MODE_FAR      FAR_GL11
 #define KERNEL_MODE_ESR      ESR_GL11
 #define KERNEL_MODE_SPSR     SPSR_GL11
-#define KERNEL_MODE_ASPSR    ASPSR_GL11
 #define KERNEL_MODE_VBAR     VBAR_GL11
 #define KERNEL_MODE_TPIDR    TPIDR_GL11
 
@@ -50,7 +52,6 @@
 #define GUARDED_MODE_FAR     FAR_EL1
 #define GUARDED_MODE_ESR     ESR_EL1
 #define GUARDED_MODE_SPSR    SPSR_EL1
-#define GUARDED_MODE_ASPSR   ASPSR_EL1
 #define GUARDED_MODE_VBAR    VBAR_EL1
 #define GUARDED_MODE_TPIDR   TPIDR_EL1
 
@@ -135,6 +136,7 @@
  *
  *   arg0 - KERNEL_MODE or HIBERNATE_MODE
  *   x0 - Address of the save area
+ *   x25 - Return the value of FPCR
  */
 #define KERNEL_MODE 0
 #define HIBERNATE_MODE 1
@@ -157,7 +159,6 @@
 	str		lr, [x0, SS64_LR]
 
 	/* Save arm_neon_saved_state64 */
-
 	stp		q0, q1, [x0, NS64_Q0]
 	stp		q2, q3, [x0, NS64_Q2]
 	stp		q4, q5, [x0, NS64_Q4]
@@ -174,11 +175,14 @@
 	stp		q26, q27, [x0, NS64_Q26]
 	stp		q28, q29, [x0, NS64_Q28]
 	stp		q30, q31, [x0, NS64_Q30]
+	mrs		x24, FPSR
+	str		w24, [x0, NS64_FPSR]
+	mrs		x25, FPCR
+	str		w25, [x0, NS64_FPCR]
+Lsave_neon_state_done_\@:
 
 	mrs		x22, ELR_EL1                                                     // Get exception link register
 	mrs		x23, SPSR_EL1                                                   // Load CPSR into var reg x23
-	mrs		x24, FPSR
-	mrs		x25, FPCR
 
 #if defined(HAS_APPLE_PAC)
 	.if \mode != HIBERNATE_MODE
@@ -202,7 +206,11 @@
 	mov		x3, x20
 	mov		x4, x16
 	mov		x5, x17
+
+	mrs		x19, SPSel
+	msr		SPSel, #1
 	bl		_ml_sign_thread_state
+	msr		SPSel, x19
 	mov		lr, x20
 	mov		x1, x21
 	.endif
@@ -210,8 +218,6 @@
 
 	str		x22, [x0, SS64_PC]                                               // Save ELR to PCB
 	str		w23, [x0, SS64_CPSR]                                    // Save CPSR to PCB
-	str		w24, [x0, NS64_FPSR]
-	str		w25, [x0, NS64_FPCR]
 
 	mrs		x20, FAR_EL1
 	mrs		x21, ESR_EL1
@@ -236,45 +242,5 @@
 	ldr		x1, [x1, ACT_CPUDATAP]
 	ldr		x1, [x1, CPU_ISTACKPTR]
 	mov		sp, x1			// Set the stack pointer to the interrupt stack
-.endmacro
-
-/*
- * REENABLE_DAIF
- *
- * Restores the DAIF bits to their original state (well, the AIF bits at least).
- *   arg0 - DAIF bits (read from the DAIF interface) to restore
- */
-.macro REENABLE_DAIF
-	/* AIF enable. */
-	tst		$0, #(DAIF_IRQF | DAIF_FIQF | DAIF_ASYNCF)
-	b.eq		3f
-
-	/* IF enable. */
-	tst		$0, #(DAIF_IRQF | DAIF_FIQF)
-	b.eq		2f
-
-	/* A enable. */
-	tst		$0, #(DAIF_ASYNCF)
-	b.eq		1f
-
-	/* Enable nothing. */
-	b		4f
-
-	/* A enable. */
-1:
-	msr		DAIFClr, #(DAIFSC_ASYNCF)
-	b		4f
-
-	/* IF enable. */
-2:
-	msr		DAIFClr, #(DAIFSC_IRQF | DAIFSC_FIQF)
-	b		4f
-
-	/* AIF enable. */
-3:
-	msr		DAIFClr, #(DAIFSC_IRQF | DAIFSC_FIQF | DAIFSC_ASYNCF)
-
-	/* Done! */
-4:
 .endmacro
 

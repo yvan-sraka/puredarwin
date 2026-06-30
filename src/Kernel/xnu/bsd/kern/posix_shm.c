@@ -87,7 +87,6 @@
 
 #define f_flag fp_glob->fg_flag
 #define f_ops fp_glob->fg_ops
-#define f_data fp_glob->fg_data
 
 /*
  * Used to construct the list of memory objects
@@ -185,9 +184,10 @@ static void pshm_cache_delete(pshm_info_t *entry);
 static int pshm_closefile(struct fileglob *fg, vfs_context_t ctx);
 
 static int pshm_access(pshm_info_t *pinfo, int mode, kauth_cred_t cred, proc_t p);
-int pshm_cache_purge_all(proc_t p);
+int pshm_cache_purge_all(void);
+int pshm_cache_purge_uid(uid_t uid);
 
-static int pshm_unlink_internal(pshm_info_t *pinfo);
+static void pshm_unlink_internal(pshm_info_t *pinfo);
 
 static const struct fileops pshmops = {
 	.fo_type     = DTYPE_PSXSHM,
@@ -264,11 +264,10 @@ pshm_cache_init(void)
  * known to be called after all user processes are killed?
  */
 int
-pshm_cache_purge_all(__unused proc_t proc)
+pshm_cache_purge_all(void)
 {
 	pshm_info_t *p;
 	pshm_info_t *tmp;
-	int error = 0;
 
 	if (kauth_cred_issuser(kauth_cred_get()) == 0) {
 		return EPERM;
@@ -276,21 +275,33 @@ pshm_cache_purge_all(__unused proc_t proc)
 
 	PSHM_SUBSYS_LOCK();
 	RB_FOREACH_SAFE(p, pshmhead, &pshm_head, tmp) {
-		error = pshm_unlink_internal(p);
-		if (error) {  /* XXX: why give up on failure, should keep going */
-			goto out;
-		}
+		pshm_unlink_internal(p);
 	}
 	assert(pshmnument == 0);
-
-out:
 	PSHM_SUBSYS_UNLOCK();
 
-	if (error) {
-		printf("%s: Error %d removing posix shm cache: %ld remain!\n",
-		    __func__, error, pshmnument);
+	return 0;
+}
+
+int
+pshm_cache_purge_uid(uid_t uid)
+{
+	pshm_info_t *p;
+	pshm_info_t *tmp;
+
+	if (kauth_cred_issuser(kauth_cred_get()) == 0) {
+		return EPERM;
 	}
-	return error;
+
+	PSHM_SUBSYS_LOCK();
+	RB_FOREACH_SAFE(p, pshmhead, &pshm_head, tmp) {
+		if (p->pshm_uid == uid) {
+			pshm_unlink_internal(p);
+		}
+	}
+	PSHM_SUBSYS_UNLOCK();
+
+	return 0;
 }
 
 /*
@@ -342,11 +353,7 @@ shm_open(proc_t p, struct shm_open_args *uap, int32_t *retval)
 	 * Allocate data structures we need. We parse the userspace name into
 	 * a pshm_info_t, even when we don't need to O_CREAT.
 	 */
-	new_pinfo = kheap_alloc(KM_SHM, sizeof(pshm_info_t), Z_WAITOK | Z_ZERO);
-	if (new_pinfo == NULL) {
-		error = ENOSPC;
-		goto bad;
-	}
+	new_pinfo = kalloc_type(pshm_info_t, Z_WAITOK | Z_ZERO | Z_NOFAIL);
 
 	/*
 	 * Get and check the name.
@@ -376,8 +383,7 @@ shm_open(proc_t p, struct shm_open_args *uap, int32_t *retval)
 	/*
 	 * Will need a new pnode for the file pointer
 	 */
-	new_pnode = kheap_alloc(KM_SHM, sizeof(pshmnode_t),
-	    Z_WAITOK | Z_ZERO);
+	new_pnode = kalloc_type(pshmnode_t, Z_WAITOK | Z_ZERO);
 	if (new_pnode == NULL) {
 		error = ENOSPC;
 		goto bad;
@@ -472,12 +478,13 @@ shm_open(proc_t p, struct shm_open_args *uap, int32_t *retval)
 #endif
 	}
 
-	proc_fdlock(p);
+	fp->fp_flags |= FP_CLOEXEC;
 	fp->f_flag = fmode & FMASK;
 	fp->f_ops = &pshmops;
 	new_pnode->pinfo = pinfo;
-	fp->f_data = (caddr_t)new_pnode;
-	*fdflags(p, indx) |= UF_EXCLOSE;
+	fp_set_data(fp, new_pnode);
+
+	proc_fdlock(p);
 	procfdtbl_releasefd(p, indx, NULL);
 	fp_drop(p, indx, fp, 1);
 	proc_fdunlock(p);
@@ -501,7 +508,7 @@ bad:
 	/*
 	 * Delete any allocated unused data structures.
 	 */
-	kheap_free(KM_SHM, new_pnode, sizeof(pshmnode_t));
+	kfree_type(pshmnode_t, new_pnode);
 
 	if (fp != NULL) {
 		fp_free(p, indx, fp);
@@ -514,7 +521,7 @@ done:
 			mac_posixshm_label_destroy(&new_pinfo->pshm_hdr);
 		}
 #endif
-		kheap_free(KM_SHM, new_pinfo, sizeof(pshm_info_t));
+		kfree_type(pshm_info_t, new_pinfo);
 	}
 	return error;
 }
@@ -560,7 +567,7 @@ pshm_truncate(
 #endif
 
 	PSHM_SUBSYS_LOCK();
-	if (((pnode = (pshmnode_t *)fp->f_data)) == NULL) {
+	if (((pnode = (pshmnode_t *)fp_get_data(fp))) == NULL) {
 		PSHM_SUBSYS_UNLOCK();
 		return EINVAL;
 	}
@@ -611,13 +618,7 @@ pshm_truncate(
 		}
 
 		/* get a list entry to track the memory object */
-		pshmobj = kheap_alloc(KM_SHM, sizeof(pshm_mobj_t), Z_WAITOK);
-		if (pshmobj == NULL) {
-			kret = KERN_NO_SPACE;
-			mach_memory_entry_port_release(mem_object);
-			mem_object = NULL;
-			goto out;
-		}
+		pshmobj = kalloc_type(pshm_mobj_t, Z_WAITOK | Z_NOFAIL);
 
 		PSHM_SUBSYS_LOCK();
 
@@ -649,7 +650,7 @@ out:
 		SLIST_REMOVE_HEAD(&pinfo->pshm_mobjs, pshmo_next);
 		PSHM_SUBSYS_UNLOCK();
 		mach_memory_entry_port_release(pshmobj->pshmo_memobject);
-		kheap_free(KM_SHM, pshmobj, sizeof(pshm_mobj_t));
+		kfree_type(pshm_mobj_t, pshmobj);
 		PSHM_SUBSYS_LOCK();
 	}
 	pinfo->pshm_flags &= ~PSHM_ALLOCATING;
@@ -738,15 +739,14 @@ pshm_mmap(
 {
 	vm_map_offset_t    user_addr = (vm_map_offset_t)uap->addr;
 	vm_map_size_t      user_size = (vm_map_size_t)uap->len;
-	vm_map_offset_t    user_start_addr;
-	vm_map_size_t      map_size, mapped_size;
+	vm_map_offset_t    user_start_addr = 0;
+	vm_map_size_t      map_size, mapped_size, pshm_size;
 	int                prot = uap->prot;
 	int                max_prot = VM_PROT_DEFAULT;
 	int                flags = uap->flags;
 	vm_object_offset_t file_pos = (vm_object_offset_t)uap->pos;
 	vm_object_offset_t map_pos;
 	vm_map_t           user_map;
-	int                alloc_flags;
 	vm_map_kernel_flags_t vmk_flags;
 	bool               docow;
 	kern_return_t      kret = KERN_SUCCESS;
@@ -771,8 +771,10 @@ pshm_mmap(
 		max_prot &= ~VM_PROT_WRITE;
 	}
 
+	user_map = current_map();
+
 	PSHM_SUBSYS_LOCK();
-	pnode = (pshmnode_t *)fp->f_data;
+	pnode = (pshmnode_t *)fp_get_data(fp);
 	if (pnode == NULL) {
 		PSHM_SUBSYS_UNLOCK();
 		return EINVAL;
@@ -789,7 +791,9 @@ pshm_mmap(
 		return EINVAL;
 	}
 
-	if (user_size > (vm_map_size_t)pinfo->pshm_length) {
+	pshm_size = vm_map_round_page((vm_map_size_t)pinfo->pshm_length, vm_map_page_mask(user_map));
+
+	if (user_size > pshm_size) {
 		PSHM_SUBSYS_UNLOCK();
 		return EINVAL;
 	}
@@ -799,7 +803,7 @@ pshm_mmap(
 		PSHM_SUBSYS_UNLOCK();
 		return EINVAL;
 	}
-	if (end_pos > (vm_map_size_t)pinfo->pshm_length) {
+	if (end_pos > pshm_size) {
 		PSHM_SUBSYS_UNLOCK();
 		return EINVAL;
 	}
@@ -825,12 +829,11 @@ pshm_mmap(
 	}
 
 	PSHM_SUBSYS_UNLOCK();
-	user_map = current_map();
 
 	if (!(flags & MAP_FIXED)) {
-		alloc_flags = VM_FLAGS_ANYWHERE;
 		user_addr = vm_map_round_page(user_addr,
 		    vm_map_page_mask(user_map));
+		vmk_flags = VM_MAP_KERNEL_FLAGS_ANYWHERE();
 	} else {
 		if (user_addr != vm_map_round_page(user_addr,
 		    vm_map_page_mask(user_map))) {
@@ -844,20 +847,17 @@ pshm_mmap(
 		 * Mach VM know that we want it to replace any existing
 		 * mapping with the new one.
 		 */
-		alloc_flags = VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE;
+		vmk_flags = VM_MAP_KERNEL_FLAGS_FIXED(.vmf_overwrite = true);
 	}
 	docow = false;
 
 	mapped_size = 0;
-	vmk_flags = VM_MAP_KERNEL_FLAGS_NONE;
 	/* reserve the entire space first... */
 	kret = vm_map_enter_mem_object(user_map,
 	    &user_addr,
 	    user_size,
 	    0,
-	    alloc_flags,
 	    vmk_flags,
-	    VM_KERN_MEMORY_NONE,
 	    IPC_PORT_NULL,
 	    0,
 	    false,
@@ -884,15 +884,13 @@ pshm_mmap(
 		if (map_size > user_size) {
 			map_size = user_size;
 		}
-		vmk_flags = VM_MAP_KERNEL_FLAGS_NONE;
+
 		kret = vm_map_enter_mem_object(
 			user_map,
 			&user_addr,
 			map_size,
 			0,
-			VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE,
-			vmk_flags,
-			VM_KERN_MEMORY_NONE,
+			VM_MAP_KERNEL_FLAGS_FIXED(.vmf_overwrite = true),
 			pshmobj->pshmo_memobject,
 			file_pos - map_pos,
 			docow,
@@ -942,22 +940,16 @@ out_deref:
 /*
  * Remove a shared memory region name from the name lookup cache.
  */
-static int
+static void
 pshm_unlink_internal(pshm_info_t *pinfo)
 {
 	PSHM_SUBSYS_ASSERT_HELD();
-
-	if (pinfo == NULL) {
-		return EINVAL;
-	}
 
 	pshm_cache_delete(pinfo);
 	pinfo->pshm_flags |= PSHM_REMOVED;
 
 	/* release the "unlink" reference */
 	pshm_deref(pinfo);
-
-	return 0;
 }
 
 int
@@ -970,12 +962,8 @@ shm_unlink(proc_t p, struct shm_unlink_args *uap, __unused int32_t *retval)
 	/*
 	 * Get the name from user args.
 	 */
-	name_pinfo = kheap_alloc(KHEAP_TEMP, sizeof(pshm_info_t),
-	    Z_WAITOK | Z_ZERO);
-	if (name_pinfo == NULL) {
-		error = ENOSPC;
-		goto bad;
-	}
+	name_pinfo = kalloc_type(pshm_info_t,
+	    Z_WAITOK | Z_ZERO | Z_NOFAIL);
 	error = pshm_get_name(name_pinfo, uap->name);
 	if (error != 0) {
 		error = EINVAL;
@@ -1011,11 +999,12 @@ shm_unlink(proc_t p, struct shm_unlink_args *uap, __unused int32_t *retval)
 		goto bad_unlock;
 	}
 
-	error = pshm_unlink_internal(pinfo);
+	pshm_unlink_internal(pinfo);
+	error = 0;
 bad_unlock:
 	PSHM_SUBSYS_UNLOCK();
 bad:
-	kheap_free(KHEAP_TEMP, name_pinfo, sizeof(pshm_info_t));
+	kfree_type(pshm_info_t, name_pinfo);
 	return error;
 }
 
@@ -1046,7 +1035,7 @@ pshm_deref(pshm_info_t *pinfo)
 
 	PSHM_SUBSYS_ASSERT_HELD();
 	if (pinfo->pshm_usecount == 0) {
-		panic("negative usecount in pshm_close\n");
+		panic("negative usecount in pshm_close");
 	}
 	pinfo->pshm_usecount--; /* release this fd's reference */
 
@@ -1062,11 +1051,11 @@ pshm_deref(pshm_info_t *pinfo)
 		while ((pshmobj = SLIST_FIRST(&pinfo->pshm_mobjs)) != NULL) {
 			SLIST_REMOVE_HEAD(&pinfo->pshm_mobjs, pshmo_next);
 			mach_memory_entry_port_release(pshmobj->pshmo_memobject);
-			kheap_free(KM_SHM, pshmobj, sizeof(pshm_mobj_t));
+			kfree_type(pshm_mobj_t, pshmobj);
 		}
 
 		/* free the pinfo itself */
-		kheap_free(KM_SHM, pinfo, sizeof(pshm_info_t));
+		kfree_type(pshm_info_t, pinfo);
 
 		PSHM_SUBSYS_LOCK();
 	}
@@ -1081,10 +1070,10 @@ pshm_closefile(struct fileglob *fg, __unused vfs_context_t ctx)
 
 	PSHM_SUBSYS_LOCK();
 
-	pnode = (pshmnode_t *)fg->fg_data;
+	pnode = (pshmnode_t *)fg_get_data(fg);
 	if (pnode != NULL) {
 		error = 0;
-		fg->fg_data = NULL; /* set fg_data to NULL to avoid racing close()es */
+		fg_set_data(fg, NULL); /* set fg_data to NULL to avoid racing close()es */
 		if (pnode->pinfo != NULL) {
 			pshm_deref(pnode->pinfo);
 			pnode->pinfo = NULL;
@@ -1092,7 +1081,7 @@ pshm_closefile(struct fileglob *fg, __unused vfs_context_t ctx)
 	}
 
 	PSHM_SUBSYS_UNLOCK();
-	kheap_free(KM_SHM, pnode, sizeof(pshmnode_t));
+	kfree_type(pshmnode_t, pnode);
 
 	return error;
 }
@@ -1132,13 +1121,13 @@ pshm_label_associate(struct fileproc *fp, struct vnode *vp, vfs_context_t ctx)
 	pshm_info_t *pshm;
 
 	PSHM_SUBSYS_LOCK();
-	pnode = (pshmnode_t *)fp->f_data;
+	pnode = (pshmnode_t *)fp_get_data(fp);
 	if (pnode != NULL) {
 		pshm = pnode->pinfo;
 		if (pshm != NULL) {
 			mac_posixshm_vnode_label_associate(
-				vfs_context_ucred(ctx), &pshm->pshm_hdr, pshm->pshm_label,
-				vp, vp->v_label);
+				vfs_context_ucred(ctx), &pshm->pshm_hdr,
+				mac_posixshm_label(&pshm->pshm_hdr), vp, mac_vnode_label(vp));
 		}
 	}
 	PSHM_SUBSYS_UNLOCK();

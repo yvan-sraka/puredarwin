@@ -10,20 +10,23 @@ OPTIONS/mach_assert				optional mach_assert
 
 # iig generated implementation files
 
-iokit/DriverKit/OSObject.iig.cpp		optional iokitcpp
-iokit/DriverKit/OSAction.iig.cpp		optional iokitcpp
-iokit/DriverKit/IOService.iig.cpp		optional iokitcpp
-iokit/DriverKit/IOUserClient.iig.cpp		optional iokitcpp
-iokit/DriverKit/IOMemoryDescriptor.iig.cpp		optional iokitcpp
-iokit/DriverKit/IOBufferMemoryDescriptor.iig.cpp		optional iokitcpp
-iokit/DriverKit/IOMemoryMap.iig.cpp		optional iokitcpp
-iokit/DriverKit/IODispatchSource.iig.cpp		optional iokitcpp
-iokit/DriverKit/IODispatchQueue.iig.cpp		optional iokitcpp
-iokit/DriverKit/IOInterruptDispatchSource.iig.cpp		optional iokitcpp
-iokit/DriverKit/IODataQueueDispatchSource.iig.cpp		optional iokitcpp
-iokit/DriverKit/IOServiceNotificationDispatchSource.iig.cpp		optional iokitcpp
-iokit/DriverKit/IOUserServer.iig.cpp		optional iokitcpp
-iokit/DriverKit/IODMACommand.iig.cpp		optional iokitcpp
+./DriverKit/OSObject.iig.cpp		optional iokitcpp
+./DriverKit/OSAction.iig.cpp		optional iokitcpp
+./DriverKit/IOService.iig.cpp		optional iokitcpp
+./DriverKit/IOUserClient.iig.cpp		optional iokitcpp
+./DriverKit/IOMemoryDescriptor.iig.cpp		optional iokitcpp
+./DriverKit/IOBufferMemoryDescriptor.iig.cpp		optional iokitcpp
+./DriverKit/IOMemoryMap.iig.cpp		optional iokitcpp
+./DriverKit/IODispatchSource.iig.cpp		optional iokitcpp
+./DriverKit/IODispatchQueue.iig.cpp		optional iokitcpp
+./DriverKit/IOInterruptDispatchSource.iig.cpp		optional iokitcpp
+./DriverKit/IODataQueueDispatchSource.iig.cpp		optional iokitcpp
+./DriverKit/IOServiceNotificationDispatchSource.iig.cpp		optional iokitcpp
+./DriverKit/IOServiceStateNotificationDispatchSource.iig.cpp		optional iokitcpp
+./DriverKit/IOEventLink.iig.cpp		optional iokitcpp
+./DriverKit/IOWorkGroup.iig.cpp		optional iokitcpp
+./DriverKit/IOUserServer.iig.cpp		optional iokitcpp
+./DriverKit/IODMACommand.iig.cpp		optional iokitcpp
 
 # libIOKit
 
@@ -73,6 +76,7 @@ iokit/Kernel/IOMemoryDescriptor.cpp			optional iokitcpp
 iokit/Kernel/IOMultiMemoryDescriptor.cpp		optional iokitcpp
 iokit/Kernel/IORangeAllocator.cpp			optional iokitcpp
 iokit/Kernel/IOSubMemoryDescriptor.cpp			optional iokitcpp
+iokit/Kernel/IOGuardPageMemoryDescriptor.cpp		optional iokitcpp
 
 iokit/Kernel/IOPlatformExpert.cpp			optional iokitcpp
 iokit/Kernel/IOPlatformIO.cpp				optional iokitcpp
@@ -91,11 +95,17 @@ iokit/Kernel/IOUserClient.cpp				optional iokitcpp
 iokit/Kernel/IOKitDebug.cpp				optional iokitcpp
 iokit/Kernel/IODataQueue.cpp				optional iokitcpp
 iokit/Kernel/IOSharedDataQueue.cpp			optional iokitcpp
+
+# IOKit tests
 iokit/Tests/Tests.cpp					optional iokitcpp
 iokit/Tests/TestIOMemoryDescriptor.cpp      optional iokitcpp
 # iokit/Tests/TestDevice.cpp                optional iokitcpp
 # iokit/Tests/TestContainers.cpp            optional iokitcpp
 # iokit/Tests/TestCollections.cpp           optional iokitcpp
+iokit/Tests/TestServices/TestIOConnectMapMemoryPortLeak45265408.cpp optional iokitcpp
+iokit/Tests/TestServices/TestIODeviceMemoryRosetta.cpp optional iokitcpp
+iokit/Tests/TestServices/TestIOUserClient2022Entitlements.cpp optional iokitcpp
+iokit/Tests/TestServices/TestIOServiceUserNotification.cpp optional iokitcpp
 
 iokit/Kernel/IOStatistics.cpp				optional iokitcpp
 iokit/Kernel/IOInterruptAccounting.cpp			optional iokitcpp
@@ -133,4 +143,8 @@ iokit/Families/IOSystemManagement/IOWatchDogTimer.cpp	optional iokitcpp
 # Performance Control
 iokit/Kernel/IOPerfControl.cpp		optional iokitcpp
 
-iokit/bsddev/skywalk/IOSkywalkSupport.cpp		optional iokitcpp
+# Workload Configuration
+iokit/Kernel/IOWorkloadConfig.cpp			optional iokitcpp
+
+# Skywalk
+iokit/bsddev/skywalk/IOSkywalkSupport.cpp		optional iokitcpp skywalk

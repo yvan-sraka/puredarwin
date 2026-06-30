@@ -25,6 +25,8 @@
  *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_END@
  */
+#ifndef _VM_VM_COMPRESSOR_BACKING_STORE_H_
+#define _VM_VM_COMPRESSOR_BACKING_STORE_H_
 
 #include <kern/kern_types.h>
 #include <kern/locks.h>
@@ -51,17 +53,12 @@
 
 #endif /* !XNU_TARGET_OS_OSX */
 
-#define COMPRESSED_SWAP_CHUNK_SIZE      (C_SEG_BUFSIZE)
-
-#define VM_SWAPFILE_HIWATER_SEGS        (MIN_SWAP_FILE_SIZE / COMPRESSED_SWAP_CHUNK_SIZE)
-
-#define SWAPFILE_RECLAIM_THRESHOLD_SEGS ((17 * (MAX_SWAP_FILE_SIZE / COMPRESSED_SWAP_CHUNK_SIZE)) / 10)
-#define SWAPFILE_RECLAIM_MINIMUM_SEGS   ((13 * (MAX_SWAP_FILE_SIZE / COMPRESSED_SWAP_CHUNK_SIZE)) / 10)
-
 #if defined(XNU_TARGET_OS_OSX)
-#define SWAP_FILE_NAME          "/System/Volumes/VM/swapfile"
+#define SWAP_VOLUME_NAME        "/System/Volumes"
+#define SWAP_FILE_NAME          SWAP_VOLUME_NAME "/VM/swapfile"
 #else
-#define SWAP_FILE_NAME          "/private/var/vm/swapfile"
+#define SWAP_VOLUME_NAME        "/private/var"
+#define SWAP_FILE_NAME          SWAP_VOLUME_NAME "/vm/swapfile"
 #endif
 
 #define SWAPFILENAME_LEN        (int)(strlen(SWAP_FILE_NAME))
@@ -71,6 +68,7 @@
 #define SWAP_DEVICE_SHIFT       33
 
 extern int              vm_num_swap_files;
+extern uint64_t         vm_swap_volume_capacity;
 
 struct swapfile;
 
@@ -94,7 +92,6 @@ struct swapout_io_completion {
 void vm_swapout_iodone(void *, int);
 
 
-static void vm_swapout_finish(c_segment_t, uint64_t, uint32_t, kern_return_t);
 kern_return_t vm_swap_put_finish(struct swapfile *, uint64_t *, int, boolean_t);
 kern_return_t vm_swap_put(vm_offset_t, uint64_t*, uint32_t, c_segment_t, struct swapout_io_completion *);
 
@@ -105,6 +102,7 @@ uint64_t vm_swap_get_total_space(void);
 uint64_t vm_swap_get_used_space(void);
 uint64_t vm_swap_get_free_space(void);
 uint64_t vm_swap_get_max_configured_space(void);
+void vm_swap_reset_max_segs_tracking(uint64_t *alloced_max, uint64_t *used_max);
 
 struct vnode;
 extern void vm_swapfile_open(const char *path, struct vnode **vp);
@@ -113,12 +111,16 @@ extern int vm_swapfile_preallocate(struct vnode *vp, uint64_t *size, boolean_t *
 extern uint64_t vm_swapfile_get_blksize(struct vnode *vp);
 extern uint64_t vm_swapfile_get_transfer_size(struct vnode *vp);
 extern int vm_swapfile_io(struct vnode *vp, uint64_t offset, uint64_t start, int npages, int flags, void *upl_ctx);
+extern __startup_func void vm_compressor_swap_init_swap_file_limit(void);
 
 #if CONFIG_FREEZE
 boolean_t vm_swap_max_budget(uint64_t *);
 int vm_swap_vol_get_budget(struct vnode* vp, uint64_t *freeze_daily_budget);
 #endif /* CONFIG_FREEZE */
+int vm_swap_vol_get_capacity(const char *volume_name, uint64_t *capacity);
 
 #if RECORD_THE_COMPRESSED_DATA
 extern int vm_record_file_write(struct vnode *vp, uint64_t offset, char *buf, int size);
 #endif
+
+#endif /* _VM_VM_COMPRESSOR_BACKING_STORE_H_ */

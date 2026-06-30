@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2007-2020 Apple Inc. All rights reserved.
+ * Copyright (c) 2007-2023 Apple Inc. All rights reserved.
  * Copyright (c) 2005-2006 Apple Computer, Inc. All rights reserved.
  */
 #ifndef _PEXPERT_ARM_BOARD_CONFIG_H
@@ -25,197 +25,64 @@
  * across all clusters.
  */
 
+#ifdef ARM64_BOARD_CONFIG_T6000
+#include <pexpert/arm64/H13.h>
 
-#ifdef ARM64_BOARD_CONFIG_T7000
-#include <pexpert/arm64/H7.h>
-
-#define MAX_L2_CLINE                   6
-#define MAX_CPUS                       3
-#define MAX_CPU_CLUSTERS               1
-#endif  /* ARM64_BOARD_CONFIG_T7000 */
-
-#ifdef ARM64_BOARD_CONFIG_T7001
-#include <pexpert/arm64/H7.h>
-
-#define MAX_L2_CLINE                   6
-#define MAX_CPUS                       3
-#define MAX_CPU_CLUSTERS               1
-#endif  /* ARM64_BOARD_CONFIG_T7001 */
-
-#ifdef ARM64_BOARD_CONFIG_S8000
-#include <pexpert/arm64/H8.h>
-#define MAX_CPUS                       2
-#define MAX_CPU_CLUSTERS               1
-/*
- * The L2 size for twister is in fact 3MB, not 4MB; we round up due
- * to the code being architected for power of 2 cache sizes, and rely
- * on the expected behavior that out of bounds operations will be
- * ignored.
- */
-#define MAX_L2_CLINE                   6
-#endif  /* ARM64_BOARD_CONFIG_S8000 */
-
-#ifdef ARM64_BOARD_CONFIG_S8001
-#include <pexpert/arm64/H8.h>
-#define MAX_CPUS                       2
-#define MAX_CPU_CLUSTERS               1
-/*
- * The L2 size for twister is in fact 3MB, not 4MB; we round up due
- * to the code being architected for power of 2 cache sizes, and rely
- * on the expect behavior that out of bounds operations will be
- * ignored.
- */
-#define MAX_L2_CLINE                   6
-#endif  /* ARM64_BOARD_CONFIG_S8001 */
-
-#ifdef ARM64_BOARD_CONFIG_T8010
-#include <pexpert/arm64/H9.h>
-#define MAX_CPUS                       3
-#define MAX_CPU_CLUSTERS               1
-/*
- * The L2 size for hurricane/zephyr is in fact 3MB, not 4MB; we round up due
- * to the code being architected for power of 2 cache sizes, and rely
- * on the expect behavior that out of bounds operations will be
- * ignored.
- */
-#define MAX_L2_CLINE                   7
-
-#if DEVELOPMENT || DEBUG
-#define PMAP_CS                        1
-#define PMAP_CS_ENABLE                 0
-#endif
-#endif  /* ARM64_BOARD_CONFIG_T8010 */
-
-#ifdef ARM64_BOARD_CONFIG_T8011
-#include <pexpert/arm64/H9.h>
 
 #define MAX_L2_CLINE                   7
-#define MAX_CPUS                       3
-#define MAX_CPU_CLUSTERS               1
+#define MAX_CPUS                       10
+#define MAX_CPU_CLUSTERS               3
+#define MAX_CPU_CLUSTER_PHY_ID         10
+#define HAS_IOA                        1
 
-#if DEVELOPMENT || DEBUG
-#define PMAP_CS                        1
-#define PMAP_CS_ENABLE                 0
-#endif
-#endif  /* ARM64_BOARD_CONFIG_T8011 */
-
-#ifdef ARM64_BOARD_CONFIG_T8015
-#include <pexpert/arm64/H10.h>
-
-#define MAX_L2_CLINE                   7
-#define MAX_CPUS                       6
-#define MAX_CPU_CLUSTERS               2
-
-#define BROKEN_FRIGGING_SLEEP          1 /* Spurious wake: See rdar://problem/29762505 */
-
-#if DEVELOPMENT || DEBUG
-#define PMAP_CS                        1
-#define PMAP_CS_ENABLE                 0
-#endif
-#endif  /* ARM64_BOARD_CONFIG_T8015 */
-
-#ifdef ARM64_BOARD_CONFIG_T8020
-#include <pexpert/arm64/H11.h>
-
-#define MAX_L2_CLINE                   7
-#define MAX_CPUS                       8
-#define MAX_CPU_CLUSTERS               2
-
-#define XNU_MONITOR                    1 /* Secure pmap runtime */
-#endif  /* ARM64_BOARD_CONFIG_T8020 */
-
-#ifdef ARM64_BOARD_CONFIG_T8006
-/*
- * The T8006 consists of 2 Tempest cores (i.e. T8020 eCores) and for most
- * of our purposes here may be considered a functional subset of T8020.
- */
-#include <pexpert/arm64/H11.h>
-
-#undef HAS_UNCORE_CTRS
-#ifdef XNU_TARGET_OS_WATCH // This check might be redundant
-#undef __APRR_SHADOW_SUPPORTED__
-#endif
-
-#define MAX_L2_CLINE                   7
-#define MAX_CPUS                       2
-#define MAX_CPU_CLUSTERS               1
-
-#define XNU_MONITOR                    1 /* Secure pmap runtime */
-#define XNU_MONITOR_T8020_DART         1 /* T8020 DART plugin for secure pmap runtime */
-#define T8020_DART_ALLOW_BYPASS        (1 << 1) /* DART allows translation bypass in certain cases */
-#define XNU_MONITOR_NVME_PPL           1 /* NVMe PPL plugin for secure pmap runtime */
-#define XNU_MONITOR_ANS2_SART          1 /* ANS2 SART plugin for secure pmap runtime */
 #define PMAP_CS                        1
 #define PMAP_CS_ENABLE                 1
-#define PREFER_ARM64_32_BINARIES
-#define PEXPERT_NO_3X_IMAGES           1
-#endif /* ARM64_BOARD_CONFIG_T8006 */
-
-#ifdef ARM64_BOARD_CONFIG_T8027
-#include <pexpert/arm64/H11.h>
-
-#define MAX_L2_CLINE                   7
-#define MAX_CPUS                       8
-#define MAX_CPU_CLUSTERS               2
-
 #define XNU_MONITOR                    1 /* Secure pmap runtime */
-#endif  /* ARM64_BOARD_CONFIG_T8027 */
+#define __ARM_42BIT_PA_SPACE__         1
+#define USE_APPLEARMSMP                1
+#if DEVELOPMENT || DEBUG
+#define XNU_ENABLE_PROCESSOR_EXIT      1 /* Enable xnu processor_exit() by default */
+#endif
+#define XNU_HANDLE_MCC                 1 /* This platform may support MCC error recovery */
+#endif  /* ARM64_BOARD_CONFIG_T6000 */
 
-#ifdef ARM64_BOARD_CONFIG_T8028
-#include <pexpert/arm64/H11.h>
 
-#define MAX_L2_CLINE                   7
-#define MAX_CPUS                       8
-#define MAX_CPU_CLUSTERS               2
 
-#define XNU_MONITOR                    1 /* Secure pmap runtime */
-#define XNU_MONITOR_T8020_DART         1 /* T8020 DART plugin for secure pmap runtime */
-#define T8020_DART_ALLOW_BYPASS        (1 << 1) /* DART allows translation bypass in certain cases */
-#define XNU_MONITOR_NVME_PPL           1 /* NVMe PPL plugin for secure pmap runtime */
-#define XNU_MONITOR_ANS2_SART          1 /* ANS2 SART plugin for secure pmap runtime */
-#define PMAP_CS                        1
-#define PMAP_CS_ENABLE                 1
-#endif  /* ARM64_BOARD_CONFIG_T8028 */
 
-#ifdef ARM64_BOARD_CONFIG_T8030
-#include <pexpert/arm64/H12.h>
 
-#define MAX_L2_CLINE                   7
-#define MAX_CPUS                       6
-#define MAX_CPU_CLUSTERS               2
 
-#define XNU_MONITOR                    1 /* Secure pmap runtime */
-#define XNU_MONITOR_T8020_DART         1 /* T8020 DART plugin for secure pmap runtime */
-#define T8020_DART_ALLOW_BYPASS        (1 << 1) /* DART allows translation bypass in certain cases */
-#define XNU_MONITOR_NVME_PPL           1 /* NVMe PPL plugin for secure pmap runtime */
-#define XNU_MONITOR_ANS2_SART          1 /* ANS2 SART plugin for secure pmap runtime */
-#define XNU_MONITOR_UAT_PPL            1 /* UAT PPL plugin for secure pmap runtime */
-#define PMAP_CS                        1
-#define PMAP_CS_ENABLE                 1
-#endif  /* ARM64_BOARD_CONFIG_T8030 */
+
+
 
 #ifdef ARM64_BOARD_CONFIG_T8101
 #include <pexpert/arm64/H13.h>
-#include <pexpert/arm64/spr_locks.h>
 
 #define MAX_L2_CLINE                   7
 #define MAX_CPUS                       8
 #define MAX_CPU_CLUSTERS               2
 
+#define PMAP_CS                        1
+#define PMAP_CS_ENABLE                 1
 #define XNU_MONITOR                    1 /* Secure pmap runtime */
 #endif  /* ARM64_BOARD_CONFIG_T8101 */
 
 #ifdef ARM64_BOARD_CONFIG_T8103
 #include <pexpert/arm64/H13.h>
-#include <pexpert/arm64/spr_locks.h>
-#undef HAS_SIQ
 
 #define MAX_L2_CLINE                   7
 #define MAX_CPUS                       8
 #define MAX_CPU_CLUSTERS               2
 
+#define PMAP_CS                        1
+#define PMAP_CS_ENABLE                 1
 #define XNU_MONITOR                    1 /* Secure pmap runtime */
 #endif  /* ARM64_BOARD_CONFIG_T8103 */
+
+
+
+
+
+
 
 
 
@@ -243,6 +110,7 @@
 
 #endif  /* ARM64_BOARD_CONFIG_VMAPPLE */
 
+
 #ifndef HAS_UNCORE_CTRS
 #undef UNCORE_VERSION
 #undef UNCORE_PER_CLUSTER
@@ -261,5 +129,20 @@
 #define PREFERRED_USER_CPU_TYPE CPU_TYPE_ARM64_32
 #define PREFERRED_USER_CPU_SUBTYPE CPU_SUBTYPE_ARM64_32_V8
 #endif
+
+
+/*
+ * Some platforms have very expensive timebase routines.  An optimization
+ * is to avoid switching timers on kernel exit/entry, which results in all
+ * time billed to the system timer.  However, when exposed to userspace, it's
+ * reported as user time to indicate that work was done on behalf of
+ * userspace.
+ */
+
+#if CONFIG_SKIP_PRECISE_USER_KERNEL_TIME
+#define PRECISE_USER_KERNEL_TIME HAS_FAST_CNTVCT
+#else /* CONFIG_SKIP_PRECISE_USER_KERNEL_TIME */
+#define PRECISE_USER_KERNEL_TIME 1
+#endif /* !CONFIG_SKIP_PRECISE_USER_KERNEL_TIME */
 
 #endif /* ! _PEXPERT_ARM_BOARD_CONFIG_H */

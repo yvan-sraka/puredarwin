@@ -144,7 +144,6 @@ extern vm_fault_return_t vm_fault_page(
 	/* More arguments: */
 	kern_return_t   *error_code,            /* code if page is in error */
 	boolean_t       no_zero_fill,           /* don't fill absent pages */
-	boolean_t       data_supply,            /* treat as data_supply */
 	vm_object_fault_info_t fault_info);
 
 extern void vm_fault_cleanup(
@@ -165,7 +164,8 @@ extern void vm_fault_unwire(
 	vm_map_entry_t  entry,
 	boolean_t       deallocate,
 	pmap_t          pmap,
-	vm_map_offset_t pmap_addr);
+	vm_map_offset_t pmap_addr,
+	vm_map_offset_t end_addr);
 
 extern kern_return_t    vm_fault_copy(
 	vm_object_t             src_object,

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2000-2006 Apple Computer, Inc. All rights reserved.
+ * Copyright (c) 2000-2021 Apple Computer, Inc. All rights reserved.
  *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
  *
@@ -36,7 +36,7 @@
 
 #include <libkern/section_keywords.h>
 
-#if defined(__arm__) || defined(__arm64__)
+#if defined(__arm64__)
 SECURITY_READ_ONLY_LATE(static uint32_t) gPEKernelConfigurationBitmask;
 #else
 static uint32_t gPEKernelConfigurationBitmask;
@@ -125,11 +125,13 @@ PE_putc_t PE_putc;
 SECURITY_READ_ONLY_LATE(PE_putc_t) PE_putc;
 #endif
 
+extern void console_write_char(char);
+
 void
 PE_init_printf(boolean_t vm_initialized)
 {
 	if (!vm_initialized) {
-		PE_putc = cnputc;
+		PE_putc = console_write_char;
 	} else {
 		vcattach();
 	}

@@ -58,8 +58,22 @@ tables, ... Available hooks are:
 - Middle: globals that require complex initialization (e.g. SFI classes).
 
 
-`STARTUP_SUB_LOCKS_EARLY`
--------------------------
+`STARTUP_SUB_TIMEOUTS`
+----------------------
+
+## Description
+
+Initializes machine timeouts, which are device-tree/boot-args
+configurable timeouts for low level machine code.
+
+See the comments for the MACHINE_TIMEOUT macro on how they are used in
+detail.
+
+- Rank 1: `MACHINE_TIMEOUT`
+- Middle: global lock timeouts that are derived from machine timeouts.
+
+`STARTUP_SUB_LOCKS`
+-------------------
 
 ### Description
 
@@ -67,20 +81,18 @@ Initializes early locks that do not require any memory allocations to be
 initialized. Available hooks are:
 
 - `LCK_GRP_DECLARE*`: automatically initialized lock groups,
-- `LCK_GRP_ATTR_DECLARE`: automatically initialized lock group attributes,
 - `LCK_ATTR_DECLARE`: automatically initialized lock attributes,
 - `LCK_SPIN_DECLARE*`: automatically initialized spinlocks,
 - `LCK_RW_DECLARE`: automatically initialized reader/writer lock,
-- `LCK_MTX_EARLY_DECLARE*`: automatically initialized mutexes, with statically
-  allocated buffers for statistics/tracing,
+- `LCK_MTX_DECLARE`: automatically initialized mutex,
 - `SIMPLE_LOCK_DECLARE*`: automatically initialized simple locks.
 
 ### Rank usage
 
 - Rank 1: Initializes the module (`lck_mod_init`),
-- Rank 2: `LCK_GRP_ATTR_DECLARE`, `LCK_ATTR_DECLARE`,
-- Rank 3: `LCK_GRP_DECLARE*`
-- Rank 4: `LCK_SPIN_DECLARE*`, `LCK_MTX_EARLY_DECLARE*`,
+- Rank 2: `LCK_ATTR_DECLARE`, `LCK_GRP_DECLARE*`
+- Rank 3: compact lock group table init
+- Rank 4: `LCK_SPIN_DECLARE*`, `LCK_MTX_DECLARE*`,
   `LCK_RW_DECLARE`, `SIMPLE_LOCK_DECLARE*`.
 
 
@@ -108,32 +120,8 @@ Allows for subsystems to steal early memory.
 N/A.
 
 
-`STARTUP_SUB_VM_KERNEL`
------------------------
-
-### Description
-
-Denotes that the early kernel VM is initialized.
-
-### Rank usage
-
-N/A.
-
-
 `STARTUP_SUB_KMEM`
 ------------------
-
-### Description
-
-Denotes that `kernel_memory_allocate` is now usable.
-
-### Rank usage
-
-N/A.
-
-
-`STARTUP_SUB_KMEM_ALLOC`
-------------------------
 
 ### Description
 
@@ -143,7 +131,6 @@ Denotes that `kmem_alloc` is now usable.
 
 N/A.
 
-
 `STARTUP_SUB_ZALLOC`
 --------------------
 
@@ -151,7 +138,7 @@ N/A.
 
 Initializes the zone allocator.
 
-- `ZONE_DECLARE`, `ZONE_INIT`: automatically initialized permanent zones.
+- `ZONE_DEFINE`, `ZONE_INIT`: automatically initialized permanent zones.
 - `ZONE_VIEW_DEFINE`, `KALLOC_HEAP_DEFINE`: zone and kalloc heap views.
 
 
@@ -169,13 +156,22 @@ Initializes the zone allocator.
 
 - Rank 3: Initialize kalloc.
 
-- Rank 4: Enable zone caching (uses kalloc)
+- Rank 4: Handle `ZONE_DEFINE` and `ZONE_INIT`.
 
-- Middle: for any initialization that only requires kalloc/zalloc
-          runs `ZONE_DECLARE` and `ZONE_INIT`.
+- Middle: Enable zone caching & logging
 
 - Last:   zone and kalloc heaps (`ZONE_VIEW_DEFINE`, `KALLOC_HEAP_DEFINE`).
 
+`STARTUP_SUB_KTRACE`
+--------------------
+
+### Description
+
+Initializes kdebug and kperf and starts tracing if requested with boot-args.
+
+### Rank usage
+
+N/A.
 
 `STARTUP_SUB_PERCPU`
 --------------------
@@ -190,17 +186,6 @@ Rank 1: allocates the percpu memory, `percpu_foreach_base` and `percpu_foreach`
         become usable.
 
 Rank 2: sets up static percpu counters.
-
-
-`STARTUP_SUB_LOCKS`
--------------------
-
-### Description
-
-Initializes kernel locks that might require allocations (due to statistics and
-tracing features). Available hooks are:
-
-- `LCK_MTX_DECLARE`: automatically initialized mutex,
 
 
 ### Rank usage
@@ -218,7 +203,6 @@ Initializes the codesigning subsystem.
 
 - Rank 1: calls the module initializer (`cs_init`).
 
-
 `STARTUP_SUB_OSLOG`
 -------------------
 
@@ -232,7 +216,7 @@ Initializes the `os_log` facilities.
 
 
 `STARTUP_SUB_MACH_IPC`
--------------------
+----------------------
 
 ### Description
 
@@ -244,8 +228,21 @@ Initializes the Mach IPC subsystem.
 - Rank last: Final IPC initialization.
 
 
-`STARTUP_SUB_SYSCTL`
+`STARTUP_SUB_THREAD_CALL`
 -------------------------
+
+### Description
+
+Initializes the Thread call subsystem (and dependent subsystems).
+
+### Rank usage
+
+- Rank 1: Initiailizes the thread call subsystem
+- Rank Middle: Initialize modules needing thread calls
+
+
+`STARTUP_SUB_SYSCTL`
+--------------------
 
 ### Description
 
@@ -269,7 +266,8 @@ interrupts or preemption enabled may begin enforcement.
 
 ### Rank usage
 
-N/A.
+- Rank 1: Initialize some BSD globals
+- Middle: Initialize some early BSD subsystems
 
 
 `STARTUP_SUB_LOCKDOWN`

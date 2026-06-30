@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2000-2020 Apple Inc. All rights reserved.
+ * Copyright (c) 2000-2021 Apple Inc. All rights reserved.
  *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
  *
@@ -96,7 +96,6 @@
 #include <net/ether_if_module.h>
 #include <sys/socketvar.h>
 #include <net/if_vlan_var.h>
-#include <net/if_6lowpan_var.h>
 #if BOND
 #include <net/if_bond_internal.h>
 #endif /* BOND */
@@ -173,7 +172,9 @@ ether_del_proto(ifnet_t ifp, protocol_family_t protocol_family)
 	}
 
 	if (desc_blk->n_used == 0) {
-		FREE(ifp->if_family_cookie, M_IFADDR);
+		u_int32_t size = desc_blk->n_count * sizeof(struct en_desc) +
+		    ETHER_DESC_HEADER_SIZE;
+		kfree_data(ifp->if_family_cookie, size);
 		ifp->if_family_cookie = 0;
 	} else {
 		/* Decrement n_max_used */
@@ -267,7 +268,7 @@ ether_add_proto_internal(struct ifnet *ifp, protocol_family_t protocol,
 		new_size = new_count * sizeof(struct en_desc) +
 		    ETHER_DESC_HEADER_SIZE;
 
-		tmp = _MALLOC(new_size, M_IFADDR, M_WAITOK);
+		tmp = (struct ether_desc_blk_str *)kalloc_data(new_size, Z_WAITOK);
 		if (tmp == NULL) {
 			/*
 			 * Remove any previous descriptors set in the call.
@@ -278,7 +279,7 @@ ether_add_proto_internal(struct ifnet *ifp, protocol_family_t protocol,
 		bzero(((char *)tmp) + old_size, new_size - old_size);
 		if (desc_blk) {
 			bcopy(desc_blk, tmp, old_size);
-			FREE(desc_blk, M_IFADDR);
+			kfree_data(desc_blk, old_size);
 		}
 		desc_blk = tmp;
 		ifp->if_family_cookie = (uintptr_t)desc_blk;
@@ -392,12 +393,6 @@ ether_demux(ifnet_t ifp, mbuf_t m, char *frame_header,
 		if (_ether_cmp(eh->ether_dhost, IF_LLADDR(ifp))) {
 			m->m_flags |= M_PROMISC;
 		}
-	}
-
-	/* check for IEEE 802.15.4 */
-	if (ether_type == htons(ETHERTYPE_IEEE802154)) {
-		*protocol_family = PF_802154;
-		return 0;
 	}
 
 	/* check for VLAN */
@@ -660,9 +655,6 @@ ether_family_init(void)
 #if IF_HEADLESS
 	if_headless_init();
 #endif /* IF_HEADLESS */
-#if SIXLOWPAN
-	sixlowpan_family_init();
-#endif /* VLAN */
 done:
 
 	return error;

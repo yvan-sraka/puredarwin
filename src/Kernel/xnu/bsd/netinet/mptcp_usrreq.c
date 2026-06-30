@@ -48,6 +48,7 @@
 #include <netinet/tcp_seq.h>
 #include <netinet/tcp_var.h>
 #include <netinet/tcp_timer.h>
+#include <netinet/mptcp.h>
 #include <netinet/mptcp_var.h>
 #include <netinet/mptcp_timer.h>
 
@@ -98,12 +99,6 @@ struct pr_usrreqs mptcp_usrreqs = {
 	.pru_preconnect =       mptcp_usr_preconnect,
 };
 
-
-#if (DEVELOPMENT || DEBUG)
-static int mptcp_disable_entitlements = 0;
-SYSCTL_INT(_net_inet_mptcp, OID_AUTO, disable_entitlements, CTLFLAG_RW | CTLFLAG_LOCKED,
-    &mptcp_disable_entitlements, 0, "Disable Multipath TCP Entitlement Checking");
-#endif
 
 int mptcp_developer_mode = 0;
 SYSCTL_INT(_net_inet_mptcp, OID_AUTO, allow_aggregate, CTLFLAG_RW | CTLFLAG_LOCKED,
@@ -473,11 +468,11 @@ mptcp_getconninfo(struct mptses *mpte, sae_connid_t *cid, uint32_t *flags,
 	*aux_type = 0;
 	*ifindex = 0;
 	*soerror = 0;
+	struct mptcb *mp_tp = mpte->mpte_mptcb;
 
 	/* MPTCP-level global stats */
 	if (*cid == SAE_CONNID_ALL) {
 		struct socket *mp_so = mptetoso(mpte);
-		struct mptcb *mp_tp = mpte->mpte_mptcb;
 		struct conninfo_multipathtcp mptcp_ci;
 		int error = 0;
 
@@ -502,6 +497,9 @@ mptcp_getconninfo(struct mptses *mpte, sae_connid_t *cid, uint32_t *flags,
 		}
 		if (mp_tp->mpt_flags & MPTCPF_FALLBACK_TO_TCP) {
 			*flags |= CIF_MP_DEGRADED;
+		}
+		if (mp_tp->mpt_version == MPTCP_VERSION_1) {
+			*flags |= CIF_MP_V1;
 		}
 
 		*src_len = 0;
@@ -606,6 +604,9 @@ mptcp_getconninfo(struct mptses *mpte, sae_connid_t *cid, uint32_t *flags,
 		if (mpts->mpts_flags & MPTSF_ACTIVE) {
 			*flags |= CIF_MP_ACTIVE;
 		}
+		if (mp_tp->mpt_version == MPTCP_VERSION_1) {
+			*flags |= CIF_MP_V1;
+		}
 
 		return 0;
 	} else {
@@ -670,6 +671,9 @@ mptcp_getconninfo(struct mptses *mpte, sae_connid_t *cid, uint32_t *flags,
 		}
 		if (mpts->mpts_flags & MPTSF_ACTIVE) {
 			*flags |= CIF_MP_ACTIVE;
+		}
+		if (mp_tp->mpt_version == MPTCP_VERSION_1) {
+			*flags |= CIF_MP_V1;
 		}
 
 		/*
@@ -1432,6 +1436,11 @@ mptcp_usr_socheckopt(struct socket *mp_so, struct sockopt *sopt)
 	case SO_NOWAKEFROMSLEEP:
 	case SO_NOAPNFALLBK:
 	case SO_MARK_CELLFALLBACK:
+	case SO_MARK_CELLFALLBACK_UUID:
+	case SO_MARK_KNOWN_TRACKER:
+	case SO_MARK_KNOWN_TRACKER_NON_APP_INITIATED:
+	case SO_MARK_APPROVED_APP_DOMAIN:
+	case SO_FALLBACK_MODE:
 		/*
 		 * Tell the caller that these options are to be processed;
 		 * these will also be recorded later by mptcp_setopt().
@@ -1575,6 +1584,9 @@ mptcp_setopt(struct mptses *mpte, struct sockopt *sopt)
 
 	mp_so = mptetoso(mpte);
 
+	VERIFY(!(mpsotomppcb(mp_so)->mpp_flags & MPP_INSIDE_SETGETOPT));
+	mpsotomppcb(mp_so)->mpp_flags |= MPP_INSIDE_SETGETOPT;
+
 	/*
 	 * Record socket options which are applicable to subflow sockets so
 	 * that we can replay them for new ones; see mptcp_usr_socheckopt()
@@ -1594,6 +1606,10 @@ mptcp_setopt(struct mptses *mpte, struct sockopt *sopt)
 		case SO_NOWAKEFROMSLEEP:
 		case SO_NOAPNFALLBK:
 		case SO_MARK_CELLFALLBACK:
+		case SO_MARK_KNOWN_TRACKER:
+		case SO_MARK_KNOWN_TRACKER_NON_APP_INITIATED:
+		case SO_MARK_APPROVED_APP_DOMAIN:
+		case SO_FALLBACK_MODE:
 			/* record it */
 			break;
 		case SO_FLUSH:
@@ -1646,6 +1662,12 @@ mptcp_setopt(struct mptses *mpte, struct sockopt *sopt)
 
 			goto out;
 		case SO_NECP_ATTRIBUTES:
+			error = necp_set_socket_attributes(&mpsotomppcb(mp_so)->inp_necp_attributes, sopt);
+			if (error) {
+				goto err_out;
+			}
+
+			goto out;
 #endif /* NECP */
 		default:
 			/* nothing to do; just return */
@@ -1745,6 +1767,27 @@ mptcp_setopt(struct mptses *mpte, struct sockopt *sopt)
 				mpte->mpte_flags |= MPTE_FORCE_ENABLE;
 			} else {
 				mpte->mpte_flags &= ~MPTE_FORCE_ENABLE;
+			}
+
+			goto out;
+		case MPTCP_FORCE_VERSION:
+			error = sooptcopyin(sopt, &optval, sizeof(optval),
+			    sizeof(optval));
+			if (error) {
+				goto err_out;
+			}
+
+			if (optval != 0 && optval != 1) {
+				error = EINVAL;
+				goto err_out;
+			}
+
+			if (optval == 0) {
+				mpte->mpte_flags |= MPTE_FORCE_V0;
+				mpte->mpte_flags &= ~MPTE_FORCE_V1;
+			} else {
+				mpte->mpte_flags |= MPTE_FORCE_V1;
+				mpte->mpte_flags &= ~MPTE_FORCE_V0;
 			}
 
 			goto out;
@@ -1863,12 +1906,14 @@ mptcp_setopt(struct mptses *mpte, struct sockopt *sopt)
 
 out:
 
+	mpsotomppcb(mp_so)->mpp_flags &= ~MPP_INSIDE_SETGETOPT;
 	return 0;
 
 err_out:
 	os_log_error(mptcp_log_handle, "%s - %lx: sopt %s (%d, %d) val %d can't be issued error %d\n",
 	    __func__, (unsigned long)VM_KERNEL_ADDRPERM(mpte),
 	    mptcp_sopt2str(level, optname), level, optname, optval, error);
+	mpsotomppcb(mp_so)->mpp_flags &= ~MPP_INSIDE_SETGETOPT;
 	return error;
 }
 
@@ -1941,6 +1986,7 @@ mptcp_fill_info(struct mptses *mpte, struct tcp_info *ti)
 		ti->tcpi_srtt = acttp->t_srtt >> TCP_RTT_SHIFT;
 		ti->tcpi_rttvar = acttp->t_rttvar >> TCP_RTTVAR_SHIFT;
 		ti->tcpi_rttbest = acttp->t_rttbest >> TCP_RTT_SHIFT;
+		ti->tcpi_rcv_srtt = acttp->rcv_srtt >> TCP_RTT_SHIFT;
 	}
 	/* tcpi_snd_ssthresh */
 	/* tcpi_snd_cwnd */
@@ -2002,6 +2048,12 @@ static int
 mptcp_getopt(struct mptses *mpte, struct sockopt *sopt)
 {
 	int error = 0, optval = 0;
+	struct socket *mp_so;
+
+	mp_so = mptetoso(mpte);
+
+	VERIFY(!(mpsotomppcb(mp_so)->mpp_flags & MPP_INSIDE_SETGETOPT));
+	mpsotomppcb(mp_so)->mpp_flags |= MPP_INSIDE_SETGETOPT;
 
 	/*
 	 * We only handle SOPT_GET for TCP level socket options; we should
@@ -2063,6 +2115,15 @@ mptcp_getopt(struct mptses *mpte, struct sockopt *sopt)
 	case MPTCP_FORCE_ENABLE:
 		optval = !!(mpte->mpte_flags & MPTE_FORCE_ENABLE);
 		break;
+	case MPTCP_FORCE_VERSION:
+		if (mpte->mpte_flags & MPTE_FORCE_V0) {
+			optval = 0;
+		} else if (mpte->mpte_flags & MPTE_FORCE_V1) {
+			optval = 1;
+		} else {
+			optval = -1;
+		}
+		break;
 	case MPTCP_EXPECTED_PROGRESS_TARGET:
 		error = sooptcopyout(sopt, &mpte->mpte_time_target, sizeof(mpte->mpte_time_target));
 
@@ -2078,6 +2139,7 @@ mptcp_getopt(struct mptses *mpte, struct sockopt *sopt)
 	}
 
 out:
+	mpsotomppcb(mp_so)->mpp_flags &= ~MPP_INSIDE_SETGETOPT;
 	return error;
 }
 
@@ -2195,6 +2257,14 @@ mptcp_sopt2str(int level, int optname)
 			return "SO_NOAPNFALLBK";
 		case SO_MARK_CELLFALLBACK:
 			return "SO_CELLFALLBACK";
+		case SO_FALLBACK_MODE:
+			return "SO_FALLBACK_MODE";
+		case SO_MARK_KNOWN_TRACKER:
+			return "SO_MARK_KNOWN_TRACKER";
+		case SO_MARK_KNOWN_TRACKER_NON_APP_INITIATED:
+			return "SO_MARK_KNOWN_TRACKER_NON_APP_INITIATED";
+		case SO_MARK_APPROVED_APP_DOMAIN:
+			return "SO_MARK_APPROVED_APP_DOMAIN";
 		case SO_DELEGATED:
 			return "SO_DELEGATED";
 		case SO_DELEGATED_UUID:
@@ -2238,6 +2308,8 @@ mptcp_sopt2str(int level, int optname)
 			return "MPTCP_ALTERNATE_PORT";
 		case MPTCP_FORCE_ENABLE:
 			return "MPTCP_FORCE_ENABLE";
+		case MPTCP_FORCE_VERSION:
+			return "MPTCP_FORCE_VERSION";
 		case MPTCP_EXPECTED_PROGRESS_TARGET:
 			return "MPTCP_EXPECTED_PROGRESS_TARGET";
 		}

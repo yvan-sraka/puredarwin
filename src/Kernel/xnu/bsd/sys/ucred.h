@@ -89,14 +89,13 @@ struct label;
  * it or copies of it be exported outside.
  */
 struct ucred {
-	LIST_ENTRY(ucred)       cr_link; /* never modify this without KAUTH_CRED_HASH_LOCK */
-#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L && !defined(__STDC_NO_ATOMICS__)
-	_Atomic u_long          cr_ref;  /* reference count */
-#elif defined(__cplusplus) && __cplusplus >= 201103L
-	_Atomic u_long          cr_ref;  /* reference count */
+#if BSD_KERNEL_PRIVATE
+	struct ucred_rw        *cr_rw;
+	void                   *cr_unused;
 #else
-	volatile u_long         cr_ref;  /* reference count */
+	LIST_ENTRY(ucred)       cr_link; /* never modify this without KAUTH_CRED_HASH_LOCK */
 #endif
+	u_long                  cr_ref;  /* reference count */
 
 	struct posix_cred {
 		/*
@@ -116,7 +115,7 @@ struct ucred {
 		uid_t   cr_gmuid;       /* UID for group membership purposes */
 		int     cr_flags;       /* flags on credential */
 	} cr_posix;
-	struct label    * OS_PTRAUTH_SIGNED_PTR("ucred.cr_label") cr_label;     /* MAC label */
+	struct label    * OS_PTRAUTH_SIGNED_PTR_AUTH_NULL("ucred.cr_label") cr_label;     /* MAC label */
 
 	/*
 	 * NOTE: If anything else (besides the flags)

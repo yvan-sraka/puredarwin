@@ -33,10 +33,16 @@
 #ifndef _ARM_THREAD_STATUS_H_
 #define _ARM_THREAD_STATUS_H_
 
+#if defined (__arm__) || defined (__arm64__)
+
 #include <mach/machine/_structs.h>
+#include <mach/machine/thread_state.h>
 #include <mach/message.h>
 #include <mach/vm_types.h>
-#include <mach/arm/thread_state.h>
+
+#ifdef XNU_KERNEL_PRIVATE
+#include <os/refcnt.h>
+#endif
 
 /*
  *    Support for determining the state of a thread
@@ -77,10 +83,16 @@
 #define ARM_NEON_SAVED_STATE64   23
 #endif /* XNU_KERNEL_PRIVATE */
 
-
-#define ARM_STATE_FLAVOR_IS_OTHER_VALID(_flavor_) 0
-
 #define ARM_PAGEIN_STATE         27
+
+#ifndef ARM_STATE_FLAVOR_IS_OTHER_VALID
+#define ARM_STATE_FLAVOR_IS_OTHER_VALID(_flavor_) 0
+#endif
+
+#define FLAVOR_MODIFIES_CORE_CPU_REGISTERS(x) \
+((x == ARM_THREAD_STATE) ||     \
+ (x == ARM_THREAD_STATE32) ||   \
+ (x == ARM_THREAD_STATE64))
 
 #define VALID_THREAD_STATE_FLAVOR(x) \
 	((x == ARM_THREAD_STATE) ||           \
@@ -281,7 +293,7 @@ const_thread_state64(const arm_unified_thread_state_t *its)
 }
 
 #if defined(__arm__)
-#include <arm/proc_reg.h>
+#include <arm64/proc_reg.h>
 
 #define ARM_SAVED_STATE (THREAD_STATE_NONE + 1)
 
@@ -510,16 +522,15 @@ struct arm_saved_state {
 typedef struct arm_saved_state arm_saved_state_t;
 
 struct arm_kernel_saved_state {
-	uint64_t x[12];     /* General purpose registers x16-x28 */
+	uint64_t x[10];     /* General purpose registers x19-x28 */
 	uint64_t fp;        /* Frame pointer x29 */
 	uint64_t lr;        /* Link register x30 */
 	uint64_t sp;        /* Stack pointer x31 */
-	uint64_t pc;        /* Program counter */
-	uint32_t cpsr;      /* Current program status register */
-	uint32_t reserved;  /* Reserved padding */
-#if defined(HAS_APPLE_PAC)
-	uint64_t jophash;
-#endif /* defined(HAS_APPLE_PAC) */
+	/* Some things here we DO need to preserve */
+	uint8_t pc_was_in_userspace;
+	uint8_t ssbs;
+	uint8_t dit;
+	uint8_t uao;
 } __attribute__((aligned(16)));
 
 typedef struct arm_kernel_saved_state arm_kernel_saved_state_t;
@@ -535,7 +546,8 @@ typedef struct arm_kernel_saved_state arm_kernel_saved_state_t;
  * and osfmk/arm/machine_routines.h.
  */
 __BEGIN_DECLS
-extern boolean_t ml_set_interrupts_enabled(boolean_t);
+extern uint64_t ml_pac_safe_interrupts_disable(void);
+extern void ml_pac_safe_interrupts_restore(uint64_t);
 __END_DECLS
 
 /*
@@ -567,31 +579,34 @@ extern void ml_check_signed_state(const arm_saved_state_t *, uint64_t, uint32_t,
  */
 #define MANIPULATE_SIGNED_THREAD_STATE(_iss, _instr, ...)                       \
 	do {                                                                    \
-	        boolean_t _intr = ml_set_interrupts_enabled(FALSE);             \
+	        uint64_t _intr = ml_pac_safe_interrupts_disable();              \
 	        asm volatile (                                                  \
-	                "mov	x8, lr"				"\n"            \
+	                "mov	x9, lr"				"\n"            \
 	                "mov	x0, %[iss]"			"\n"            \
+	                "msr	SPSel, #1"			"\n"            \
 	                "ldp	x4, x5, [x0, %[SS64_X16]]"	"\n"            \
-	                "ldr	x6, [x0, %[SS64_PC]]"		"\n"            \
-	                "ldr	w7, [x0, %[SS64_CPSR]]"		"\n"            \
+	                "ldr	x7, [x0, %[SS64_PC]]"		"\n"            \
+	                "ldr	w8, [x0, %[SS64_CPSR]]"		"\n"            \
 	                "ldr	x3, [x0, %[SS64_LR]]"		"\n"            \
-	                "mov	x1, x6"				"\n"            \
-	                "mov	w2, w7"				"\n"            \
+	                "mov	x1, x7"				"\n"            \
+	                "mov	w2, w8"				"\n"            \
 	                "bl	_ml_check_signed_state"		"\n"            \
-	                "mov	x1, x6"				"\n"            \
-	                "mov	w2, w7"				"\n"            \
+	                "mov	x1, x7"				"\n"            \
+	                "mov	w2, w8"				"\n"            \
 	                _instr					"\n"            \
 	                "bl	_ml_sign_thread_state"		"\n"            \
-	                "mov	lr, x8"				"\n"            \
+	                "msr	SPSel, #0"			"\n"            \
+	                "mov	lr, x9"				"\n"            \
 	                :                                                       \
 	                : [iss]         "r"(_iss),                              \
 	                  [SS64_X16]	"i"(ss64_offsetof(x[16])),              \
 	                  [SS64_PC]	"i"(ss64_offsetof(pc)),                 \
 	                  [SS64_CPSR]	"i"(ss64_offsetof(cpsr)),               \
 	                  [SS64_LR]	"i"(ss64_offsetof(lr)),##__VA_ARGS__    \
-	                : "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8"  \
+	                : "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", \
+	                  "x9"                                                  \
 	        );                                                              \
-	        ml_set_interrupts_enabled(_intr);                               \
+	        ml_pac_safe_interrupts_restore(_intr);                          \
 	} while (0)
 
 static inline void
@@ -899,6 +914,14 @@ set_saved_state_exc(arm_saved_state_t *iss, uint32_t exc)
 
 extern void panic_unimplemented(void);
 
+/**
+ * Extracts the SVC (Supervisor Call) number from the appropriate GPR (General
+ * Purpose Register).
+ *
+ * @param[in] iss the 32-bit or 64-bit ARM saved state (i.e. trap frame).
+ *
+ * @return The SVC number.
+ */
 static inline int
 get_saved_state_svc_number(const arm_saved_state_t *iss)
 {
@@ -913,6 +936,7 @@ struct arm_debug_aggregate_state {
 		arm_debug_state32_t ds32;
 		arm_debug_state64_t ds64;
 	} uds;
+	os_refcnt_t     ref;
 } __attribute__((aligned(16)));
 
 typedef struct arm_debug_aggregate_state arm_debug_state_t;
@@ -1024,5 +1048,7 @@ extern void saved_state_to_thread_state32(const arm_saved_state_t*, arm_thread_s
 extern void thread_state32_to_saved_state(const arm_thread_state32_t*, arm_saved_state_t*);
 
 #endif /* XNU_KERNEL_PRIVATE */
+
+#endif /* defined (__arm__) || defined (__arm64__) */
 
 #endif /* _ARM_THREAD_STATUS_H_ */

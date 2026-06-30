@@ -25,6 +25,8 @@
  *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_END@
  */
+#ifndef _VM_VM_COMPRESSOR_H_
+#define _VM_VM_COMPRESSOR_H_
 
 #include <vm/vm_compressor_pager.h>
 #include <vm/vm_kern.h>
@@ -39,25 +41,16 @@
 #include <sys/kdebug.h>
 
 #if defined(__arm64__)
-#include <arm/proc_reg.h>
+#include <arm64/proc_reg.h>
 #endif
 
 #define C_SEG_OFFSET_BITS       16
-#define C_SEG_BUFSIZE           (1024 * 256)
-#define C_SEG_MAX_PAGES         (C_SEG_BUFSIZE / PAGE_SIZE)
 
-#if !defined(__x86_64__)
-#define C_SEG_OFF_LIMIT         (C_SEG_BYTES_TO_OFFSET((C_SEG_BUFSIZE - 512)))
-#define C_SEG_ALLOCSIZE         (C_SEG_BUFSIZE + PAGE_SIZE)
-#else
-#define C_SEG_OFF_LIMIT         (C_SEG_BYTES_TO_OFFSET((C_SEG_BUFSIZE - 128)))
-#define C_SEG_ALLOCSIZE         (C_SEG_BUFSIZE)
-#endif /* !defined(__x86_64__) */
 #define C_SEG_MAX_POPULATE_SIZE (4 * PAGE_SIZE)
 
 #if defined(__arm64__) && (DEVELOPMENT || DEBUG)
 
-#if defined(PLATFORM_WatchOS)
+#if defined(XNU_PLATFORM_WatchOS)
 #define VALIDATE_C_SEGMENTS (1)
 #endif
 #endif /* defined(__arm64__) && (DEVELOPMENT || DEBUG) */
@@ -97,16 +90,6 @@
 #define C_SLOT_C_POPCOUNT_BITS          0
 #define C_SLOT_C_PADDING_BITS           3
 
-#elif __ARM_WKDM_POPCNT__               /* no packing */
-#define C_SLOT_PACKED_PTR_BITS          47
-#define C_SLOT_PACKED_PTR_SHIFT         0
-#define C_SLOT_PACKED_PTR_BASE          ((uintptr_t)KERNEL_PMAP_HEAP_RANGE_START)
-
-#define C_SLOT_C_SIZE_BITS              14
-#define C_SLOT_C_CODEC_BITS             1
-#define C_SLOT_C_POPCOUNT_BITS          18
-#define C_SLOT_C_PADDING_BITS           0
-
 #elif defined(__arm64__)                /* 32G from the heap start */
 #define C_SLOT_PACKED_PTR_BITS          33
 #define C_SLOT_PACKED_PTR_SHIFT         2
@@ -144,7 +127,7 @@ static_assert((C_SEG_OFFSET_BITS + C_SLOT_C_SIZE_BITS +
     C_SLOT_C_PADDING_BITS + C_SLOT_PACKED_PTR_BITS) % 32 == 0);
 
 struct c_slot {
-	uint64_t        c_offset:C_SEG_OFFSET_BITS;
+	uint64_t        c_offset:C_SEG_OFFSET_BITS __kernel_ptr_semantics;
 	uint64_t        c_size:C_SLOT_C_SIZE_BITS;
 #if C_SLOT_C_CODEC_BITS
 	uint64_t        c_codec:C_SLOT_C_CODEC_BITS;
@@ -162,7 +145,7 @@ struct c_slot {
 #if C_SLOT_C_PADDING_BITS
 	uint64_t        c_padding:C_SLOT_C_PADDING_BITS;
 #endif
-	uint64_t        c_packed_ptr:C_SLOT_PACKED_PTR_BITS;
+	uint64_t        c_packed_ptr:C_SLOT_PACKED_PTR_BITS __kernel_ptr_semantics;
 
 	/* debugging fields, typically not present on release kernels */
 #if CHECKSUM_THE_DATA
@@ -199,16 +182,8 @@ struct c_segment {
 	task_t          c_task_owner;
 #endif /* CONFIG_FREEZE */
 
-#define C_SEG_MAX_LIMIT         (1 << 20)       /* this needs to track the size of c_mysegno */
-	uint32_t        c_mysegno:20,
-	    c_busy:1,
-	    c_busy_swapping:1,
-	    c_wanted:1,
-	    c_on_minorcompact_q:1,              /* can also be on the age_q, the majorcompact_q or the swappedin_q */
-
-	    c_state:4,                          /* what state is the segment in which dictates which q to find it on */
-	    c_overage_swap:1,
-	    c_reserved:3;
+#define C_SEG_MAX_LIMIT         (UINT_MAX)       /* this needs to track the size of c_mysegno */
+	uint32_t        c_mysegno;
 
 	uint32_t        c_creation_ts;
 	uint64_t        c_generation_id;
@@ -240,6 +215,30 @@ struct c_segment {
 	thread_t        c_busy_for_thread;
 	uint32_t        c_agedin_ts;
 	uint32_t        c_swappedin_ts;
+	bool            c_swappedin;
+	/*
+	 * Do not pull c_swappedin above into the bitfield below.
+	 * We update it without always taking the segment
+	 * lock and rely on the segment being busy instead.
+	 * The bitfield needs the segment lock. So updating
+	 * this state, if in the bitfield, without the lock
+	 * will race with the updates to the other fields and
+	 * result in a mess.
+	 */
+	uint32_t        c_busy:1,
+	    c_busy_swapping:1,
+	    c_wanted:1,
+	    c_on_minorcompact_q:1,              /* can also be on the age_q, the majorcompact_q or the swappedin_q */
+
+	    c_state:4,                          /* what state is the segment in which dictates which q to find it on */
+	    c_overage_swap:1,
+	    c_has_donated_pages:1,
+#if CONFIG_FREEZE
+	    c_has_freezer_pages:1,
+	    c_reserved:21;
+#else /* CONFIG_FREEZE */
+	c_reserved:22;
+#endif /* CONFIG_FREEZE */
 
 	int             c_slot_var_array_len;
 	struct  c_slot  *c_slot_var_array;
@@ -256,11 +255,11 @@ struct  c_slot_mapping {
 typedef struct c_slot_mapping *c_slot_mapping_t;
 
 
-#define C_SEG_SLOT_VAR_ARRAY_MIN_LEN    C_SEG_MAX_PAGES
-
 extern  int             c_seg_fixed_array_len;
 extern  vm_offset_t     c_buffers;
-#define C_SEG_BUFFER_ADDRESS(c_segno)   ((c_buffers + ((uint64_t)c_segno * (uint64_t)C_SEG_ALLOCSIZE)))
+extern int64_t c_segment_compressed_bytes;
+
+#define C_SEG_BUFFER_ADDRESS(c_segno)   ((c_buffers + ((uint64_t)c_segno * (uint64_t)c_seg_allocsize)))
 
 #define C_SEG_SLOT_FROM_INDEX(cseg, index)      (index < c_seg_fixed_array_len ? &(cseg->c_slot_fixed_array[index]) : &(cseg->c_slot_var_array[index - c_seg_fixed_array_len]))
 
@@ -268,7 +267,6 @@ extern  vm_offset_t     c_buffers;
 #define C_SEG_BYTES_TO_OFFSET(bytes)    ((bytes) / (int) sizeof(int32_t))
 
 #define C_SEG_UNUSED_BYTES(cseg)        (cseg->c_bytes_unused + (C_SEG_OFFSET_TO_BYTES(cseg->c_populated_offset - cseg->c_nextoffset)))
-//todo opensource
 
 #ifndef __PLATFORM_WKDM_ALIGNMENT_MASK__
 #define C_SEG_OFFSET_ALIGNMENT_MASK     0x3ULL
@@ -278,7 +276,7 @@ extern  vm_offset_t     c_buffers;
 #define C_SEG_OFFSET_ALIGNMENT_BOUNDARY __PLATFORM_WKDM_ALIGNMENT_BOUNDARY__
 #endif
 
-#define C_SEG_SHOULD_MINORCOMPACT_NOW(cseg)     ((C_SEG_UNUSED_BYTES(cseg) >= (C_SEG_BUFSIZE / 4)) ? 1 : 0)
+#define C_SEG_SHOULD_MINORCOMPACT_NOW(cseg)     ((C_SEG_UNUSED_BYTES(cseg) >= (c_seg_bufsize / 4)) ? 1 : 0)
 
 /*
  * the decsion to force a c_seg to be major compacted is based on 2 criteria
@@ -287,8 +285,8 @@ extern  vm_offset_t     c_buffers;
  *    of combining this c_seg with another one.
  */
 #define C_SEG_SHOULD_MAJORCOMPACT_NOW(cseg)                                                                                     \
-	((((cseg->c_bytes_unused + (C_SEG_BUFSIZE - C_SEG_OFFSET_TO_BYTES(c_seg->c_nextoffset))) >= (C_SEG_BUFSIZE / 8)) &&     \
-	  ((C_SLOT_MAX_INDEX - cseg->c_slots_used) > (C_SEG_BUFSIZE / PAGE_SIZE))) \
+	((((cseg->c_bytes_unused + (c_seg_bufsize - C_SEG_OFFSET_TO_BYTES(c_seg->c_nextoffset))) >= (c_seg_bufsize / 8)) &&     \
+	  ((C_SLOT_MAX_INDEX - cseg->c_slots_used) > (c_seg_bufsize / PAGE_SIZE))) \
 	? 1 : 0)
 
 #define C_SEG_ONDISK_IS_SPARSE(cseg)    ((cseg->c_bytes_used < cseg->c_bytes_unused) ? 1 : 0)
@@ -331,7 +329,7 @@ extern int vm_compressor_test_seg_wp;
 	if (write_protect_c_segs) {                     \
 	        vm_map_protect(compressor_map,                  \
 	                       (vm_map_offset_t)cseg->c_store.c_buffer,         \
-	                       (vm_map_offset_t)&cseg->c_store.c_buffer[C_SEG_BYTES_TO_OFFSET(C_SEG_ALLOCSIZE)],\
+	                       (vm_map_offset_t)&cseg->c_store.c_buffer[C_SEG_BYTES_TO_OFFSET(c_seg_allocsize)],\
 	                       VM_PROT_READ | VM_PROT_WRITE,    \
 	                       0);                              \
 	}                               \
@@ -342,7 +340,7 @@ extern int vm_compressor_test_seg_wp;
 	if (write_protect_c_segs) {                     \
 	        vm_map_protect(compressor_map,                  \
 	                       (vm_map_offset_t)cseg->c_store.c_buffer,         \
-	                       (vm_map_offset_t)&cseg->c_store.c_buffer[C_SEG_BYTES_TO_OFFSET(C_SEG_ALLOCSIZE)],\
+	                       (vm_map_offset_t)&cseg->c_store.c_buffer[C_SEG_BYTES_TO_OFFSET(c_seg_allocsize)],\
 	                       VM_PROT_READ,                    \
 	                       0);                              \
 	}                                                       \
@@ -365,6 +363,8 @@ void vm_consider_waking_compactor_swapper(void);
 void vm_consider_swapping(void);
 void vm_compressor_flush(void);
 void c_seg_free(c_segment_t);
+bool vm_compressor_is_thrashing(void);
+bool vm_compressor_needs_to_swap(bool wake_memorystatus_thread);
 void c_seg_free_locked(c_segment_t);
 void c_seg_insert_into_age_q(c_segment_t);
 void c_seg_need_delayed_compaction(c_segment_t, boolean_t);
@@ -410,12 +410,15 @@ extern int              c_overage_swapped_limit;
 
 extern queue_head_t     c_minor_list_head;
 extern queue_head_t     c_age_list_head;
-extern queue_head_t     c_swapout_list_head;
+extern queue_head_t     c_major_list_head;
+extern queue_head_t     c_early_swapout_list_head;
+extern queue_head_t     c_regular_swapout_list_head;
+extern queue_head_t     c_late_swapout_list_head;
 extern queue_head_t     c_swappedout_list_head;
 extern queue_head_t     c_swappedout_sparse_list_head;
 
 extern uint32_t         c_age_count;
-extern uint32_t         c_swapout_count;
+extern uint32_t         c_early_swapout_count, c_regular_swapout_count, c_late_swapout_count;
 extern uint32_t         c_swappedout_count;
 extern uint32_t         c_swappedout_sparse_count;
 
@@ -425,6 +428,7 @@ extern uint64_t         last_c_segment_to_warm_generation_id;
 extern boolean_t        hibernate_flushing;
 extern boolean_t        hibernate_no_swapspace;
 extern boolean_t        hibernate_in_progress_with_pinned_swap;
+extern boolean_t        hibernate_flush_timed_out;
 extern uint32_t         swapout_target_age;
 
 extern void c_seg_insert_into_q(queue_head_t *, c_segment_t);
@@ -513,4 +517,11 @@ if (vm_ktrace_enabled) {        \
 	KDBG(x, ## __VA_ARGS__);\
 }                               \
 MACRO_END
+
+#if DEVELOPMENT || DEBUG
+extern bool compressor_running_perf_test;
+extern uint64_t compressor_perf_test_pages_processed;
+#endif /* DEVELOPMENT || DEBUG */
 #endif
+
+#endif /* _VM_VM_COMPRESSOR_H_ */

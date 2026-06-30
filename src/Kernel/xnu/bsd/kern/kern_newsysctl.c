@@ -94,6 +94,12 @@
 #include <ptrauth.h>
 #endif /* defined(HAS_APPLE_PAC) */
 
+#include <libkern/coreanalytics/coreanalytics.h>
+
+#if DEBUG || DEVELOPMENT
+#include <os/system_event_log.h>
+#endif /* DEBUG || DEVELOPMENT */
+
 static LCK_GRP_DECLARE(sysctl_lock_group, "sysctl");
 static LCK_RW_DECLARE(sysctl_geometry_lock, &sysctl_lock_group);
 static LCK_MTX_DECLARE(sysctl_unlocked_node_lock, &sysctl_lock_group);
@@ -256,15 +262,7 @@ sysctl_register_oid(struct sysctl_oid *new_oidp)
 	 */
 	if (!(new_oidp->oid_kind & CTLFLAG_OID2)) {
 #if __x86_64__
-		/*
-		 * XXX:	KHEAP_DEFAULT is perhaps not the most apropriate zone, as it
-		 * XXX:	will subject us to use-after-free by other consumers.
-		 */
-		oidp = kheap_alloc(KHEAP_DEFAULT, sizeof(struct sysctl_oid),
-		    Z_WAITOK | Z_ZERO);
-		if (oidp == NULL) {
-			return;         /* reject: no memory */
-		}
+		oidp = kalloc_type(struct sysctl_oid, Z_WAITOK | Z_ZERO | Z_NOFAIL);
 		/*
 		 * Copy the structure only through the oid_fmt field, which
 		 * is the last field in a non-OID2 OID structure.
@@ -402,7 +400,7 @@ sysctl_unregister_oid(struct sysctl_oid *oidp)
 
 #if __x86_64__
 	/* If it was allocated, free it after dropping the lock */
-	kheap_free(KHEAP_DEFAULT, old_oidp, sizeof(struct sysctl_oid));
+	kfree_type(struct sysctl_oid, old_oidp);
 #endif
 }
 
@@ -1198,14 +1196,14 @@ sysctl_sysctl_name2oid(__unused struct sysctl_oid *oidp, __unused void *arg1,
 		return ENAMETOOLONG;
 	}
 
-	p = kheap_alloc(KHEAP_TEMP, req->newlen + 1, Z_WAITOK);
+	p = (char *)kalloc_data(req->newlen + 1, Z_WAITOK);
 	if (!p) {
 		return ENOMEM;
 	}
 
 	error = SYSCTL_IN(req, p, req->newlen);
 	if (error) {
-		kheap_free(KHEAP_TEMP, p, req->newlen + 1);
+		kfree_data(p, req->newlen + 1);
 		return error;
 	}
 
@@ -1219,7 +1217,7 @@ sysctl_sysctl_name2oid(__unused struct sysctl_oid *oidp, __unused void *arg1,
 	error = name2oid(p, oid, &len);
 	lck_rw_done(&sysctl_geometry_lock);
 
-	kheap_free(KHEAP_TEMP, p, req->newlen + 1);
+	kfree_data(p, req->newlen + 1);
 
 	if (error) {
 		return error;
@@ -1576,7 +1574,7 @@ sysctl_new_user(struct sysctl_req *req, void *p, size_t l)
 STATIC bool
 can_write_experiment_factors(__unused struct sysctl_req *req)
 {
-	if (IOTaskHasEntitlement(current_task(), WRITE_EXPERIMENT_FACTORS_ENTITLEMENT)) {
+	if (IOCurrentTaskHasEntitlement(WRITE_EXPERIMENT_FACTORS_ENTITLEMENT)) {
 		return true;
 	}
 #if DEBUG || DEVELOPMENT
@@ -1925,7 +1923,7 @@ sysctl(proc_t p, struct sysctl_args *uap, __unused int32_t *retval)
 		}
 	}
 
-	namestring = kheap_alloc(KHEAP_TEMP, namestringlen, Z_WAITOK);
+	namestring = (char *)kalloc_data(namestringlen, Z_WAITOK);
 	if (!namestring) {
 		oldlen = 0;
 		goto err;
@@ -1933,7 +1931,7 @@ sysctl(proc_t p, struct sysctl_args *uap, __unused int32_t *retval)
 
 	error = userland_sysctl(FALSE, namestring, namestringlen, name, uap->namelen, &req, &oldlen);
 
-	kheap_free(KHEAP_TEMP, namestring, namestringlen);
+	kfree_data(namestring, namestringlen);
 
 	if ((error) && (error != ENOMEM)) {
 		return error;
@@ -1971,14 +1969,14 @@ sys_sysctlbyname(proc_t p, struct sysctlbyname_args *uap, __unused int32_t *retv
 	}
 	namelen = (size_t)uap->namelen;
 
-	name = kheap_alloc(KHEAP_TEMP, namelen + 1, Z_WAITOK);
+	name = (char *)kalloc_data(namelen + 1, Z_WAITOK);
 	if (!name) {
 		return ENOMEM;
 	}
 
 	error = copyin(uap->name, name, namelen);
 	if (error) {
-		kheap_free(KHEAP_TEMP, name, namelen + 1);
+		kfree_data(name, namelen + 1);
 		return error;
 	}
 	name[namelen] = '\0';
@@ -1988,7 +1986,7 @@ sys_sysctlbyname(proc_t p, struct sysctlbyname_args *uap, __unused int32_t *retv
 	 */
 
 	if (uap->newlen > SIZE_T_MAX) {
-		kheap_free(KHEAP_TEMP, name, namelen + 1);
+		kfree_data(name, namelen + 1);
 		return EINVAL;
 	}
 	newlen = (size_t)uap->newlen;
@@ -2010,7 +2008,7 @@ sys_sysctlbyname(proc_t p, struct sysctlbyname_args *uap, __unused int32_t *retv
 
 	error = userland_sysctl(TRUE, name, namelen + 1, oid, CTL_MAXNAME, &req, &oldlen);
 
-	kheap_free(KHEAP_TEMP, name, namelen + 1);
+	kfree_data(name, namelen + 1);
 
 	if ((error) && (error != ENOMEM)) {
 		return error;
@@ -2145,3 +2143,233 @@ experiment_factor_##name##_handler SYSCTL_HANDLER_ARGS \
 
 experiment_factor_numeric_types
 #undef X
+
+#if DEBUG || DEVELOPMENT
+static int
+sysctl_test_handler SYSCTL_HANDLER_ARGS
+{
+	int error;
+	int64_t value, out = 0;
+
+	/* require setting this sysctl to prevent sysctl -a from running this */
+	if (!req->newptr) {
+		return EINVAL;
+	}
+
+	if (req->newlen != sizeof(value)) {
+		return ERANGE;
+	}
+
+	error = SYSCTL_IN(req, &value, sizeof(value));
+	if (error == 0) {
+		/* call the test that was specified in SYSCTL_TEST_REGISTER */
+		error = ((int (*)(int64_t, int64_t *))(uintptr_t)arg1)(value, &out);
+	}
+	if (error == 0) {
+		error = SYSCTL_OUT(req, &out, sizeof(out));
+	}
+	return error;
+}
+
+void
+sysctl_register_test_startup(struct sysctl_test_setup_spec *spec)
+{
+	struct sysctl_oid *oid = zalloc_permanent_type(struct sysctl_oid);
+
+	*oid = (struct sysctl_oid){
+		.oid_parent     = &sysctl__debug_test_children,
+		.oid_number     = OID_AUTO,
+		.oid_kind       = CTLTYPE_QUAD | CTLFLAG_OID2 | CTLFLAG_WR |
+	    CTLFLAG_PERMANENT | CTLFLAG_LOCKED,
+		.oid_arg1       = (void *)(uintptr_t)spec->st_func,
+		.oid_name       = spec->st_name,
+		.oid_handler    = sysctl_test_handler,
+		.oid_fmt        = "Q",
+		.oid_version    = SYSCTL_OID_VERSION,
+		.oid_descr      = "",
+	};
+	sysctl_register_oid_early(oid);
+}
+
+
+extern void vm_analytics_tick(void *arg0, void *arg1);
+
+/* Manual trigger of vm_analytics_tick for testing on dev/debug kernel. */
+static int
+sysctl_vm_analytics_tick SYSCTL_HANDLER_ARGS
+{
+#pragma unused(arg1, arg2)
+	int error, val = 0;
+	error = sysctl_handle_int(oidp, &val, 0, req);
+	if (error || !req->newptr) {
+		return error;
+	}
+	vm_analytics_tick(NULL, NULL);
+	return 0;
+}
+
+SYSCTL_PROC(_vm, OID_AUTO, analytics_report, CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_LOCKED | CTLFLAG_MASKED, 0, 0, &sysctl_vm_analytics_tick, "I", "");
+
+/* Manual trigger of record_system_event for testing on dev/debug kernel */
+static int
+sysctl_test_record_system_event SYSCTL_HANDLER_ARGS
+{
+#pragma unused(arg1, arg2)
+	int error, val = 0;
+	error = sysctl_handle_int(oidp, &val, 0, req);
+	if (error || !req->newptr) {
+		return error;
+	}
+	record_system_event(SYSTEM_EVENT_TYPE_INFO, SYSTEM_EVENT_SUBSYSTEM_TEST, "sysctl test", "this is a test %s", "message");
+	return 0;
+}
+
+SYSCTL_PROC(_kern, OID_AUTO, test_record_system_event, CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_LOCKED | CTLFLAG_MASKED, 0, 0, &sysctl_test_record_system_event, "-", "");
+
+#endif /* DEBUG || DEVELOPMENT */
+
+
+CA_EVENT(ca_test_event,
+    CA_INT, TestKey,
+    CA_BOOL, TestBool,
+    CA_STATIC_STRING(CA_UUID_LEN), TestString);
+
+/*
+ * Manual testing of sending a CoreAnalytics event
+ */
+static int
+sysctl_test_ca_event SYSCTL_HANDLER_ARGS
+{
+#pragma unused(arg1, arg2)
+	int error, val = 0;
+	/*
+	 * Only send on write
+	 */
+	error = sysctl_handle_int(oidp, &val, 0, req);
+	if (error || !req->newptr) {
+		return error;
+	}
+
+	ca_event_t event = CA_EVENT_ALLOCATE(ca_test_event);
+	CA_EVENT_TYPE(ca_test_event) * event_data = event->data;
+	event_data->TestKey = val;
+	event_data->TestBool = true;
+	uuid_string_t test_str = "sysctl_test_ca_event";
+	strlcpy(event_data->TestString, test_str, CA_UUID_LEN);
+	CA_EVENT_SEND(event);
+	return 0;
+}
+
+SYSCTL_PROC(_kern, OID_AUTO, test_ca_event, CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_LOCKED | CTLFLAG_MASKED, 0, 0, &sysctl_test_ca_event, "I", "");
+
+
+#if DEVELOPMENT || DEBUG
+#if CONFIG_DEFERRED_RECLAIM
+/*
+ * VM reclaim testing
+ */
+extern bool vm_deferred_reclamation_block_until_pid_has_been_reclaimed(pid_t pid);
+
+static int
+sysctl_vm_reclaim_drain_async_queue SYSCTL_HANDLER_ARGS
+{
+#pragma unused(arg1, arg2)
+	int error = EINVAL, pid = 0;
+	/*
+	 * Only send on write
+	 */
+	error = sysctl_handle_int(oidp, &pid, 0, req);
+	if (error || !req->newptr) {
+		return error;
+	}
+
+	bool success = vm_deferred_reclamation_block_until_pid_has_been_reclaimed(pid);
+	if (success) {
+		error = 0;
+	}
+
+	return error;
+}
+
+SYSCTL_PROC(_vm, OID_AUTO, reclaim_drain_async_queue,
+    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_LOCKED | CTLFLAG_MASKED, 0, 0,
+    &sysctl_vm_reclaim_drain_async_queue, "I", "");
+
+extern uint64_t vm_reclaim_max_threshold;
+SYSCTL_QUAD(_vm, OID_AUTO, reclaim_max_threshold, CTLFLAG_RD | CTLFLAG_LOCKED, &vm_reclaim_max_threshold, "");
+#endif /* CONFIG_DEFERRED_RECLAIM */
+
+kern_return_t
+run_compressor_perf_test(
+	user_addr_t buf,
+	size_t buffer_size,
+	uint64_t *time,
+	uint64_t *bytes_compressed,
+	uint64_t *compressor_growth);
+
+struct perf_compressor_data {
+	user_addr_t buffer;
+	size_t buffer_size;
+	uint64_t benchmark_time;
+	uint64_t bytes_processed;
+	uint64_t compressor_growth;
+};
+
+static int
+sysctl_perf_compressor SYSCTL_HANDLER_ARGS
+{
+	int error = EINVAL;
+	size_t len = sizeof(struct perf_compressor_data);
+	struct perf_compressor_data benchmark_data = {0};
+
+	if (req->oldptr == USER_ADDR_NULL || req->oldlen != len ||
+	    req->newptr == USER_ADDR_NULL || req->newlen != len) {
+		return EINVAL;
+	}
+
+	error = SYSCTL_IN(req, &benchmark_data, len);
+	if (error) {
+		return error;
+	}
+
+	kern_return_t ret = run_compressor_perf_test(benchmark_data.buffer, benchmark_data.buffer_size,
+	    &benchmark_data.benchmark_time, &benchmark_data.bytes_processed, &benchmark_data.compressor_growth);
+	switch (ret) {
+	case KERN_SUCCESS:
+		error = 0;
+		break;
+	case KERN_NOT_SUPPORTED:
+		error = ENOTSUP;
+		break;
+	case KERN_INVALID_ARGUMENT:
+		error = EINVAL;
+		break;
+	case KERN_RESOURCE_SHORTAGE:
+		error = EAGAIN;
+		break;
+	default:
+		error = ret;
+		break;
+	}
+	if (error != 0) {
+		return error;
+	}
+
+	return SYSCTL_OUT(req, &benchmark_data, len);
+}
+
+/*
+ * Compressor & swap performance test
+ */
+SYSCTL_PROC(_kern, OID_AUTO, perf_compressor, CTLFLAG_WR | CTLFLAG_MASKED | CTLTYPE_STRUCT,
+    0, 0, sysctl_perf_compressor, "S", "Compressor & swap benchmark");
+#endif /* DEVELOPMENT || DEBUG */
+
+#if CONFIG_JETSAM
+extern uint32_t swapout_sleep_threshold;
+#if DEVELOPMENT || DEBUG
+SYSCTL_UINT(_vm, OID_AUTO, swapout_sleep_threshold, CTLFLAG_RW | CTLFLAG_LOCKED, &swapout_sleep_threshold, 0, "");
+#else /* DEVELOPMENT || DEBUG */
+SYSCTL_UINT(_vm, OID_AUTO, swapout_sleep_threshold, CTLFLAG_RD | CTLFLAG_LOCKED, &swapout_sleep_threshold, 0, "");
+#endif /* DEVELOPMENT || DEBUG */
+#endif /* CONFIG_JETSAM */

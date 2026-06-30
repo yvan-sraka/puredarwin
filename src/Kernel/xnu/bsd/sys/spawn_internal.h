@@ -79,7 +79,6 @@ typedef enum {
 	PSPA_IMP_WATCHPORTS = 3,
 	PSPA_REGISTERED_PORTS = 4,
 	PSPA_PTRAUTH_TASK_PORT = 5,
-	PSPA_SUID_CRED = 6,
 } pspa_t;
 
 /*
@@ -119,8 +118,10 @@ typedef struct _posix_spawn_port_actions {
 typedef struct _ps_mac_policy_extension {
 	char                    policyname[128];
 	union {
+		/* Address of the user space data passed into kernel space */
 		uint64_t        data;
-		void            *datap;         /* pointer in kernel memory */
+		/* In kernel space, offset into the pool of all extensions' data */
+		uint64_t        dataoff;
 	};
 	uint64_t                datalen;
 } _ps_mac_policy_extension_t;
@@ -186,8 +187,8 @@ struct _posix_spawn_persona_info {
 };
 
 #define POSIX_SPAWN_PERSONA_FLAGS_NONE      0x0
-#define POSIX_SPAWN_PERSONA_FLAGS_OVERRIDE  0x1
-#define POSIX_SPAWN_PERSONA_FLAGS_VERIFY    0x2
+#define POSIX_SPAWN_PERSONA_FLAGS_OVERRIDE  0x1 /* noop, the only option */
+#define POSIX_SPAWN_PERSONA_FLAGS_VERIFY    0x2 /* noop, unimplemented */
 
 #define POSIX_SPAWN_PERSONA_ALL_FLAGS \
 	(POSIX_SPAWN_PERSONA_FLAGS_OVERRIDE \
@@ -239,6 +240,19 @@ typedef struct _posix_spawnattr {
 
 	cpu_subtype_t      psa_subcpuprefs[NBINPREFS];   /* subcpu affinity prefs*/
 	uint32_t        psa_options;             /* More options to be passed to posix_spawn */
+	uint32_t        psa_port_soft_limit;     /* port space soft limit */
+	uint32_t        psa_port_hard_limit;     /* port space hard limit */
+	uint32_t        psa_filedesc_soft_limit; /* file descriptor soft limit */
+	uint32_t        psa_filedesc_hard_limit; /* file descriptor hard limit */
+	uint32_t        psa_crash_behavior;      /* crash behavior flags */
+	int             psa_dataless_iopolicy;   /* materialize dataless iopolicy parameter */
+	uint64_t        psa_crash_behavior_deadline; /* crash behavior deadline */
+	uint8_t         psa_launch_type;         /* type of launch for launch constraint enforcement */
+
+	/* For exponential backoff */
+	uint32_t        psa_crash_count;
+	uint32_t        psa_throttle_timeout;
+
 	/*
 	 * NOTE: Extensions array pointers must stay at the end so that
 	 * everything above this point stays the same size on different bitnesses
@@ -344,6 +358,8 @@ typedef struct _posix_spawnattr {
 __options_decl(posix_spawn_options, uint32_t, {
 	PSA_OPTION_NONE                         = 0,
 	PSA_OPTION_PLUGIN_HOST_DISABLE_A_KEYS   = 0x1,
+	PSA_OPTION_ALT_ROSETTA                  = 0x2,
+	PSA_OPTION_DATALESS_IOPOLICY            = 0x4,
 });
 
 /*

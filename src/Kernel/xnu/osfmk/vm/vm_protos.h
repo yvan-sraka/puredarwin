@@ -74,7 +74,13 @@ extern mach_port_name_t ipc_port_copyout_send(
 extern mach_port_name_t ipc_port_copyout_send_pinned(
 	ipc_port_t      sright,
 	ipc_space_t     space);
-extern task_t port_name_to_task(
+#endif /* _IPC_IPC_PORT_H_ */
+
+#ifndef _KERN_IPC_TT_H_
+
+#define port_name_to_task(name) port_name_to_task_kernel(name)
+
+extern task_t port_name_to_task_kernel(
 	mach_port_name_t name);
 extern task_t port_name_to_task_read(
 	mach_port_name_t name);
@@ -82,7 +88,7 @@ extern task_t port_name_to_task_name(
 	mach_port_name_t name);
 extern void ipc_port_release_send(
 	ipc_port_t      port);
-#endif /* _IPC_IPC_PORT_H_ */
+#endif /* _KERN_IPC_TT_H_ */
 
 extern ipc_space_t  get_task_ipcspace(
 	task_t t);
@@ -93,8 +99,7 @@ extern int max_task_footprint_mb;       /* Per-task limit on physical memory con
 
 /* Some loose-ends VM stuff */
 
-extern vm_map_t         kalloc_map;
-extern vm_size_t        msg_ool_size_small;
+extern const vm_size_t msg_ool_size_small;
 
 extern kern_return_t vm_tests(void);
 extern void consider_machine_adjust(void);
@@ -116,6 +121,10 @@ extern kern_return_t vm_map_purgable_control(
 	int                     *state);
 
 #if MACH_ASSERT
+extern void vm_map_pmap_set_process(
+	vm_map_t        map,
+	int             pid,
+	char            *procname);
 extern void vm_map_pmap_check_ledgers(
 	pmap_t          pmap,
 	ledger_t        ledger,
@@ -155,15 +164,30 @@ extern kern_return_t vm_upl_unmap
 	upl_t upl
 );
 
+extern kern_return_t vm_upl_map_range
+(
+	vm_map_t target_task,
+	upl_t upl,
+	vm_offset_t offset,
+	vm_size_t size,
+	vm_prot_t prot,
+	vm_address_t *address
+);
+
+extern kern_return_t vm_upl_unmap_range
+(
+	vm_map_t target_task,
+	upl_t upl,
+	vm_offset_t offset,
+	vm_size_t size
+);
+
 extern kern_return_t vm_region_object_create
 (
 	vm_map_t target_task,
 	vm_size_t size,
 	ipc_port_t *object_handle
 );
-
-extern mach_vm_offset_t mach_get_vm_start(vm_map_t);
-extern mach_vm_offset_t mach_get_vm_end(vm_map_t);
 
 #if CONFIG_CODE_DECRYPTION
 #define VM_MAP_DEBUG_APPLE_PROTECT      MACH_ASSERT
@@ -201,6 +225,11 @@ extern memory_object_t shared_region_pager_setup(
 	vm_object_offset_t      backing_offset,
 	struct vm_shared_region_slide_info *slide_info,
 	uint64_t                jop_key);
+
+extern uint64_t apple_protect_pager_purge_all(void);
+extern uint64_t shared_region_pager_purge_all(void);
+extern uint64_t dyld_pager_purge_all(void);
+
 #if __has_feature(ptrauth_calls)
 extern memory_object_t shared_region_pager_match(
 	vm_object_t             backing_object,
@@ -256,8 +285,6 @@ extern kern_return_t fourk_pager_populate(
  * bsd
  */
 struct vnode;
-extern void *upl_get_internal_page_list(
-	upl_t upl);
 
 extern void vnode_setswapmount(struct vnode *);
 extern int64_t vnode_getswappin_avail(struct vnode *);
@@ -400,11 +427,6 @@ extern kern_return_t vnode_pager_data_initialize(
 	memory_object_cluster_size_t);
 extern void vnode_pager_reference(
 	memory_object_t         mem_obj);
-extern kern_return_t vnode_pager_synchronize(
-	memory_object_t         mem_obj,
-	memory_object_offset_t  offset,
-	memory_object_size_t            length,
-	vm_sync_t               sync_flags);
 extern kern_return_t vnode_pager_map(
 	memory_object_t         mem_obj,
 	vm_prot_t               prot);
@@ -450,14 +472,6 @@ extern kern_return_t device_pager_data_return(memory_object_t,
 extern kern_return_t device_pager_data_initialize(memory_object_t,
     memory_object_offset_t,
     memory_object_cluster_size_t);
-extern kern_return_t device_pager_data_unlock(memory_object_t,
-    memory_object_offset_t,
-    memory_object_size_t,
-    vm_prot_t);
-extern kern_return_t device_pager_synchronize(memory_object_t,
-    memory_object_offset_t,
-    memory_object_size_t,
-    vm_sync_t);
 extern kern_return_t device_pager_map(memory_object_t, vm_prot_t);
 extern kern_return_t device_pager_last_unmap(memory_object_t);
 extern kern_return_t device_pager_populate_object(
@@ -535,6 +549,14 @@ extern kern_return_t memory_entry_access_tracking_internal(
 	uint32_t        *access_tracking_reads,
 	uint32_t        *access_tracking_writes);
 
+extern kern_return_t mach_memory_object_memory_entry_64(
+	host_t                  host,
+	boolean_t               internal,
+	vm_object_offset_t      size,
+	vm_prot_t               permission,
+	memory_object_t         pager,
+	ipc_port_t              *entry_handle);
+
 extern kern_return_t mach_memory_entry_purgable_control(
 	ipc_port_t      entry_port,
 	vm_purgable_t   control,
@@ -577,37 +599,23 @@ extern kern_return_t mach_memory_entry_range_op(
 	int                     *range);
 
 extern void mach_memory_entry_port_release(ipc_port_t port);
-extern void mach_destroy_memory_entry(ipc_port_t port);
-extern kern_return_t mach_memory_entry_allocate(
-	struct vm_named_entry **user_entry_p,
-	ipc_port_t *user_handle_p);
+extern vm_named_entry_t mach_memory_entry_from_port(ipc_port_t port);
+extern struct vm_named_entry *mach_memory_entry_allocate(ipc_port_t *user_handle_p);
 extern vm_object_t vm_named_entry_to_vm_object(
 	vm_named_entry_t        named_entry);
-extern kern_return_t vm_named_entry_from_vm_object(
+extern void vm_named_entry_associate_vm_object(
 	vm_named_entry_t        named_entry,
 	vm_object_t             object,
 	vm_object_offset_t      offset,
 	vm_object_size_t        size,
 	vm_prot_t               prot);
 
-extern void vm_paging_map_init(void);
-
 extern int macx_backing_store_compaction(int flags);
 extern unsigned int mach_vm_ctl_page_free_wanted(void);
 
 extern int no_paging_space_action(void);
 
-/*
- * counts updated by revalidate_text_page()
- */
 extern unsigned int vmtc_total;        /* total # of text page corruptions detected */
-extern unsigned int vmtc_undiagnosed;  /* of that what wasn't diagnosed */
-extern unsigned int vmtc_not_eligible; /* failed to correct, due to page attributes */
-extern unsigned int vmtc_copyin_fail;  /* of undiagnosed, copyin failure count */
-extern unsigned int vmtc_not_found;    /* of diagnosed, no error found - code signing error? */
-extern unsigned int vmtc_one_bit_flip; /* of diagnosed, single bit errors */
-#define MAX_TRACK_POWER2 9             /* of diagnosed, counts of 1, 2, 4,... bytes corrupted */
-extern unsigned int vmtc_byte_counts[MAX_TRACK_POWER2 + 1];
 
 extern kern_return_t revalidate_text_page(task_t, vm_map_offset_t);
 
@@ -620,15 +628,21 @@ int vm_toggle_entry_reuse(int, int*);
 #define SWAP_READ               0x00000001      /* Read buffer. */
 #define SWAP_ASYNC              0x00000002      /* Start I/O, do not wait. */
 
-extern void vm_compressor_pager_init(void);
 extern kern_return_t compressor_memory_object_create(
 	memory_object_size_t,
 	memory_object_t *);
 
 extern boolean_t vm_compressor_low_on_space(void);
+extern bool vm_compressor_compressed_pages_nearing_limit(void);
 extern boolean_t vm_compressor_out_of_space(void);
 extern int       vm_swap_low_on_space(void);
+extern int       vm_swap_out_of_space(void);
 void             do_fastwake_warmup_all(void);
+
+#if defined(__arm64__)
+extern void vm_panic_hibernate_write_image_failed(int err);
+#endif /* __arm64__ */
+
 #if CONFIG_JETSAM
 extern int proc_get_memstat_priority(struct proc*, boolean_t);
 #endif /* CONFIG_JETSAM */
@@ -676,6 +690,7 @@ struct vm_page_secluded_data {
 	int     grab_success_other;
 	int     grab_failure_locked;
 	int     grab_failure_state;
+	int     grab_failure_realtime;
 	int     grab_failure_dirty;
 	int     grab_for_iokit;
 	int     grab_for_iokit_success;
@@ -685,12 +700,34 @@ extern struct vm_page_secluded_data vm_page_secluded;
 extern int num_tasks_can_use_secluded_mem;
 
 /* boot-args */
-extern int secluded_for_apps;
-extern int secluded_for_iokit;
-extern int secluded_for_filecache;
-#if 11
-extern int secluded_for_fbdp;
-#endif
+
+__enum_decl(secluded_filecache_mode_t, uint8_t, {
+	/*
+	 * SECLUDED_FILECACHE_NONE:
+	 * + no file contents in secluded pool
+	 */
+	SECLUDED_FILECACHE_NONE = 0,
+	/*
+	 * SECLUDED_FILECACHE_APPS
+	 * + no files from /
+	 * + files from /Applications/ are OK
+	 * + files from /Applications/Camera are not OK
+	 * + no files that are open for write
+	 */
+	SECLUDED_FILECACHE_APPS = 1,
+	/*
+	 * SECLUDED_FILECACHE_RDONLY
+	 * + all read-only files OK, except:
+	 *      + dyld_shared_cache_arm64*
+	 *      + Camera
+	 *	+ mediaserverd
+	 */
+	SECLUDED_FILECACHE_RDONLY = 2,
+});
+
+extern secluded_filecache_mode_t secluded_for_filecache;
+extern bool secluded_for_apps;
+extern bool secluded_for_iokit;
 
 extern uint64_t vm_page_secluded_drain(void);
 extern void             memory_object_mark_eligible_for_secluded(
@@ -698,6 +735,15 @@ extern void             memory_object_mark_eligible_for_secluded(
 	boolean_t                       eligible_for_secluded);
 
 #endif /* CONFIG_SECLUDED_MEMORY */
+
+extern void             memory_object_mark_for_realtime(
+	memory_object_control_t         control,
+	bool                            for_realtime);
+
+#if MACH_ASSERT
+extern void             memory_object_mark_for_fbdp(
+	memory_object_control_t         control);
+#endif /* MACH_ASSERT */
 
 #define MAX_PAGE_RANGE_QUERY    (1ULL * 1024 * 1024 * 1024) /* 1 GB */
 
@@ -716,6 +762,8 @@ memory_entry_check_for_adjustment(
 	ipc_port_t                      port,
 	vm_map_offset_t         *overmap_start,
 	vm_map_offset_t         *overmap_end);
+
+extern uint64_t vm_purge_filebacked_pagers(void);
 
 #define roundup(x, y)   ((((x) % (y)) == 0) ? \
 	                (x) : ((x) + ((y) - ((x) % (y)))))
@@ -842,6 +890,7 @@ extern const char *debug4k_category_name[];
 #define DEBUG4K_VFS(...)
 
 #endif /* MACH_ASSERT */
+
 
 #endif  /* _VM_VM_PROTOS_H_ */
 

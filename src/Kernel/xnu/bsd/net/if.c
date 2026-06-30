@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2000-2020 Apple Inc. All rights reserved.
+ * Copyright (c) 2000-2023 Apple Inc. All rights reserved.
  *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
  *
@@ -127,8 +127,13 @@
 #include <netinet6/nd6.h>
 #endif /* INET */
 
+#if SKYWALK
+#include <skywalk/nexus/netif/nx_netif.h>
+#endif /* SKYWALK */
 
 #include <os/log.h>
+
+#include <IOKit/IOBSD.h>
 
 /*
  * System initialization
@@ -137,9 +142,8 @@
 extern char *proc_name_address(void *);
 
 /* Lock group and attribute for ifaddr lock */
-lck_attr_t      *ifa_mtx_attr;
-lck_grp_t       *ifa_mtx_grp;
-static lck_grp_attr_t   *ifa_mtx_grp_attr;
+LCK_ATTR_DECLARE(ifa_mtx_attr, 0, 0);
+LCK_GRP_DECLARE(ifa_mtx_grp, "ifaddr");
 
 static int ifioctl_ifreq(struct socket *, u_long, struct ifreq *,
     struct proc *);
@@ -185,16 +189,15 @@ static void if_detach_ifa_common(struct ifnet *, struct ifaddr *, int);
 static void if_attach_ifma(struct ifnet *, struct ifmultiaddr *, int);
 static int if_detach_ifma(struct ifnet *, struct ifmultiaddr *, int);
 
-static struct ifmultiaddr *ifma_alloc(int);
+static struct ifmultiaddr *ifma_alloc(zalloc_flags_t);
 static void ifma_free(struct ifmultiaddr *);
 static void ifma_trace(struct ifmultiaddr *, int);
 
 #if DEBUG
-static unsigned int ifma_debug = 1;     /* debugging (enabled) */
+static TUNABLE(bool, ifma_debug, "ifma_debug", true); /* debugging (enabled) */
 #else
-static unsigned int ifma_debug;         /* debugging (disabled) */
+static TUNABLE(bool, ifma_debug, "ifma_debug", false); /* debugging (disabled) */
 #endif /* !DEBUG */
-static unsigned int ifma_size;          /* size of zone element */
 static struct zone *ifma_zone;          /* zone for ifmultiaddr */
 
 #define IFMA_TRACE_HIST_SIZE    32      /* size of trace history */
@@ -219,7 +222,7 @@ struct ifmultiaddr_dbg {
 
 /* List of trash ifmultiaddr entries protected by ifma_trash_lock */
 static TAILQ_HEAD(, ifmultiaddr_dbg) ifma_trash_head;
-static decl_lck_mtx_data(, ifma_trash_lock);
+static LCK_MTX_DECLARE_ATTR(ifma_trash_lock, &ifa_mtx_grp, &ifa_mtx_attr);
 
 #define IFMA_ZONE_MAX           64              /* maximum elements in zone */
 #define IFMA_ZONE_NAME          "ifmultiaddr"   /* zone name */
@@ -229,7 +232,6 @@ static decl_lck_mtx_data(, ifma_trash_lock);
  * should be more generalized?
  */
 extern void     nd6_setmtu(struct ifnet *);
-extern lck_mtx_t *nd6_mutex;
 
 SYSCTL_NODE(_net, PF_LINK, link, CTLFLAG_RW | CTLFLAG_LOCKED, 0, "Link layers");
 SYSCTL_NODE(_net_link, 0, generic, CTLFLAG_RW | CTLFLAG_LOCKED, 0,
@@ -287,7 +289,85 @@ SYSCTL_PROC(_net_link_generic_system, OID_AUTO, companion_sndbuf_limit,
     &companion_link_sock_buffer_limit, 0, sysctl_set_companion_link_sock_buf_limit,
     "I", "set sock send buffer limit of connections using companion links");
 
-boolean_t intcoproc_unrestricted;
+
+TUNABLE(bool, intcoproc_unrestricted, "intcoproc_unrestricted", false);
+
+SYSCTL_NODE(_net_link_generic_system, OID_AUTO, management,
+    CTLFLAG_RW | CTLFLAG_LOCKED, 0, "management interface");
+
+TUNABLE_WRITEABLE(int, if_management_verbose, "management_data_unrestricted", 0);
+
+SYSCTL_INT(_net_link_generic_system_management, OID_AUTO, verbose,
+    CTLFLAG_RW | CTLFLAG_LOCKED, &if_management_verbose, 0, "");
+
+/*
+ * boot-args to disable entitlement check for data transfer on management interface
+ */
+TUNABLE_DEV_WRITEABLE(bool, management_data_unrestricted, "management_data_unrestricted", false);
+
+#if DEBUG || DEVELOPMENT
+#define MANAGEMENT_CTLFLAG_ACCESS CTLFLAG_RW
+#else
+#define MANAGEMENT_CTLFLAG_ACCESS CTLFLAG_RD
+#endif
+
+static int
+sysctl_management_data_unrestricted SYSCTL_HANDLER_ARGS
+{
+#pragma unused(oidp, arg1, arg2)
+	int val = management_data_unrestricted;
+
+	int error = sysctl_handle_int(oidp, &val, 0, req);
+#if DEBUG || DEVELOPMENT
+	if (error == 0 && req->newptr != USER_ADDR_NULL) {
+		management_data_unrestricted = (val == 0) ? false : true;
+		if (if_management_verbose > 0) {
+			os_log(OS_LOG_DEFAULT,
+			    "sysctl_management_data_unrestricted val %d -> management_data_unrestricted %d",
+			    val, management_data_unrestricted);
+		}
+	}
+#endif /* DEBUG || DEVELOPMENT */
+	return error;
+}
+
+SYSCTL_PROC(_net_link_generic_system_management, OID_AUTO, data_unrestricted,
+    CTLTYPE_INT | MANAGEMENT_CTLFLAG_ACCESS | CTLFLAG_LOCKED, 0, 0,
+    sysctl_management_data_unrestricted, "I", "");
+
+/*
+ * boot-args to disable entitlement restrictions to control management interfaces
+ */
+TUNABLE_DEV_WRITEABLE(bool, management_control_unrestricted, "management_control_unrestricted", false);
+
+static int
+sysctl_management_control_unrestricted SYSCTL_HANDLER_ARGS
+{
+#pragma unused(oidp, arg1, arg2)
+	int val = management_control_unrestricted;
+
+	int error = sysctl_handle_int(oidp, &val, 0, req);
+#if DEBUG || DEVELOPMENT
+	if (error == 0 && req->newptr != USER_ADDR_NULL) {
+		management_control_unrestricted = (val == 0) ? false : true;
+		if (if_management_verbose > 0) {
+			os_log(OS_LOG_DEFAULT,
+			    "sysctl_management_control_unrestricted val %d -> management_control_unrestricted %d",
+			    val, management_control_unrestricted);
+		}
+	}
+#endif /* DEBUG || DEVELOPMENT */
+	return error;
+}
+
+SYSCTL_PROC(_net_link_generic_system_management, OID_AUTO, control_unrestricted,
+    CTLTYPE_INT | MANAGEMENT_CTLFLAG_ACCESS | CTLFLAG_LOCKED, 0, 0,
+    sysctl_management_control_unrestricted, "I", "");
+
+#undef MANAGEMENT_CTLFLAG_ACCESS
+
+/* The following is set as soon as IFNET_SUBFAMILY_MANAGEMENT is used */
+bool if_management_interface_check_needed = false;
 
 /* Eventhandler context for interface events */
 struct eventhandler_lists_ctxt ifnet_evhdlr_ctxt;
@@ -295,22 +375,11 @@ struct eventhandler_lists_ctxt ifnet_evhdlr_ctxt;
 void
 ifa_init(void)
 {
-	/* Setup lock group and attribute for ifaddr */
-	ifa_mtx_grp_attr = lck_grp_attr_alloc_init();
-	ifa_mtx_grp = lck_grp_alloc_init("ifaddr", ifa_mtx_grp_attr);
-	ifa_mtx_attr = lck_attr_alloc_init();
-
-	PE_parse_boot_argn("ifa_debug", &ifma_debug, sizeof(ifma_debug));
-
-	ifma_size = (ifma_debug == 0) ? sizeof(struct ifmultiaddr) :
+	size_t ifma_size = (ifma_debug == 0) ? sizeof(struct ifmultiaddr) :
 	    sizeof(struct ifmultiaddr_dbg);
 
 	ifma_zone = zone_create(IFMA_ZONE_NAME, ifma_size, ZC_NONE);
-	lck_mtx_init(&ifma_trash_lock, ifa_mtx_grp, ifa_mtx_attr);
 	TAILQ_INIT(&ifma_trash_head);
-
-	PE_parse_boot_argn("intcoproc_unrestricted", &intcoproc_unrestricted,
-	    sizeof(intcoproc_unrestricted));
 }
 
 /*
@@ -359,6 +428,7 @@ if_attach_ifa_common(struct ifnet *ifp, struct ifaddr *ifa, int link)
 	}
 	IFA_ADDREF_LOCKED(ifa);
 	ifa->ifa_debug |= IFD_ATTACHED;
+
 	if (link) {
 		TAILQ_INSERT_HEAD(&ifp->if_addrhead, ifa, ifa_link);
 	} else {
@@ -369,6 +439,9 @@ if_attach_ifa_common(struct ifnet *ifp, struct ifaddr *ifa, int link)
 		(*ifa->ifa_attached)(ifa);
 	}
 
+#if SKYWALK
+	SK_NXS_MS_IF_ADDR_GENCNT_INC(ifp);
+#endif /* SKYWALK */
 }
 
 __private_extern__ void
@@ -431,6 +504,9 @@ if_detach_ifa_common(struct ifnet *ifp, struct ifaddr *ifa, int link)
 		(*ifa->ifa_detached)(ifa);
 	}
 
+#if SKYWALK
+	SK_NXS_MS_IF_ADDR_GENCNT_INC(ifp);
+#endif /* SKYWALK */
 }
 
 #define INITIAL_IF_INDEXLIM     8
@@ -456,6 +532,14 @@ if_next_index(void)
 	static int      if_indexlim = 0;
 	int             new_index;
 
+	/*
+	 * Although we are returning an integer,
+	 * ifnet's if_index is a uint16_t which means
+	 * that's our upper bound.
+	 */
+	if (if_index >= UINT16_MAX) {
+		return -1;
+	}
 	new_index = ++if_index;
 	if (if_index > if_indexlim) {
 		unsigned        n;
@@ -463,8 +547,10 @@ if_next_index(void)
 		caddr_t         new_ifnet_addrs;
 		caddr_t         new_ifindex2ifnet;
 		caddr_t         old_ifnet_addrs;
+		size_t          old_ifnet_size;
 
 		old_ifnet_addrs = (caddr_t)ifnet_addrs;
+		old_ifnet_size = (size_t)(2 * if_indexlim + 1);
 		if (ifnet_addrs == NULL) {
 			new_if_indexlim = INITIAL_IF_INDEXLIM;
 		} else {
@@ -472,22 +558,18 @@ if_next_index(void)
 		}
 
 		/* allocate space for the larger arrays */
-		n = (2 * new_if_indexlim + 1) * sizeof(caddr_t);
-		new_ifnet_addrs = _MALLOC(n, M_IFADDR, M_WAITOK | M_ZERO);
+		n = (2 * new_if_indexlim + 1);
+		new_ifnet_addrs = (caddr_t)kalloc_type(caddr_t, n, Z_WAITOK | Z_ZERO);
 		if (new_ifnet_addrs == NULL) {
 			--if_index;
 			return -1;
 		}
 
-		new_ifindex2ifnet = new_ifnet_addrs
-		    + new_if_indexlim * sizeof(caddr_t);
+		new_ifindex2ifnet = new_ifnet_addrs + new_if_indexlim * sizeof(caddr_t);
 		if (ifnet_addrs != NULL) {
 			/* copy the existing data */
-			bcopy((caddr_t)ifnet_addrs, new_ifnet_addrs,
-			    if_indexlim * sizeof(caddr_t));
-			bcopy((caddr_t)ifindex2ifnet,
-			    new_ifindex2ifnet,
-			    (if_indexlim + 1) * sizeof(caddr_t));
+			bcopy(ifnet_addrs, new_ifnet_addrs, if_indexlim * sizeof(caddr_t));
+			bcopy(ifindex2ifnet, new_ifindex2ifnet, (if_indexlim + 1) * sizeof(caddr_t));
 		}
 
 		/* switch to the new tables and size */
@@ -497,7 +579,8 @@ if_next_index(void)
 
 		/* release the old data */
 		if (old_ifnet_addrs != NULL) {
-			_FREE((caddr_t)old_ifnet_addrs, M_IFADDR);
+			void *old_ifnet_addrs_p = (void *)old_ifnet_addrs;
+			kfree_type(caddr_t, old_ifnet_size, old_ifnet_addrs_p);
 		}
 	}
 	return new_index;
@@ -530,12 +613,15 @@ if_clone_create(char *name, int len, void *params)
 	/*
 	 * Find a free unit if none was given.
 	 */
+	lck_mtx_lock(&ifc->ifc_mutex);
+again:
 	if (wildcard) {
 		while ((bytoff < ifc->ifc_bmlen) &&
 		    (ifc->ifc_units[bytoff] == 0xff)) {
 			bytoff++;
 		}
 		if (bytoff >= ifc->ifc_bmlen) {
+			lck_mtx_lock(&ifc->ifc_mutex);
 			return ENOSPC;
 		}
 		while ((ifc->ifc_units[bytoff] & (1 << bitoff)) != 0) {
@@ -545,12 +631,16 @@ if_clone_create(char *name, int len, void *params)
 	}
 
 	if (unit > ifc->ifc_maxunit) {
+		lck_mtx_unlock(&ifc->ifc_mutex);
 		return ENXIO;
 	}
 
-	lck_mtx_lock(&ifc->ifc_mutex);
 	err = (*ifc->ifc_create)(ifc, unit, params);
 	if (err != 0) {
+		if (wildcard && err == EBUSY) {
+			bitoff++;
+			goto again;
+		}
 		lck_mtx_unlock(&ifc->ifc_mutex);
 		return err;
 	}
@@ -657,15 +747,11 @@ if_clone_lookup(const char *name, u_int32_t *unitp)
 	const char *cp;
 	u_int32_t i;
 
-	for (ifc = LIST_FIRST(&if_cloners); ifc != NULL;) {
-		for (cp = name, i = 0; i < ifc->ifc_namelen; i++, cp++) {
-			if (ifc->ifc_name[i] != *cp) {
-				goto next_ifc;
-			}
+	LIST_FOREACH(ifc, &if_cloners, ifc_list) {
+		if (strncmp(name, ifc->ifc_name, ifc->ifc_namelen) == 0) {
+			cp = name + ifc->ifc_namelen;
+			goto found_name;
 		}
-		goto found_name;
-next_ifc:
-		ifc = LIST_NEXT(ifc, ifc_list);
 	}
 
 	/* No match. */
@@ -688,29 +774,6 @@ found_name:
 		*unitp = i;
 	}
 	return ifc;
-}
-
-void *
-if_clone_softc_allocate(const struct if_clone *ifc)
-{
-	void *p_clone = NULL;
-
-	VERIFY(ifc != NULL);
-
-	p_clone = zalloc(ifc->ifc_zone);
-	if (p_clone != NULL) {
-		bzero(p_clone, ifc->ifc_softc_size);
-	}
-
-	return p_clone;
-}
-
-void
-if_clone_softc_deallocate(const struct if_clone *ifc, void *p_softc)
-{
-	VERIFY(ifc != NULL && p_softc != NULL);
-	bzero(p_softc, ifc->ifc_softc_size);
-	zfree(ifc->ifc_zone, p_softc);
 }
 
 /*
@@ -736,17 +799,12 @@ if_clone_attach(struct if_clone *ifc)
 	if ((len << 3) < maxclone) {
 		len++;
 	}
-	ifc->ifc_units = _MALLOC(len, M_CLONE, M_WAITOK | M_ZERO);
+	ifc->ifc_units = (unsigned char *)kalloc_data(len, Z_WAITOK | Z_ZERO);
 	if (ifc->ifc_units == NULL) {
 		return ENOBUFS;
 	}
 	ifc->ifc_bmlen = len;
-	lck_mtx_init(&ifc->ifc_mutex, ifnet_lock_group, ifnet_lock_attr);
-
-	if (ifc->ifc_softc_size != 0) {
-		ifc->ifc_zone = zone_create(ifc->ifc_name, ifc->ifc_softc_size,
-		    ZC_DESTRUCTIBLE);
-	}
+	lck_mtx_init(&ifc->ifc_mutex, &ifnet_lock_group, &ifnet_lock_attr);
 
 	LIST_INSERT_HEAD(&if_cloners, ifc, ifc_list);
 	if_cloners_count++;
@@ -773,12 +831,8 @@ void
 if_clone_detach(struct if_clone *ifc)
 {
 	LIST_REMOVE(ifc, ifc_list);
-	FREE(ifc->ifc_units, M_CLONE);
-	if (ifc->ifc_softc_size != 0) {
-		zdestroy(ifc->ifc_zone);
-	}
-
-	lck_mtx_destroy(&ifc->ifc_mutex, ifnet_lock_group);
+	kfree_data(ifc->ifc_units, ifc->ifc_bmlen);
+	lck_mtx_destroy(&ifc->ifc_mutex, &ifnet_lock_group);
 	if_cloners_count--;
 }
 
@@ -837,11 +891,15 @@ if_functional_type(struct ifnet *ifp, bool exclude_delegate)
 				ret = IFRTYPE_FUNCTIONAL_WIFI_INFRA;
 			}
 		} else if ((exclude_delegate &&
-		    (ifp->if_type == IFT_CELLULAR)) ||
+		    (ifp->if_type == IFT_CELLULAR ||
+		    (ifp->if_family == IFNET_FAMILY_ETHERNET &&
+		    ifp->if_subfamily == IFNET_SUBFAMILY_SIMCELL))) ||
 		    (!exclude_delegate && IFNET_IS_CELLULAR(ifp))) {
 			ret = IFRTYPE_FUNCTIONAL_CELLULAR;
 		} else if (IFNET_IS_INTCOPROC(ifp)) {
 			ret = IFRTYPE_FUNCTIONAL_INTCOPROC;
+		} else if (IFNET_IS_MANAGEMENT(ifp)) {
+			ret = IFRTYPE_FUNCTIONAL_MANAGEMENT;
 		} else if ((exclude_delegate &&
 		    (ifp->if_family == IFNET_FAMILY_ETHERNET ||
 		    ifp->if_family == IFNET_FAMILY_BOND ||
@@ -875,7 +933,7 @@ ifa_foraddr_scoped(unsigned int addr, unsigned int scope)
 {
 	struct in_ifaddr *ia = NULL;
 
-	lck_rw_lock_shared(in_ifaddr_rwlock);
+	lck_rw_lock_shared(&in_ifaddr_rwlock);
 	TAILQ_FOREACH(ia, INADDR_HASH(addr), ia_hash) {
 		IFA_LOCK_SPIN(&ia->ia_ifa);
 		if (ia->ia_addr.sin_addr.s_addr == addr &&
@@ -886,7 +944,7 @@ ifa_foraddr_scoped(unsigned int addr, unsigned int scope)
 		}
 		IFA_UNLOCK(&ia->ia_ifa);
 	}
-	lck_rw_done(in_ifaddr_rwlock);
+	lck_rw_done(&in_ifaddr_rwlock);
 	return ia;
 }
 
@@ -943,14 +1001,14 @@ ifa_ifpgetprimary(struct ifnet *ifp, int family)
 	return ifa;
 }
 
-static inline int
-ifa_equal(const struct sockaddr *sa1, const struct sockaddr *sa2)
+inline boolean_t
+sa_equal(const struct sockaddr *sa1, const struct sockaddr *sa2)
 {
 	if (!sa1 || !sa2) {
-		return 0;
+		return FALSE;
 	}
 	if (sa1->sa_len != sa2->sa_len) {
-		return 0;
+		return FALSE;
 	}
 
 	return bcmp(sa1, sa2, sa1->sa_len) == 0;
@@ -976,7 +1034,7 @@ ifa_ifwithaddr_locked(const struct sockaddr *addr)
 				IFA_UNLOCK(ifa);
 				continue;
 			}
-			if (ifa_equal(addr, ifa->ifa_addr)) {
+			if (sa_equal(addr, ifa->ifa_addr)) {
 				result = ifa;
 				IFA_ADDREF_LOCKED(ifa); /* for caller */
 				IFA_UNLOCK(ifa);
@@ -986,7 +1044,7 @@ ifa_ifwithaddr_locked(const struct sockaddr *addr)
 			    ifa->ifa_broadaddr != NULL &&
 			    /* IP6 doesn't have broadcast */
 			    ifa->ifa_broadaddr->sa_len != 0 &&
-			    ifa_equal(ifa->ifa_broadaddr, addr)) {
+			    sa_equal(ifa->ifa_broadaddr, addr)) {
 				result = ifa;
 				IFA_ADDREF_LOCKED(ifa); /* for caller */
 				IFA_UNLOCK(ifa);
@@ -1037,7 +1095,7 @@ ifa_ifwithdstaddr(const struct sockaddr *addr)
 					IFA_UNLOCK(ifa);
 					continue;
 				}
-				if (ifa_equal(addr, ifa->ifa_dstaddr)) {
+				if (sa_equal(addr, ifa->ifa_dstaddr)) {
 					result = ifa;
 					IFA_ADDREF_LOCKED(ifa); /* for caller */
 					IFA_UNLOCK(ifa);
@@ -1086,7 +1144,7 @@ ifa_ifwithaddr_scoped_locked(const struct sockaddr *addr, unsigned int ifscope)
 				IFA_UNLOCK(ifa);
 				continue;
 			}
-			if (ifa_equal(addr, ifa->ifa_addr)) {
+			if (sa_equal(addr, ifa->ifa_addr)) {
 				result = ifa;
 				IFA_ADDREF_LOCKED(ifa); /* for caller */
 				IFA_UNLOCK(ifa);
@@ -1096,7 +1154,7 @@ ifa_ifwithaddr_scoped_locked(const struct sockaddr *addr, unsigned int ifscope)
 			    ifa->ifa_broadaddr != NULL &&
 			    /* IP6 doesn't have broadcast */
 			    ifa->ifa_broadaddr->sa_len != 0 &&
-			    ifa_equal(ifa->ifa_broadaddr, addr)) {
+			    sa_equal(ifa->ifa_broadaddr, addr)) {
 				result = ifa;
 				IFA_ADDREF_LOCKED(ifa); /* for caller */
 				IFA_UNLOCK(ifa);
@@ -1148,6 +1206,7 @@ ifa_ifwithnet_common(const struct sockaddr *addr, unsigned int ifscope)
 	struct ifaddr *ifa_maybe = NULL;
 	u_int af = addr->sa_family;
 	const char *addr_data = addr->sa_data, *cplim;
+	const struct sockaddr_in6 *sock_addr = (const struct sockaddr_in6*)(const void*)addr;
 
 	if (af != AF_INET && af != AF_INET6) {
 		ifscope = IFSCOPE_NONE;
@@ -1170,6 +1229,11 @@ ifa_ifwithnet_common(const struct sockaddr *addr, unsigned int ifscope)
 			ifnet_head_done();
 			return ifa;
 		}
+	}
+
+	if (!in6_embedded_scope && af == AF_INET6 &&
+	    IN6_IS_SCOPE_EMBED(&sock_addr->sin6_addr)) {
+		VERIFY(ifscope != IFSCOPE_NONE);
 	}
 
 	/*
@@ -1309,8 +1373,8 @@ ifaof_ifpforaddr(const struct sockaddr *addr, struct ifnet *ifp)
 			ifa_maybe = ifa;
 		}
 		if (ifa->ifa_netmask == 0) {
-			if (ifa_equal(addr, ifa->ifa_addr) ||
-			    ifa_equal(addr, ifa->ifa_dstaddr)) {
+			if (sa_equal(addr, ifa->ifa_addr) ||
+			    sa_equal(addr, ifa->ifa_dstaddr)) {
 				IFA_ADDREF_LOCKED(ifa); /* for caller */
 				IFA_UNLOCK(ifa);
 				break;
@@ -1319,13 +1383,13 @@ ifaof_ifpforaddr(const struct sockaddr *addr, struct ifnet *ifp)
 			continue;
 		}
 		if (ifp->if_flags & IFF_POINTOPOINT) {
-			if (ifa_equal(addr, ifa->ifa_dstaddr)) {
+			if (sa_equal(addr, ifa->ifa_dstaddr)) {
 				IFA_ADDREF_LOCKED(ifa); /* for caller */
 				IFA_UNLOCK(ifa);
 				break;
 			}
 		} else {
-			if (ifa_equal(addr, ifa->ifa_addr)) {
+			if (sa_equal(addr, ifa->ifa_addr)) {
 				/* exact match */
 				IFA_ADDREF_LOCKED(ifa); /* for caller */
 				IFA_UNLOCK(ifa);
@@ -1426,13 +1490,13 @@ link_rtrequest(int cmd, struct rtentry *rt, struct sockaddr *sa)
  * up/down state and updating the rest of the flags.
  */
 __private_extern__ void
-if_updown( struct ifnet *ifp, int up)
+if_updown(struct ifnet *ifp, int up)
 {
 	u_int32_t eflags;
 	int i;
 	struct ifaddr **ifa;
 	struct timespec tv;
-	struct ifclassq *ifq = &ifp->if_snd;
+	struct ifclassq *ifq;
 
 	/* Wait until no one else is changing the up/down state */
 	while ((ifp->if_eflags & IFEF_UPDOWNCHANGE) != 0) {
@@ -1460,29 +1524,41 @@ if_updown( struct ifnet *ifp, int up)
 		ifp->if_flags &= ~IFF_UP;
 	}
 
-	ifnet_touch_lastchange(ifp);
-	ifnet_touch_lastupdown(ifp);
+	if (!ifnet_is_attached(ifp, 1)) {
+		/*
+		 * The interface is not attached or is detaching, so
+		 * skip modifying any other state.
+		 */
+		os_log(OS_LOG_DEFAULT, "%s: %s is not attached",
+		    __func__, if_name(ifp));
+	} else {
+		/* Drop the lock to notify addresses and route */
+		ifnet_lock_done(ifp);
 
-	/* Drop the lock to notify addresses and route */
-	ifnet_lock_done(ifp);
+		/* Inform all transmit queues about the new link state */
+		ifq = ifp->if_snd;
+		ASSERT(ifq != NULL);
+		IFCQ_LOCK(ifq);
+		if_qflush_snd(ifp, true);
+		ifnet_update_sndq(ifq,
+		    up ? CLASSQ_EV_LINK_UP : CLASSQ_EV_LINK_DOWN);
+		IFCQ_UNLOCK(ifq);
 
-	IFCQ_LOCK(ifq);
-	if_qflush(ifp, 1);
-
-	/* Inform all transmit queues about the new link state */
-	ifnet_update_sndq(ifq, up ? CLASSQ_EV_LINK_UP : CLASSQ_EV_LINK_DOWN);
-	IFCQ_UNLOCK(ifq);
-
-	if (ifnet_get_address_list(ifp, &ifa) == 0) {
-		for (i = 0; ifa[i] != 0; i++) {
-			pfctlinput(up ? PRC_IFUP : PRC_IFDOWN, ifa[i]->ifa_addr);
+		/* Inform protocols of changed interface state */
+		if (ifnet_get_address_list(ifp, &ifa) == 0) {
+			for (i = 0; ifa[i] != 0; i++) {
+				pfctlinput(up ? PRC_IFUP : PRC_IFDOWN,
+				    ifa[i]->ifa_addr);
+			}
+			ifnet_free_address_list(ifa);
 		}
-		ifnet_free_address_list(ifa);
-	}
-	rt_ifmsg(ifp);
+		rt_ifmsg(ifp);
 
-	/* Aquire the lock to clear the changing flag */
-	ifnet_lock_exclusive(ifp);
+		ifnet_lock_exclusive(ifp);
+		ifnet_touch_lastchange(ifp);
+		ifnet_touch_lastupdown(ifp);
+		ifnet_decr_iorefcnt(ifp);
+	}
 	if_clear_eflags(ifp, IFEF_UPDOWNCHANGE);
 	wakeup(&ifp->if_eflags);
 }
@@ -1517,9 +1593,16 @@ if_up(
  * Flush an interface queue.
  */
 void
-if_qflush(struct ifnet *ifp, int ifq_locked)
+if_qflush(struct ifnet *ifp, struct ifclassq *ifq, bool ifq_locked)
 {
-	struct ifclassq *ifq = &ifp->if_snd;
+	lck_mtx_lock(&ifp->if_ref_lock);
+	if ((ifp->if_refflags & IFRF_ATTACH_MASK) == 0) {
+		lck_mtx_unlock(&ifp->if_ref_lock);
+		return;
+	}
+	VERIFY(ifq != NULL);
+	ifclassq_retain(ifq);
+	lck_mtx_unlock(&ifp->if_ref_lock);
 
 	if (!ifq_locked) {
 		IFCQ_LOCK(ifq);
@@ -1534,15 +1617,27 @@ if_qflush(struct ifnet *ifp, int ifq_locked)
 	if (!ifq_locked) {
 		IFCQ_UNLOCK(ifq);
 	}
+	ifclassq_release(&ifq);
+}
+
+void
+if_qflush_snd(struct ifnet *ifp, bool ifq_locked)
+{
+	if_qflush(ifp, ifp->if_snd, ifq_locked);
 }
 
 void
 if_qflush_sc(struct ifnet *ifp, mbuf_svc_class_t sc, u_int32_t flow,
     u_int32_t *packets, u_int32_t *bytes, int ifq_locked)
 {
-	struct ifclassq *ifq = &ifp->if_snd;
+	struct ifclassq *ifq;
 	u_int32_t cnt = 0, len = 0;
 
+	if ((ifp->if_refflags & IFRF_ATTACH_MASK) == 0) {
+		return;
+	}
+	ifq = ifp->if_snd;
+	VERIFY(ifq != NULL);
 	VERIFY(sc == MBUF_SC_UNSPEC || MBUF_VALID_SC(sc));
 	VERIFY(flow != 0);
 
@@ -1724,7 +1819,7 @@ ifioctl_ifconf(u_long cmd, caddr_t data)
 	case OSIOCGIFCONF64: {                  /* struct ifconf64 */
 		struct ifconf64 ifc;
 		bcopy(data, &ifc, sizeof(ifc));
-		error = ifconf(cmd, ifc.ifc_req, &ifc.ifc_len);
+		error = ifconf(cmd, CAST_USER_ADDR_T(ifc.ifc_req), &ifc.ifc_len);
 		bcopy(&ifc, data, sizeof(ifc));
 		break;
 	}
@@ -1756,7 +1851,7 @@ ifioctl_ifclone(u_long cmd, caddr_t data)
 		struct if_clonereq64 ifcr;
 		bcopy(data, &ifcr, sizeof(ifcr));
 		error = if_clone_list(ifcr.ifcr_count, &ifcr.ifcr_total,
-		    ifcr.ifcru_buffer);
+		    CAST_USER_ADDR_T(ifcr.ifcru_buffer));
 		bcopy(&ifcr, data, sizeof(ifcr));
 		break;
 	}
@@ -1831,8 +1926,9 @@ ifioctl_linkparams(struct ifnet *ifp, u_long cmd, caddr_t data, struct proc *p)
 	int error = 0;
 
 	VERIFY(ifp != NULL);
-	ifq = &ifp->if_snd;
+	ifq = ifp->if_snd;
 
+	ASSERT(ifq != NULL);
 	switch (cmd) {
 	case SIOCSIFLINKPARAMS: {               /* struct if_linkparamsreq */
 		struct tb_profile tb = { .rate = 0, .percent = 0, .depth = 0 };
@@ -1841,11 +1937,31 @@ ifioctl_linkparams(struct ifnet *ifp, u_long cmd, caddr_t data, struct proc *p)
 			break;
 		}
 
+#if SKYWALK
+		error = kern_nexus_set_netif_input_tbr_rate(ifp,
+		    iflpr->iflpr_input_tbr_rate);
+		if (error != 0) {
+			break;
+		}
+
+		/*
+		 * Input netem is done at flowswitch, which is the entry point
+		 * of all traffic, when skywalk is enabled.
+		 */
+		error = kern_nexus_set_if_netem_params(
+			kern_nexus_shared_controller(),
+			ifp->if_nx_flowswitch.if_fsw_instance,
+			&iflpr->iflpr_input_netem,
+			sizeof(iflpr->iflpr_input_netem));
+		if (error != 0) {
+			break;
+		}
+#endif /* SKYWALK */
 
 		char netem_name[32];
 		(void) snprintf(netem_name, sizeof(netem_name),
 		    "if_output_netem_%s", if_name(ifp));
-		error = netem_config(&ifp->if_output_netem, netem_name,
+		error = netem_config(&ifp->if_output_netem, netem_name, ifp,
 		    &iflpr->iflpr_output_netem, (void *)ifp,
 		    ifnet_enqueue_netem, NETEM_MAX_BATCH_SIZE);
 		if (error != 0) {
@@ -1904,6 +2020,12 @@ ifioctl_linkparams(struct ifnet *ifp, u_long cmd, caddr_t data, struct proc *p)
 		bcopy(&ifp->if_input_lt, &iflpr->iflpr_input_lt,
 		    sizeof(iflpr->iflpr_input_lt));
 
+#if SKYWALK
+		if (ifp->if_input_netem != NULL) {
+			netem_get_params(ifp->if_input_netem,
+			    &iflpr->iflpr_input_netem);
+		}
+#endif /* SKYWALK */
 		if (ifp->if_output_netem != NULL) {
 			netem_get_params(ifp->if_output_netem,
 			    &iflpr->iflpr_output_netem);
@@ -1925,6 +2047,7 @@ ifioctl_qstats(struct ifnet *ifp, u_long cmd, caddr_t data)
 {
 	struct if_qstatsreq *ifqr = (struct if_qstatsreq *)(void *)data;
 	u_int32_t ifqr_len, ifqr_slot;
+	uint32_t ifqr_grp_idx = 0;
 	int error = 0;
 
 	VERIFY(ifp != NULL);
@@ -1932,9 +2055,14 @@ ifioctl_qstats(struct ifnet *ifp, u_long cmd, caddr_t data)
 	switch (cmd) {
 	case SIOCGIFQUEUESTATS: {               /* struct if_qstatsreq */
 		bcopy(&ifqr->ifqr_slot, &ifqr_slot, sizeof(ifqr_slot));
+		bcopy(&ifqr->ifqr_grp_idx, &ifqr_grp_idx, sizeof(ifqr_grp_idx));
 		bcopy(&ifqr->ifqr_len, &ifqr_len, sizeof(ifqr_len));
-		error = ifclassq_getqstats(&ifp->if_snd, ifqr_slot,
-		    ifqr->ifqr_buf, &ifqr_len);
+
+		if (ifqr_grp_idx > FQ_IF_MAX_GROUPS) {
+			return EINVAL;
+		}
+		error = ifclassq_getqstats(ifp->if_snd, (uint8_t)ifqr_grp_idx,
+		    ifqr_slot, ifqr->ifqr_buf, &ifqr_len);
 		if (error != 0) {
 			ifqr_len = 0;
 		}
@@ -2063,9 +2191,10 @@ if_add_netagent_locked(struct ifnet *ifp, uuid_t new_agent_uuid)
 			    IF_MAXAGENTS);
 
 			/* Reallocate array */
-			uuid_t *new_agent_array = _REALLOC(ifp->if_agentids,
-			    sizeof(uuid_t) * new_agent_count, M_NETAGENT,
-			    M_WAITOK | M_ZERO);
+			uuid_t *new_agent_array = krealloc_data(ifp->if_agentids,
+			    sizeof(uuid_t) * ifp->if_agentcount,
+			    sizeof(uuid_t) * new_agent_count,
+			    Z_WAITOK | Z_ZERO);
 			if (new_agent_array == NULL) {
 				return ENOMEM;
 			}
@@ -2216,7 +2345,7 @@ ifioctl_netagent(struct ifnet *ifp, u_long cmd, caddr_t data, struct proc *p)
 	case SIOCGIFAGENTIDS64: {               /* struct if_agentidsreq64 */
 		bcopy(data, &u.s64, sizeof(u.s64));
 		error = ifioctl_getnetagents(ifp, &u.s64.ifar_count,
-		    u.s64.ifar_uuids);
+		    CAST_USER_ADDR_T(u.s64.ifar_uuids));
 		if (error == 0) {
 			bcopy(&u.s64, data, sizeof(u.s64));
 		}
@@ -2290,6 +2419,10 @@ ifnet_reset_order(u_int32_t *ordered_indices, u_int32_t count)
 	struct ifnet *ifp = NULL;
 	int error = 0;
 
+	if (if_verbose != 0) {
+		os_log(OS_LOG_DEFAULT, "%s: count %u", __func__, count);
+	}
+
 	ifnet_head_lock_exclusive();
 	for (u_int32_t order_index = 0; order_index < count; order_index++) {
 		if (ordered_indices[order_index] == IFSCOPE_NONE ||
@@ -2328,6 +2461,34 @@ ifnet_reset_order(u_int32_t *ordered_indices, u_int32_t count)
 	return error;
 }
 
+#if (DEBUG || DEVELOPMENT)
+static int
+ifnet_get_ordered_indices(u_int32_t *ordered_indices, uint32_t *count)
+{
+	struct ifnet *ifp = NULL;
+	int error = 0;
+	uint32_t order_index = 0;
+
+	ifnet_head_lock_exclusive();
+
+	if (*count < if_ordered_count) {
+		ifnet_head_done();
+		return ENOBUFS;
+	}
+
+	TAILQ_FOREACH(ifp, &ifnet_ordered_head, if_ordered_link) {
+		if (order_index >= if_ordered_count) {
+			break;
+		}
+		ordered_indices[order_index++] = ifp->if_index;
+	}
+	*count = order_index;
+	ifnet_head_done();
+
+	return error;
+}
+#endif /* (DEBUG || DEVELOPMENT) */
+
 int
 if_set_qosmarking_mode(struct ifnet *ifp, u_int32_t mode)
 {
@@ -2342,13 +2503,18 @@ if_set_qosmarking_mode(struct ifnet *ifp, u_int32_t mode)
 	case IFRTYPE_QOSMARKING_RFC4594:
 		ifp->if_qosmarking_mode = mode;
 		break;
+#if (DEBUG || DEVELOPMENT)
+	case IFRTYPE_QOSMARKING_CUSTOM:
+		ifp->if_qosmarking_mode = mode;
+		break;
+#endif /* (DEBUG || DEVELOPMENT) */
 	default:
 		error = EINVAL;
 		break;
 	}
 	if (error == 0 && old_mode != ifp->if_qosmarking_mode) {
 		dlil_post_msg(ifp, KEV_DL_SUBCLASS, KEV_DL_QOS_MODE_CHANGED,
-		    NULL, 0);
+		    NULL, 0, FALSE);
 	}
 	return error;
 }
@@ -2358,6 +2524,8 @@ ifioctl_iforder(u_long cmd, caddr_t data)
 {
 	int error = 0;
 	u_int32_t *ordered_indices = NULL;
+	size_t ordered_indices_length = 0;
+
 	if (data == NULL) {
 		return EINVAL;
 	}
@@ -2371,20 +2539,21 @@ ifioctl_iforder(u_long cmd, caddr_t data)
 			break;
 		}
 
-		size_t length = (ifo->ifo_count * sizeof(u_int32_t));
-		if (length > 0) {
+		ordered_indices_length = ifo->ifo_count * sizeof(u_int32_t);
+		if (ordered_indices_length > 0) {
 			if (ifo->ifo_ordered_indices == USER_ADDR_NULL) {
 				error = EINVAL;
 				break;
 			}
-			ordered_indices = _MALLOC(length, M_NECP, M_WAITOK);
+			ordered_indices = (u_int32_t *)kalloc_data(ordered_indices_length,
+			    Z_WAITOK);
 			if (ordered_indices == NULL) {
 				error = ENOMEM;
 				break;
 			}
 
-			error = copyin(ifo->ifo_ordered_indices,
-			    ordered_indices, length);
+			error = copyin(CAST_USER_ADDR_T(ifo->ifo_ordered_indices),
+			    ordered_indices, ordered_indices_length);
 			if (error != 0) {
 				break;
 			}
@@ -2412,6 +2581,44 @@ ifioctl_iforder(u_long cmd, caddr_t data)
 		break;
 	}
 
+	case SIOCGIFORDER: {
+#if (DEBUG || DEVELOPMENT)
+		struct if_order *ifo = (struct if_order *)(void *)data;
+		uint32_t count;
+
+		if (ifo->ifo_ordered_indices == 0) {
+			ifo->ifo_count = if_ordered_count;
+			break;
+		}
+
+		count = ifo->ifo_count;
+		if (count == 0) {
+			error = EINVAL;
+			break;
+		}
+
+		ordered_indices_length = count * sizeof(uint32_t);
+		ordered_indices = (uint32_t *)kalloc_data(ordered_indices_length,
+		    Z_WAITOK | Z_ZERO);
+		if (ordered_indices == NULL) {
+			error = ENOMEM;
+			break;
+		}
+
+		error = ifnet_get_ordered_indices(ordered_indices, &count);
+		if (error == 0) {
+			ifo->ifo_count = count;
+			error = copyout((caddr_t)ordered_indices,
+			    CAST_USER_ADDR_T(ifo->ifo_ordered_indices),
+			    count * sizeof(uint32_t));
+		}
+#else /* (DEBUG || DEVELOPMENT) */
+		error = EOPNOTSUPP;
+#endif /* (DEBUG || DEVELOPMENT) */
+
+		break;
+	}
+
 	default: {
 		VERIFY(0);
 		/* NOTREACHED */
@@ -2419,7 +2626,7 @@ ifioctl_iforder(u_long cmd, caddr_t data)
 	}
 
 	if (ordered_indices != NULL) {
-		_FREE(ordered_indices, M_NECP);
+		kfree_data(ordered_indices, ordered_indices_length);
 	}
 
 	return error;
@@ -2446,7 +2653,7 @@ ifioctl_networkid(struct ifnet *ifp, caddr_t data)
 		goto end;
 	}
 
-	ifp->network_id_len = len;
+	ifp->network_id_len = (uint8_t)len;
 	bcopy(data, ifp->network_id, len);
 end:
 	return error;
@@ -2552,6 +2759,33 @@ ifioctl_clat46addr(struct ifnet *ifp, u_long cmd, caddr_t data)
 	return error;
 }
 
+#if SKYWALK
+static __attribute__((noinline)) int
+ifioctl_nexus(struct ifnet *ifp, u_long cmd, caddr_t data)
+{
+	int error = 0;
+	struct if_nexusreq *ifnr = (struct if_nexusreq *)(void *)data;
+
+	switch (cmd) {
+	case SIOCGIFNEXUS:              /* struct if_nexusreq */
+		if (ifnr->ifnr_flags != 0) {
+			error = EINVAL;
+			break;
+		}
+		error = kern_nexus_get_netif_instance(ifp, ifnr->ifnr_netif);
+		if (error != 0) {
+			break;
+		}
+		kern_nexus_get_flowswitch_instance(ifp, ifnr->ifnr_flowswitch);
+		break;
+	default:
+		VERIFY(0);
+		/* NOTREACHED */
+	}
+
+	return error;
+}
+#endif /* SKYWALK */
 
 static int
 ifioctl_get_protolist(struct ifnet *ifp, u_int32_t * ret_count,
@@ -2575,7 +2809,7 @@ ifioctl_get_protolist(struct ifnet *ifp, u_int32_t * ret_count,
 	if (count == 0) {
 		goto done;
 	}
-	list = _MALLOC(count * sizeof(*list), M_TEMP, M_WAITOK | M_ZERO);
+	list = (u_int32_t *)kalloc_data(count * sizeof(*list), Z_WAITOK | Z_ZERO);
 	if (list == NULL) {
 		error = ENOMEM;
 		goto done;
@@ -2624,7 +2858,7 @@ ifioctl_protolist(struct ifnet *ifp, u_long cmd, caddr_t data)
 			break;
 		}
 		error = ifioctl_get_protolist(ifp, &ifpl.ifpl_count,
-		    ifpl.ifpl_list);
+		    CAST_USER_ADDR_T(ifpl.ifpl_list));
 		bcopy(&ifpl, data, sizeof(ifpl));
 		break;
 	}
@@ -2643,7 +2877,7 @@ static bool
 ifioctl_restrict_intcoproc(unsigned long cmd, const char *ifname,
     struct ifnet *ifp, struct proc *p)
 {
-	if (intcoproc_unrestricted == TRUE) {
+	if (intcoproc_unrestricted) {
 		return false;
 	}
 	if (proc_pid(p) == 0) {
@@ -2707,9 +2941,13 @@ ifioctl_restrict_intcoproc(unsigned long cmd, const char *ifname,
 	case SIOCGNBRINFO_IN6:
 	case SIOCGIFALIFETIME_IN6:
 	case SIOCGIFNETMASK_IN6:
+#if SKYWALK
+	case SIOCGIFNEXUS:
+#endif /* SKYWALK */
 	case SIOCGIFPROTOLIST32:
 	case SIOCGIFPROTOLIST64:
 	case SIOCGIFXFLAGS:
+	case SIOCGIFNOTRAFFICSHAPING:
 		return false;
 	default:
 #if (DEBUG || DEVELOPMENT)
@@ -2717,6 +2955,98 @@ ifioctl_restrict_intcoproc(unsigned long cmd, const char *ifname,
 		    __func__, cmd, proc_pid(p));
 #endif
 		return true;
+	}
+	return false;
+}
+
+static bool
+ifioctl_restrict_management(unsigned long cmd, const char *ifname,
+    struct ifnet *ifp, struct proc *p)
+{
+	if (if_management_interface_check_needed == false) {
+		return false;
+	}
+	if (management_control_unrestricted) {
+		return false;
+	}
+	if (proc_pid(p) == 0) {
+		return false;
+	}
+	if (ifname) {
+		ifp = ifunit(ifname);
+	}
+	if (ifp == NULL) {
+		return false;
+	}
+	if (!IFNET_IS_MANAGEMENT(ifp)) {
+		return false;
+	}
+	switch (cmd) {
+	case SIOCGIFBRDADDR:
+	case SIOCGIFCONF32:
+	case SIOCGIFCONF64:
+	case SIOCGIFFLAGS:
+	case SIOCGIFEFLAGS:
+	case SIOCGIFCAP:
+	case SIOCGIFMETRIC:
+	case SIOCGIFMTU:
+	case SIOCGIFPHYS:
+	case SIOCGIFTYPE:
+	case SIOCGIFFUNCTIONALTYPE:
+	case SIOCGIFPSRCADDR:
+	case SIOCGIFPDSTADDR:
+	case SIOCGIFGENERIC:
+	case SIOCGIFDEVMTU:
+	case SIOCGIFVLAN:
+	case SIOCGIFBOND:
+	case SIOCGIFWAKEFLAGS:
+	case SIOCGIFGETRTREFCNT:
+	case SIOCGIFOPPORTUNISTIC:
+	case SIOCGIFLINKQUALITYMETRIC:
+	case SIOCGIFLOG:
+	case SIOCGIFDELEGATE:
+	case SIOCGIFEXPENSIVE:
+	case SIOCGIFINTERFACESTATE:
+	case SIOCGIFPROBECONNECTIVITY:
+	case SIOCGIFTIMESTAMPENABLED:
+	case SIOCGECNMODE:
+	case SIOCGQOSMARKINGMODE:
+	case SIOCGQOSMARKINGENABLED:
+	case SIOCGIFLOWINTERNET:
+	case SIOCGIFSTATUS:
+	case SIOCGIFMEDIA32:
+	case SIOCGIFMEDIA64:
+	case SIOCGIFXMEDIA32:
+	case SIOCGIFXMEDIA64:
+	case SIOCGIFDESC:
+	case SIOCGIFLINKPARAMS:
+	case SIOCGIFQUEUESTATS:
+	case SIOCGIFTHROTTLE:
+	case SIOCGIFAGENTIDS32:
+	case SIOCGIFAGENTIDS64:
+	case SIOCGIFNETSIGNATURE:
+	case SIOCGIFINFO_IN6:
+	case SIOCGIFAFLAG_IN6:
+	case SIOCGNBRINFO_IN6:
+	case SIOCGIFALIFETIME_IN6:
+	case SIOCGIFNETMASK_IN6:
+#if SKYWALK
+	case SIOCGIFNEXUS:
+#endif /* SKYWALK */
+	case SIOCGIFPROTOLIST32:
+	case SIOCGIFPROTOLIST64:
+	case SIOCGIFXFLAGS:
+	case SIOCGIFNOTRAFFICSHAPING:
+		return false;
+	default:
+		if (!IOCurrentTaskHasEntitlement(MANAGEMENT_CONTROL_ENTITLEMENT)) {
+#if (DEBUG || DEVELOPMENT)
+			printf("ifioctl_restrict_management: cmd 0x%lx on %s not allowed for %s:%u\n",
+			    cmd, ifname, proc_name_address(p), proc_pid(p));
+#endif
+			return true;
+		}
+		return false;
 	}
 	return false;
 }
@@ -2746,16 +3076,16 @@ compat_ifmu_ulist(struct ifnet *ifp, u_long cmd, void *data)
 	bool list_modified = false;
 
 	user_addr = (cmd == SIOCGIFMEDIA64) ?
-	    ((struct ifmediareq64 *)ifmr)->ifmu_ulist :
+	    CAST_USER_ADDR_T(((struct ifmediareq64 *)ifmr)->ifmu_ulist) :
 	    CAST_USER_ADDR_T(((struct ifmediareq32 *)ifmr)->ifmu_ulist);
 	if (user_addr == USER_ADDR_NULL || ifmr->ifm_count == 0) {
 		return 0;
 	}
-	MALLOC(media_list, int *, ifmr->ifm_count * sizeof(int),
-	    M_TEMP, M_WAITOK | M_ZERO);
+	media_list = (int *)kalloc_data(ifmr->ifm_count * sizeof(int),
+	    Z_WAITOK | Z_ZERO);
 	if (media_list == NULL) {
 		os_log_error(OS_LOG_DEFAULT,
-		    "%s: %s MALLOC() failed",
+		    "%s: %s kalloc_data() failed",
 		    __func__, ifp->if_xname);
 		error = ENOMEM;
 		goto done;
@@ -2795,7 +3125,7 @@ compat_ifmu_ulist(struct ifnet *ifp, u_long cmd, void *data)
 	}
 done:
 	if (media_list != NULL) {
-		FREE(media_list, M_TEMP);
+		kfree_data(media_list, ifmr->ifm_count * sizeof(int));
 	}
 	return error;
 }
@@ -2884,6 +3214,7 @@ ifioctl(struct socket *so, u_long cmd, caddr_t data, struct proc *p)
 		goto done;
 
 	case SIOCSIFORDER:                      /* struct if_order */
+	case SIOCGIFORDER:                      /* struct if_order */
 		error = ifioctl_iforder(cmd, data);
 		goto done;
 
@@ -2912,6 +3243,7 @@ ifioctl(struct socket *so, u_long cmd, caddr_t data, struct proc *p)
 	case SIOCGIFPHYS:                       /* struct ifreq */
 	case SIOCSIFFLAGS:                      /* struct ifreq */
 	case SIOCSIFCAP:                        /* struct ifreq */
+	case SIOCSIFMANAGEMENT:                 /* struct ifreq */
 	case SIOCSIFMETRIC:                     /* struct ifreq */
 	case SIOCSIFPHYS:                       /* struct ifreq */
 	case SIOCSIFMTU:                        /* struct ifreq */
@@ -2938,6 +3270,7 @@ ifioctl(struct socket *so, u_long cmd, caddr_t data, struct proc *p)
 	case SIOCSIFOPPORTUNISTIC:              /* struct ifreq */
 	case SIOCGIFOPPORTUNISTIC:              /* struct ifreq */
 	case SIOCGIFLINKQUALITYMETRIC:          /* struct ifreq */
+	case SIOCSIFLINKQUALITYMETRIC:          /* struct ifreq */
 	case SIOCSIFLOG:                        /* struct ifreq */
 	case SIOCGIFLOG:                        /* struct ifreq */
 	case SIOCGIFDELEGATE:                   /* struct ifreq */
@@ -2956,6 +3289,7 @@ ifioctl(struct socket *so, u_long cmd, caddr_t data, struct proc *p)
 #if (DEBUG || DEVELOPMENT)
 	case SIOCSIFDISABLEOUTPUT:              /* struct ifreq */
 #endif /* (DEBUG || DEVELOPMENT) */
+	case SIOCSIFSUBFAMILY:                  /* struct ifreq */
 	case SIOCGECNMODE:                      /* struct ifreq */
 	case SIOCSECNMODE:
 	case SIOCSQOSMARKINGMODE:               /* struct ifreq */
@@ -2966,21 +3300,28 @@ ifioctl(struct socket *so, u_long cmd, caddr_t data, struct proc *p)
 	case SIOCGIFLOWINTERNET:                /* struct ifreq */
 	case SIOCGIFLOWPOWER:                   /* struct ifreq */
 	case SIOCSIFLOWPOWER:                   /* struct ifreq */
-	case SIOCSIF6LOWPAN:                    /* struct ifreq */
-	case SIOCGIF6LOWPAN:                    /* struct ifreq */
 	case SIOCGIFMPKLOG:                     /* struct ifreq */
 	case SIOCSIFMPKLOG:                     /* struct ifreq */
 	case SIOCGIFCONSTRAINED:                /* struct ifreq */
 	case SIOCSIFCONSTRAINED:                /* struct ifreq */
+	case SIOCSIFESTTHROUGHPUT:              /* struct ifreq */
+	case SIOCSIFRADIODETAILS:               /* struct ifreq */
 	case SIOCGIFXFLAGS:                     /* struct ifreq */
 	case SIOCGIFNOACKPRIO:                  /* struct ifreq */
 	case SIOCSIFNOACKPRIO:                  /* struct ifreq */
+	case SIOCSIFMARKWAKEPKT:                /* struct ifreq */
+	case SIOCSIFNOTRAFFICSHAPING:           /* struct ifreq */
+	case SIOCGIFNOTRAFFICSHAPING:           /* struct ifreq */
 	{                       /* struct ifreq */
 		struct ifreq ifr;
 		bcopy(data, &ifr, sizeof(ifr));
 		ifr.ifr_name[IFNAMSIZ - 1] = '\0';
 		bcopy(&ifr.ifr_name, ifname, IFNAMSIZ);
 		if (ifioctl_restrict_intcoproc(cmd, ifname, NULL, p) == true) {
+			error = EPERM;
+			goto done;
+		}
+		if (ifioctl_restrict_management(cmd, ifname, NULL, p) == true) {
 			error = EPERM;
 			goto done;
 		}
@@ -3015,12 +3356,7 @@ ifioctl(struct socket *so, u_long cmd, caddr_t data, struct proc *p)
 		break;
 
 	case SIOCGIFSTATUS:                     /* struct ifstat */
-		ifs = _MALLOC(sizeof(*ifs), M_DEVBUF, M_WAITOK);
-		if (ifs == NULL) {
-			error = ENOMEM;
-			dlil_if_unlock();
-			goto done;
-		}
+		ifs = kalloc_type(struct ifstat, Z_WAITOK | Z_NOFAIL);
 		bcopy(data, ifs, sizeof(*ifs));
 		ifs->ifs_name[IFNAMSIZ - 1] = '\0';
 		bcopy(ifs->ifs_name, ifname, IFNAMSIZ);
@@ -3089,6 +3425,13 @@ ifioctl(struct socket *so, u_long cmd, caddr_t data, struct proc *p)
 		    ifname, IFNAMSIZ);
 		ifp = ifunit_ref(ifname);
 		break;
+#if SKYWALK
+	case SIOCGIFNEXUS:                      /* struct if_nexusreq */
+		bcopy(((struct if_nexusreq *)(void *)data)->ifnr_name,
+		    ifname, IFNAMSIZ);
+		ifp = ifunit_ref(ifname);
+		break;
+#endif /* SKYWALK */
 	case SIOCGIFPROTOLIST32:                /* struct if_protolistreq32 */
 	case SIOCGIFPROTOLIST64:                /* struct if_protolistreq64 */
 		bcopy(((struct if_protolistreq *)(void *)data)->ifpl_name,
@@ -3191,6 +3534,11 @@ ifioctl(struct socket *so, u_long cmd, caddr_t data, struct proc *p)
 	case SIOCGIFCLAT46ADDR:                 /* struct if_clat46req */
 		error = ifioctl_clat46addr(ifp, cmd, data);
 		break;
+#if SKYWALK
+	case SIOCGIFNEXUS:
+		error = ifioctl_nexus(ifp, cmd, data);
+		break;
+#endif /* SKYWALK */
 
 	case SIOCGIFPROTOLIST32:                /* struct if_protolistreq32 */
 	case SIOCGIFPROTOLIST64:                /* struct if_protolistreq64 */
@@ -3219,7 +3567,7 @@ ifioctl(struct socket *so, u_long cmd, caddr_t data, struct proc *p)
 
 done:
 	if (ifs != NULL) {
-		_FREE(ifs, M_DEVBUF);
+		kfree_type(struct ifstat, ifs);
 	}
 
 	if (if_verbose) {
@@ -3432,8 +3780,9 @@ ifioctl_ifreq(struct socket *so, u_long cmd, struct ifreq *ifr, struct proc *p)
 
 	case SIOCSIFMTU: {
 		u_int32_t oldmtu = ifp->if_mtu;
-		struct ifclassq *ifq = &ifp->if_snd;
+		struct ifclassq *ifq = ifp->if_snd;
 
+		ASSERT(ifq != NULL);
 		error = proc_suser(p);
 		if (error != 0) {
 			break;
@@ -3572,7 +3921,6 @@ ifioctl_ifreq(struct socket *so, u_long cmd, struct ifreq *ifr, struct proc *p)
 	case SIOCSIFALTMTU:
 	case SIOCSIFVLAN:
 	case SIOCSIFBOND:
-	case SIOCSIF6LOWPAN:
 		error = proc_suser(p);
 		if (error != 0) {
 			break;
@@ -3623,7 +3971,6 @@ ifioctl_ifreq(struct socket *so, u_long cmd, struct ifreq *ifr, struct proc *p)
 	case SIOCGIFDEVMTU:
 	case SIOCGIFVLAN:
 	case SIOCGIFBOND:
-	case SIOCGIF6LOWPAN:
 		error = ifnet_ioctl(ifp, SOCK_DOM(so), cmd, (caddr_t)ifr);
 		break;
 
@@ -3658,6 +4005,14 @@ ifioctl_ifreq(struct socket *so, u_long cmd, struct ifreq *ifr, struct proc *p)
 			    IFNET_LQM_THRESH_OFF;
 		}
 		ifnet_lock_done(ifp);
+		break;
+
+	case SIOCSIFLINKQUALITYMETRIC:
+		if ((error = priv_check_cred(kauth_cred_get(),
+		    PRIV_NET_INTERFACE_CONTROL, 0)) != 0) {
+			return error;
+		}
+		error = ifnet_set_link_quality(ifp, ifr->ifr_link_quality_metric);
 		break;
 
 	case SIOCSIFLOG:
@@ -3754,6 +4109,86 @@ ifioctl_ifreq(struct socket *so, u_long cmd, struct ifreq *ifr, struct proc *p)
 		}
 		ifnet_head_done();
 		necp_update_all_clients();
+		break;
+	}
+
+	case SIOCSIFESTTHROUGHPUT:
+	{
+		bool changed = false;
+		struct ifnet *difp;
+
+		if ((error = priv_check_cred(kauth_cred_get(),
+		    PRIV_NET_INTERFACE_CONTROL, 0)) != 0) {
+			return error;
+		}
+		ifnet_lock_exclusive(ifp);
+		changed = (ifp->if_estimated_up_bucket != ifr->ifr_estimated_throughput.up_bucket) ||
+		    (ifp->if_estimated_down_bucket != ifr->ifr_estimated_throughput.down_bucket);
+		ifp->if_estimated_up_bucket = ifr->ifr_estimated_throughput.up_bucket;
+		ifp->if_estimated_down_bucket = ifr->ifr_estimated_throughput.down_bucket;
+		if (changed) {
+			ifnet_increment_generation(ifp);
+		}
+		ifnet_lock_done(ifp);
+		os_log_info(OS_LOG_DEFAULT,
+		    "SIOCSIFESTTHROUGHPUT %s%s up: %u, down: %u",
+		    ifp->if_name, changed ? " changed" : "",
+		    ifp->if_estimated_up_bucket,
+		    ifp->if_estimated_down_bucket);
+		if (changed) {
+			/*
+			 * Update the generation on delegated interfaces.
+			 */
+			ifnet_head_lock_shared();
+			TAILQ_FOREACH(difp, &ifnet_head, if_link) {
+				ifnet_lock_exclusive(difp);
+				if (difp->if_delegated.ifp == ifp) {
+					ifnet_increment_generation(difp);
+				}
+				ifnet_lock_done(difp);
+			}
+			ifnet_head_done();
+			necp_update_all_clients();
+		}
+		break;
+	}
+
+	case SIOCSIFRADIODETAILS:
+	{
+		bool changed = false;
+		struct ifnet *difp;
+
+		if ((error = priv_check_cred(kauth_cred_get(),
+		    PRIV_NET_INTERFACE_CONTROL, 0)) != 0) {
+			return error;
+		}
+		ifnet_lock_exclusive(ifp);
+		changed = ifp->if_radio_type != ifr->ifr_radio_details.technology ||
+		    ifp->if_radio_channel != ifr->ifr_radio_details.channel;
+		ifp->if_radio_type = ifr->ifr_radio_details.technology;
+		ifp->if_radio_channel = ifr->ifr_radio_details.channel;
+		ifnet_lock_done(ifp);
+		os_log_info(OS_LOG_DEFAULT,
+		    "SIOCSIFRADIODETAILS %s%s technology: %u, channel: %u",
+		    ifp->if_name, changed ? " changed" : "",
+		    ifr->ifr_radio_details.technology,
+		    ifr->ifr_radio_details.channel);
+		if (changed) {
+			ifnet_increment_generation(ifp);
+			/*
+			 * Update the generation on delegated interfaces.
+			 */
+			ifnet_head_lock_shared();
+			TAILQ_FOREACH(difp, &ifnet_head, if_link) {
+				ifnet_lock_exclusive(difp);
+				if (difp->if_delegated.ifp == ifp) {
+					ifnet_increment_generation(difp);
+				}
+				ifnet_lock_done(difp);
+			}
+			ifnet_head_done();
+			necp_update_all_clients();
+		}
 		break;
 	}
 
@@ -3999,9 +4434,44 @@ ifioctl_ifreq(struct socket *so, u_long cmd, struct ifreq *ifr, struct proc *p)
 		    PRIV_NET_INTERFACE_CONTROL, 0)) != 0) {
 			return error;
 		}
+#if (DEBUG || DEVELOPMENT)
+		if (management_control_unrestricted) {
+			uint32_t subfamily = ifr->ifr_type.ift_subfamily;
+
+			if (subfamily == ifp->if_subfamily) {
+				break;
+			} else if (subfamily == IFRTYPE_SUBFAMILY_MANAGEMENT && ifp->if_subfamily == 0) {
+				ifp->if_subfamily = IFNET_SUBFAMILY_MANAGEMENT;
+				ifnet_set_management(ifp, true);
+				break;
+			} else if (subfamily == 0 && ifp->if_subfamily == IFNET_SUBFAMILY_MANAGEMENT) {
+				ifnet_set_management(ifp, false);
+				break;
+			}
+		}
+#endif /* (DEBUG || DEVELOPMENT) */
 		error = ifnet_ioctl(ifp, SOCK_DOM(so), cmd, (caddr_t)ifr);
 		break;
 
+	case SIOCSIFMANAGEMENT: {
+		if (management_control_unrestricted == false &&
+		    !IOCurrentTaskHasEntitlement(MANAGEMENT_CONTROL_ENTITLEMENT)) {
+			os_log(OS_LOG_DEFAULT, "ifioctl_req: cmd SIOCSIFMANAGEMENT on %s not allowed for %s:%u\n",
+			    ifp->if_xname, proc_name_address(p), proc_pid(p));
+			return EPERM;
+		}
+		if (ifr->ifr_intval != 0) {
+			ifnet_set_management(ifp, true);
+		} else {
+			if (ifp->if_subfamily == IFNET_SUBFAMILY_MANAGEMENT) {
+				os_log(OS_LOG_DEFAULT, "ifioctl_req: cmd SIOCSIFMANAGEMENT 0 not allowed on %s with subfamily management",
+				    ifp->if_xname);
+				return EPERM;
+			}
+			ifnet_set_management(ifp, false);
+		}
+		break;
+	}
 	case SIOCSIFLOWINTERNET:
 		if ((error = priv_check_cred(kauth_cred_get(),
 		    PRIV_NET_INTERFACE_CONTROL, 0)) != 0) {
@@ -4074,6 +4544,48 @@ ifioctl_ifreq(struct socket *so, u_long cmd, struct ifreq *ifr, struct proc *p)
 		}
 		break;
 
+	case SIOCSIFMARKWAKEPKT:
+#if (DEVELOPMENT || DEBUG)
+		if ((error = priv_check_cred(kauth_cred_get(),
+		    PRIV_NET_INTERFACE_CONTROL, 0)) != 0) {
+			return error;
+		}
+		if (net_wake_pkt_debug) {
+			os_log(OS_LOG_DEFAULT,
+			    "SIOCSIFMARKWAKEPKT %s", ifp->if_xname);
+		}
+		if (ifr->ifr_intval != 0) {
+			ifp->if_xflags |= IFXF_MARK_WAKE_PKT;
+		} else {
+			ifp->if_xflags &= ~IFXF_MARK_WAKE_PKT;
+		}
+#else /* DEVELOPMENT || DEBUG */
+		error = EOPNOTSUPP;
+#endif /* DEVELOPMENT || DEBUG */
+		break;
+
+	case SIOCSIFNOTRAFFICSHAPING:
+		if ((error = priv_check_cred(kauth_cred_get(),
+		    PRIV_NET_INTERFACE_CONTROL, 0)) != 0) {
+			return error;
+		}
+		os_log_info(OS_LOG_DEFAULT, "SIOCSIFNOTRAFFICSHAPING %s %d",
+		    ifp->if_xname, ifr->ifr_intval);
+		if (ifr->ifr_intval != 0) {
+			ifp->if_xflags |= IFXF_NO_TRAFFIC_SHAPING;
+		} else {
+			ifp->if_xflags &= ~IFXF_NO_TRAFFIC_SHAPING;
+		}
+		break;
+
+	case SIOCGIFNOTRAFFICSHAPING:
+		if ((ifp->if_xflags & IFXF_NO_TRAFFIC_SHAPING) != 0) {
+			ifr->ifr_intval = 1;
+		} else {
+			ifr->ifr_intval = 0;
+		}
+		break;
+
 	default:
 		VERIFY(0);
 		/* NOTREACHED */
@@ -4139,10 +4651,10 @@ ifnet_set_promiscuous(
 	}
 
 	if (newflags != oldflags) {
-		log(LOG_INFO, "%s: promiscuous mode %s%s\n",
+		log(LOG_INFO, "%s: promiscuous mode %s %s (%d)\n",
 		    if_name(ifp),
 		    (newflags & IFF_PROMISC) != 0 ? "enable" : "disable",
-		    error != 0 ? " failed" : " succeeded");
+		    error != 0 ? "failed" : "succeeded", error);
 	}
 	return error;
 }
@@ -4278,21 +4790,16 @@ ifconf(u_long cmd, user_addr_t ifrp, int *ret_space)
 	return error;
 }
 
-/*
- * Just like if_promisc(), but for all-multicast-reception mode.
- */
-int
-if_allmulti(struct ifnet *ifp, int onswitch)
+static bool
+set_allmulti(struct ifnet * ifp, bool enable)
 {
-	int error = 0;
-	int     modified = 0;
+	bool    changed = false;
 
 	ifnet_lock_exclusive(ifp);
-
-	if (onswitch) {
+	if (enable) {
 		if (ifp->if_amcount++ == 0) {
 			ifp->if_flags |= IFF_ALLMULTI;
-			modified = 1;
+			changed = true;
 		}
 	} else {
 		if (ifp->if_amcount > 1) {
@@ -4300,32 +4807,48 @@ if_allmulti(struct ifnet *ifp, int onswitch)
 		} else {
 			ifp->if_amcount = 0;
 			ifp->if_flags &= ~IFF_ALLMULTI;
-			modified = 1;
+			changed = true;
 		}
 	}
 	ifnet_lock_done(ifp);
+	return changed;
+}
 
-	if (modified) {
+/*
+ * Like ifnet_set_promiscuous(), but for all-multicast-reception mode.
+ */
+int
+if_allmulti(struct ifnet *ifp, int onswitch)
+{
+	bool    enable = onswitch != 0;
+	int     error = 0;
+
+	if (set_allmulti(ifp, enable)) {
+		/* state change, tell the driver */
 		error = ifnet_ioctl(ifp, 0, SIOCSIFFLAGS, NULL);
-	}
-
-	if (error == 0) {
-		rt_ifmsg(ifp);
+		log(LOG_INFO, "%s: %s allmulti %s (%d)\n",
+		    if_name(ifp),
+		    enable ? "enable" : "disable",
+		    error != 0 ? "failed" : "succeeded", error);
+		if (error == 0) {
+			rt_ifmsg(ifp);
+		} else {
+			/* restore the reference count, flags */
+			(void)set_allmulti(ifp, !enable);
+		}
 	}
 	return error;
 }
 
 static struct ifmultiaddr *
-ifma_alloc(int how)
+ifma_alloc(zalloc_flags_t how)
 {
 	struct ifmultiaddr *ifma;
 
-	ifma = (how == M_WAITOK) ? zalloc(ifma_zone) :
-	    zalloc_noblock(ifma_zone);
+	ifma = zalloc_flags(ifma_zone, how | Z_ZERO);
 
 	if (ifma != NULL) {
-		bzero(ifma, ifma_size);
-		lck_mtx_init(&ifma->ifma_lock, ifa_mtx_grp, ifa_mtx_attr);
+		lck_mtx_init(&ifma->ifma_lock, &ifa_mtx_grp, &ifa_mtx_attr);
 		ifma->ifma_debug |= IFD_ALLOC;
 		if (ifma_debug != 0) {
 			ifma->ifma_debug |= IFD_DEBUG;
@@ -4382,10 +4905,10 @@ ifma_free(struct ifmultiaddr *ifma)
 	IFMA_UNLOCK(ifma);
 
 	if (ifma->ifma_addr != NULL) {
-		FREE(ifma->ifma_addr, M_IFADDR);
+		kfree_data(ifma->ifma_addr, ifma->ifma_addr->sa_len);
 		ifma->ifma_addr = NULL;
 	}
-	lck_mtx_destroy(&ifma->ifma_lock, ifa_mtx_grp);
+	lck_mtx_destroy(&ifma->ifma_lock, &ifa_mtx_grp);
 	zfree(ifma_zone, ifma);
 }
 
@@ -4588,7 +5111,7 @@ if_addmulti_doesexist(struct ifnet *ifp, const struct sockaddr *sa,
 	for (ifma = LIST_FIRST(&ifp->if_multiaddrs); ifma != NULL;
 	    ifma = LIST_NEXT(ifma, ifma_link)) {
 		IFMA_LOCK_SPIN(ifma);
-		if (!ifa_equal(sa, ifma->ifma_addr)) {
+		if (!sa_equal(sa, ifma->ifma_addr)) {
 			IFMA_UNLOCK(ifma);
 			continue;
 		}
@@ -4632,8 +5155,7 @@ copy_and_normalize(const struct sockaddr *original)
 	if (original->sa_family != AF_LINK &&
 	    original->sa_family != AF_UNSPEC) {
 		/* Just make a copy */
-		MALLOC(copy, struct sockaddr *, original->sa_len,
-		    M_IFADDR, M_WAITOK);
+		copy = (struct sockaddr *)kalloc_data(original->sa_len, Z_WAITOK);
 		if (copy != NULL) {
 			bcopy(original, copy, original->sa_len);
 		}
@@ -4645,6 +5167,9 @@ copy_and_normalize(const struct sockaddr *original)
 		const struct sockaddr_dl *sdl_original =
 		    (struct sockaddr_dl *)(uintptr_t)(size_t)original;
 
+		if (sdl_original->sdl_len < offsetof(struct sockaddr_dl, sdl_data)) {
+			return NULL;
+		}
 		if (sdl_original->sdl_nlen + sdl_original->sdl_alen +
 		    sdl_original->sdl_slen +
 		    offsetof(struct sockaddr_dl, sdl_data) >
@@ -4674,13 +5199,12 @@ copy_and_normalize(const struct sockaddr *original)
 	}
 
 	len = alen + offsetof(struct sockaddr_dl, sdl_data);
-	MALLOC(sdl_new, struct sockaddr_dl *, len, M_IFADDR, M_WAITOK);
+	sdl_new = (struct sockaddr_dl *)kalloc_data(len, Z_WAITOK | Z_ZERO);
 
 	if (sdl_new != NULL) {
-		bzero(sdl_new, len);
-		sdl_new->sdl_len = len;
+		sdl_new->sdl_len = (u_char)len;
 		sdl_new->sdl_family = AF_LINK;
-		sdl_new->sdl_alen = alen;
+		sdl_new->sdl_alen = (u_char)alen;
 		bcopy(aptr, LLADDR(sdl_new), alen);
 	}
 
@@ -4785,7 +5309,7 @@ if_addmulti_common(struct ifnet *ifp, const struct sockaddr *sa,
 			goto cleanup;
 		}
 
-		llifma = ifma_alloc(M_WAITOK);
+		llifma = ifma_alloc(Z_WAITOK);
 		if (llifma == NULL) {
 			error = ENOMEM;
 			goto cleanup;
@@ -4807,7 +5331,7 @@ if_addmulti_common(struct ifnet *ifp, const struct sockaddr *sa,
 			goto cleanup;
 		}
 	}
-	ifma = ifma_alloc(M_WAITOK);
+	ifma = ifma_alloc(Z_WAITOK);
 	if (ifma == NULL) {
 		error = ENOMEM;
 		goto cleanup;
@@ -4826,7 +5350,7 @@ if_addmulti_common(struct ifnet *ifp, const struct sockaddr *sa,
 	if (llifma != NULL) {
 		VERIFY(!anon);  /* must not get here if "anonymous" */
 		if (if_addmulti_doesexist(ifp, llsa, &ifma->ifma_ll, 0) == 0) {
-			FREE(llsa, M_IFADDR);
+			kfree_data(llsa, llsa->sa_len);
 			llsa = NULL;
 			ifma_free(llifma);
 			llifma = NULL;
@@ -4868,9 +5392,11 @@ if_addmulti_common(struct ifnet *ifp, const struct sockaddr *sa,
 	 * We are certain we have added something, so call down to the
 	 * interface to let them know about it.  Do this only for newly-
 	 * added AF_LINK/AF_UNSPEC address in the if_multiaddrs set.
+	 * Note that the notification is deferred to avoid
+	 * locking reodering issues in certain paths.
 	 */
 	if (lladdr || ll_firstref) {
-		(void) ifnet_ioctl(ifp, 0, SIOCADDMULTI, NULL);
+		ifnet_ioctl_async(ifp, SIOCADDMULTI);
 	}
 
 	if (ifp->if_updatemcasts > 0) {
@@ -4884,13 +5410,13 @@ cleanup:
 		ifma_free(ifma);
 	}
 	if (dupsa != NULL) {
-		FREE(dupsa, M_IFADDR);
+		kfree_data(dupsa, dupsa->sa_len);
 	}
 	if (llifma != NULL) {
 		ifma_free(llifma);
 	}
 	if (llsa != NULL) {
-		FREE(llsa, M_IFADDR);
+		kfree_data(llsa, llsa->sa_len);
 	}
 
 	return error;
@@ -4961,7 +5487,7 @@ if_delmulti_common(struct ifmultiaddr *ifma, struct ifnet *ifp,
 		for (ifma = LIST_FIRST(&ifp->if_multiaddrs); ifma != NULL;
 		    ifma = LIST_NEXT(ifma, ifma_link)) {
 			IFMA_LOCK(ifma);
-			if (!ifa_equal(sa, ifma->ifma_addr) ||
+			if (!sa_equal(sa, ifma->ifma_addr) ||
 			    (anon && !(ifma->ifma_flags & IFMAF_ANONYMOUS))) {
 				VERIFY(!(ifma->ifma_flags & IFMAF_ANONYMOUS) ||
 				    ifma->ifma_anoncnt != 0);
@@ -4973,7 +5499,7 @@ if_delmulti_common(struct ifmultiaddr *ifma, struct ifnet *ifp,
 		}
 		if (ifma == NULL) {
 			if (dupsa != NULL) {
-				FREE(dupsa, M_IFADDR);
+				kfree_data(dupsa, dupsa->sa_len);
 			}
 			ifnet_lock_done(ifp);
 			return ENOENT;
@@ -5008,8 +5534,10 @@ if_delmulti_common(struct ifmultiaddr *ifma, struct ifnet *ifp,
 		 * case of a link layer mcast group being left.  Do
 		 * this only for a AF_LINK/AF_UNSPEC address that has
 		 * been removed from the if_multiaddrs set.
+		 * Note that the notification is deferred to avoid
+		 * locking reodering issues in certain paths.
 		 */
-		ifnet_ioctl(ifp, 0, SIOCDELMULTI, NULL);
+		ifnet_ioctl_async(ifp, SIOCDELMULTI);
 	}
 
 	if (lastref) {
@@ -5020,7 +5548,7 @@ if_delmulti_common(struct ifmultiaddr *ifma, struct ifnet *ifp,
 	}
 	IFMA_REMREF(ifma);              /* for this routine */
 	if (dupsa != NULL) {
-		FREE(dupsa, M_IFADDR);
+		kfree_data(dupsa, dupsa->sa_len);
 	}
 
 	return 0;
@@ -5173,8 +5701,10 @@ if_data_internal_to_if_data(struct ifnet *ifp,
 #define COPYFIELD32(fld)        if_data->fld = (u_int32_t)(if_data_int->fld)
 /* compiler will cast down to 32-bit */
 #define COPYFIELD32_ATOMIC(fld) do {                                    \
-	atomic_get_64(if_data->fld,                                     \
-	    (u_int64_t *)(void *)(uintptr_t)&if_data_int->fld);         \
+	u_int64_t _val = 0;                                             \
+	atomic_get_64(_val,                                             \
+	        (u_int64_t *)(void *)(uintptr_t)&if_data_int->fld);     \
+	if_data->fld = (uint32_t) _val;                                 \
 } while (0)
 
 	COPYFIELD(ifi_type);
@@ -5208,10 +5738,10 @@ if_data_internal_to_if_data(struct ifnet *ifp,
 	COPYFIELD(ifi_recvtiming);
 	COPYFIELD(ifi_xmittiming);
 
-	if_data->ifi_lastchange.tv_sec = if_data_int->ifi_lastchange.tv_sec;
+	if_data->ifi_lastchange.tv_sec = (uint32_t)if_data_int->ifi_lastchange.tv_sec;
 	if_data->ifi_lastchange.tv_usec = if_data_int->ifi_lastchange.tv_usec;
 
-	if_data->ifi_lastchange.tv_sec += boottime_sec();
+	if_data->ifi_lastchange.tv_sec += (uint32_t)boottime_sec();
 
 	if_data->ifi_unused2 = 0;
 	COPYFIELD(ifi_hwassist);
@@ -5265,10 +5795,10 @@ if_data_internal_to_if_data64(struct ifnet *ifp,
 	COPYFIELD64(ifi_recvtiming);
 	COPYFIELD64(ifi_xmittiming);
 
-	if_data64->ifi_lastchange.tv_sec = if_data_int->ifi_lastchange.tv_sec;
-	if_data64->ifi_lastchange.tv_usec = if_data_int->ifi_lastchange.tv_usec;
+	if_data64->ifi_lastchange.tv_sec = (uint32_t)if_data_int->ifi_lastchange.tv_sec;
+	if_data64->ifi_lastchange.tv_usec = (uint32_t)if_data_int->ifi_lastchange.tv_usec;
 
-	if_data64->ifi_lastchange.tv_sec += boottime_sec();
+	if_data64->ifi_lastchange.tv_sec += (uint32_t)boottime_sec();
 
 #undef COPYFIELD64
 }
@@ -5381,7 +5911,21 @@ void
 if_copy_netif_stats(struct ifnet *ifp, struct if_netif_stats *if_ns)
 {
 	bzero(if_ns, sizeof(*if_ns));
+#if SKYWALK
+	if (!(ifp->if_capabilities & IFCAP_SKYWALK) ||
+	    !ifnet_is_attached(ifp, 1)) {
+		return;
+	}
+
+	if (ifp->if_na != NULL) {
+		nx_netif_copy_stats(ifp->if_na, if_ns);
+	}
+
+	/* Release the IO refcnt */
+	ifnet_decr_iorefcnt(ifp);
+#else /* SKYWALK */
 #pragma unused(ifp)
+#endif /* SKYWALK */
 }
 
 struct ifaddr *
@@ -5394,13 +5938,13 @@ ifa_remref(struct ifaddr *ifa, int locked)
 	}
 
 	if (ifa->ifa_refcnt == 0) {
-		panic("%s: ifa %p negative refcnt\n", __func__, ifa);
+		panic("%s: ifa %p negative refcnt", __func__, ifa);
 	} else if (ifa->ifa_trace != NULL) {
 		(*ifa->ifa_trace)(ifa, FALSE);
 	}
 	if (--ifa->ifa_refcnt == 0) {
 		if (ifa->ifa_debug & IFD_ATTACHED) {
-			panic("ifa %p attached to ifp is being freed\n", ifa);
+			panic("ifa %p attached to ifp is being freed", ifa);
 		}
 		/*
 		 * Some interface addresses are allocated either statically
@@ -5409,10 +5953,18 @@ ifa_remref(struct ifaddr *ifa, int locked)
 		 * family allocator.  Otherwise, leave it alone.
 		 */
 		if (ifa->ifa_debug & IFD_ALLOC) {
+#if XNU_PLATFORM_MacOSX
 			if (ifa->ifa_free == NULL) {
 				IFA_UNLOCK(ifa);
-				FREE(ifa, M_IFADDR);
-			} else {
+				/*
+				 * support for 3rd party kexts,
+				 * old ABI was that this had to be allocated
+				 * with MALLOC(M_IFADDR).
+				 */
+				__typed_allocators_ignore(kheap_free_addr(KHEAP_DEFAULT, ifa));
+			} else
+#endif /* XNU_PLATFORM_MacOSX */
+			{
 				/* Become a regular mutex */
 				IFA_CONVERT_LOCK(ifa);
 				/* callee will unlock */
@@ -5441,7 +5993,7 @@ ifa_addref(struct ifaddr *ifa, int locked)
 	}
 
 	if (++ifa->ifa_refcnt == 0) {
-		panic("%s: ifa %p wraparound refcnt\n", __func__, ifa);
+		panic("%s: ifa %p wraparound refcnt", __func__, ifa);
 		/* NOTREACHED */
 	} else if (ifa->ifa_trace != NULL) {
 		(*ifa->ifa_trace)(ifa, TRUE);
@@ -5454,14 +6006,14 @@ ifa_addref(struct ifaddr *ifa, int locked)
 void
 ifa_lock_init(struct ifaddr *ifa)
 {
-	lck_mtx_init(&ifa->ifa_lock, ifa_mtx_grp, ifa_mtx_attr);
+	lck_mtx_init(&ifa->ifa_lock, &ifa_mtx_grp, &ifa_mtx_attr);
 }
 
 void
 ifa_lock_destroy(struct ifaddr *ifa)
 {
 	IFA_LOCK_ASSERT_NOTHELD(ifa);
-	lck_mtx_destroy(&ifa->ifa_lock, ifa_mtx_grp);
+	lck_mtx_destroy(&ifa->ifa_lock, &ifa_mtx_grp);
 }
 
 /*
@@ -5610,6 +6162,8 @@ ifioctl_cassert(void)
 	case SIOCSIFCAP:
 	case SIOCGIFCAP:
 
+	case SIOCSIFMANAGEMENT:
+
 	case SIOCIFCREATE:
 	case SIOCIFDESTROY:
 	case SIOCIFCREATE2:
@@ -5634,6 +6188,7 @@ ifioctl_cassert(void)
 
 	case SIOCGIFGETRTREFCNT:
 	case SIOCGIFLINKQUALITYMETRIC:
+	case SIOCSIFLINKQUALITYMETRIC:
 	case SIOCSIFOPPORTUNISTIC:
 	case SIOCGIFOPPORTUNISTIC:
 	case SIOCGETROUTERMODE:
@@ -5688,6 +6243,7 @@ ifioctl_cassert(void)
 	case SIOCSECNMODE:
 
 	case SIOCSIFORDER:
+	case SIOCGIFORDER:
 
 	case SIOCSQOSMARKINGMODE:
 	case SIOCSQOSMARKINGENABLED:
@@ -5712,12 +6268,12 @@ ifioctl_cassert(void)
 	case SIOCSIFNAT64PREFIX:
 
 	case SIOCGIFCLAT46ADDR:
+#if SKYWALK
+	case SIOCGIFNEXUS:
+#endif /* SKYWALK */
 
 	case SIOCGIFPROTOLIST32:
 	case SIOCGIFPROTOLIST64:
-
-	case SIOCSIF6LOWPAN:
-	case SIOCGIF6LOWPAN:
 
 	case SIOCGIFLOWPOWER:
 	case SIOCSIFLOWPOWER:
@@ -5732,10 +6288,24 @@ ifioctl_cassert(void)
 
 	case SIOCGIFNOACKPRIO:
 	case SIOCSIFNOACKPRIO:
+
+	case SIOCSIFMARKWAKEPKT:
+
+	case SIOCSIFNOTRAFFICSHAPING:
+	case SIOCGIFNOTRAFFICSHAPING:
 		;
 	}
 }
 
+#if SKYWALK
+/*
+ * XXX: This API is only used by BSD stack and for now will always return 0.
+ * For Skywalk native drivers, preamble space need not be allocated in mbuf
+ * as the preamble will be reserved in the translated skywalk packet
+ * which is transmitted to the driver.
+ * For Skywalk compat drivers currently headroom is always set to zero.
+ */
+#endif /* SKYWALK */
 uint32_t
 ifnet_mbuf_packetpreamblelen(struct ifnet *ifp)
 {
@@ -5750,20 +6320,26 @@ struct intf_event {
 	uint32_t intf_event_code;
 };
 
-static void
-intf_event_callback(void *arg)
-{
-	struct intf_event *p_intf_ev = (struct intf_event *)arg;
-
-	/* Call this before we walk the tree */
-	EVENTHANDLER_INVOKE(&ifnet_evhdlr_ctxt, ifnet_event, p_intf_ev->ifp,
-	    (struct sockaddr *)&(p_intf_ev->addr), p_intf_ev->intf_event_code);
-}
-
 struct intf_event_nwk_wq_entry {
 	struct nwk_wq_entry nwk_wqe;
 	struct intf_event intf_ev_arg;
 };
+
+static void
+intf_event_callback(struct nwk_wq_entry *nwk_item)
+{
+	struct intf_event_nwk_wq_entry *p_ev;
+
+	p_ev = __container_of(nwk_item, struct intf_event_nwk_wq_entry, nwk_wqe);
+
+	/* Call this before we walk the tree */
+	EVENTHANDLER_INVOKE(&ifnet_evhdlr_ctxt, ifnet_event,
+	    p_ev->intf_ev_arg.ifp,
+	    (struct sockaddr *)&(p_ev->intf_ev_arg.addr),
+	    p_ev->intf_ev_arg.intf_event_code);
+
+	kfree_type(struct intf_event_nwk_wq_entry, p_ev);
+}
 
 void
 intf_event_enqueue_nwk_wq_entry(struct ifnet *ifp, struct sockaddr *addrp,
@@ -5772,9 +6348,8 @@ intf_event_enqueue_nwk_wq_entry(struct ifnet *ifp, struct sockaddr *addrp,
 #pragma unused(addrp)
 	struct intf_event_nwk_wq_entry *p_intf_ev = NULL;
 
-	MALLOC(p_intf_ev, struct intf_event_nwk_wq_entry *,
-	    sizeof(struct intf_event_nwk_wq_entry),
-	    M_NWKWQ, M_WAITOK | M_ZERO);
+	p_intf_ev = kalloc_type(struct intf_event_nwk_wq_entry,
+	    Z_WAITOK | Z_ZERO | Z_NOFAIL);
 
 	p_intf_ev->intf_ev_arg.ifp = ifp;
 	/*
@@ -5783,9 +6358,7 @@ intf_event_enqueue_nwk_wq_entry(struct ifnet *ifp, struct sockaddr *addrp,
 	 */
 	p_intf_ev->intf_ev_arg.intf_event_code = intf_event_code;
 	p_intf_ev->nwk_wqe.func = intf_event_callback;
-	p_intf_ev->nwk_wqe.is_arg_managed = TRUE;
-	p_intf_ev->nwk_wqe.arg = &p_intf_ev->intf_ev_arg;
-	nwk_wq_enqueue((struct nwk_wq_entry*)p_intf_ev);
+	nwk_wq_enqueue(&p_intf_ev->nwk_wqe);
 }
 
 int
@@ -5808,4 +6381,26 @@ if_get_tcp_kao_max(struct ifnet *ifp)
 		ifnet_lock_done(ifp);
 	}
 	return error;
+}
+
+int
+ifnet_set_management(struct ifnet *ifp, boolean_t on)
+{
+	if (ifp == NULL) {
+		return EINVAL;
+	}
+	if (if_management_verbose > 0) {
+		os_log(OS_LOG_DEFAULT,
+		    "interface %s management set %s by %s:%d",
+		    ifp->if_xname, on ? "true" : "false",
+		    proc_best_name(current_proc()), proc_selfpid());
+	}
+	if (on) {
+		if_set_xflags(ifp, IFXF_MANAGEMENT);
+		if_management_interface_check_needed = true;
+		in_management_interface_check();
+	} else {
+		if_clear_xflags(ifp, IFXF_MANAGEMENT);
+	}
+	return 0;
 }

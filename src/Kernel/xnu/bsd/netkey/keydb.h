@@ -97,7 +97,7 @@ struct secasvar {
 
 	struct secreplay *replay[MAX_REPLAY_WINDOWS]; /* replay prevention */
 
-	long created;                   /* for lifetime */
+	u_int64_t created;              /* for lifetime */
 
 	struct sadb_lifetime *lft_c;    /* CURRENT lifetime, it's constant. */
 	struct sadb_lifetime *lft_h;    /* HARD lifetime */
@@ -116,14 +116,19 @@ struct secasvar {
 	u_int16_t       natt_encapsulated_src_port;     /* network byte order */
 	u_int16_t       natt_interval; /* Interval in seconds */
 	u_int16_t       natt_offload_interval; /* Hardware Offload Interval in seconds */
+	/*
+	 * Globally unique flow identifier for the SA.
+	 * Added on outgoing packets by the IPSec driver.
+	 */
+	uint32_t        flowid;
 
 	u_int8_t        always_expire; /* Send expire/delete messages even if unused */
 };
 
 /* replay prevention */
 struct secreplay {
-	u_int8_t wsize;           /* window size */
-	u_int32_t count;
+	u_int8_t wsize;         /* window size */
+	u_int32_t count;        /* used by sender/receiver */
 	u_int32_t seq;          /* used by sender */
 	u_int32_t lastseq;      /* used by sender/receiver */
 	caddr_t bitmap;         /* used by receiver */
@@ -145,7 +150,7 @@ struct secacq {
 	struct secasindex saidx;
 
 	u_int32_t seq;          /* sequence number */
-	long created;           /* for lifetime */
+	u_int64_t created;      /* for lifetime */
 	int count;              /* for lifetime */
 };
 #endif

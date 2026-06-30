@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2000-2019 Apple Inc. All rights reserved.
+ * Copyright (c) 2000-2021 Apple Inc. All rights reserved.
  *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
  *
@@ -66,7 +66,9 @@
 
 #include <sys/queue.h>
 #include <sys/kern_event.h>
+#include <net/if_var.h>
 #include <net/net_kev.h>
+#include <netinet/in.h>
 
 #ifdef BSD_KERNEL_PRIVATE
 #include <net/route.h>
@@ -182,10 +184,10 @@ extern void socket_post_kev_msg_closed(struct socket *);
  * Hash table for IPv4 addresses.
  */
 extern TAILQ_HEAD(in_ifaddrhead, in_ifaddr) in_ifaddrhead;
-extern TAILQ_HEAD(in_ifaddrhashhead, in_ifaddr) * in_ifaddrhashtbl;
-extern lck_rw_t *in_ifaddr_rwlock;
+TAILQ_HEAD(in_ifaddrhashhead, in_ifaddr);
+extern lck_rw_t in_ifaddr_rwlock;
 
-#define INADDR_HASH(x)  (&in_ifaddrhashtbl[inaddr_hashval(x)])
+#define INADDR_HASH(x)  inaddr_hashlookup(x)
 
 extern  u_char  inetctlerrmap[];
 
@@ -199,7 +201,7 @@ extern  u_char  inetctlerrmap[];
 {                                                                       \
 	struct in_ifaddr *ia;                                           \
                                                                         \
-	lck_rw_lock_shared(in_ifaddr_rwlock);                           \
+	lck_rw_lock_shared(&in_ifaddr_rwlock);                          \
 	TAILQ_FOREACH(ia, INADDR_HASH((addr).s_addr), ia_hash) {        \
 	        IFA_LOCK_SPIN(&ia->ia_ifa);                             \
 	        if (IA_SIN(ia)->sin_addr.s_addr == (addr).s_addr) {     \
@@ -209,7 +211,7 @@ extern  u_char  inetctlerrmap[];
 	        IFA_UNLOCK(&ia->ia_ifa);                                \
 	}                                                               \
 	(ifp) = (ia == NULL) ? NULL : ia->ia_ifp;                       \
-	lck_rw_done(in_ifaddr_rwlock);                                  \
+	lck_rw_done(&in_ifaddr_rwlock);                                 \
 }
 
 /*
@@ -221,14 +223,14 @@ extern  u_char  inetctlerrmap[];
 	/* struct ifnet *ifp; */                                        \
 	/* struct in_ifaddr *ia; */                                     \
 {                                                                       \
-	lck_rw_lock_shared(in_ifaddr_rwlock);                           \
+	lck_rw_lock_shared(&in_ifaddr_rwlock);                          \
 	for ((ia) = TAILQ_FIRST(&in_ifaddrhead);                        \
 	    (ia) != NULL && (ia)->ia_ifp != (ifp);                      \
 	    (ia) = TAILQ_NEXT((ia), ia_link))                           \
 	        continue;                                               \
 	if ((ia) != NULL)                                               \
 	        IFA_ADDREF(&(ia)->ia_ifa);                              \
-	lck_rw_done(in_ifaddr_rwlock);                                  \
+	lck_rw_done(&in_ifaddr_rwlock);                                 \
 }
 
 /*
@@ -483,7 +485,7 @@ struct in_ifextra {
 	u_int8_t                netsig[IFNET_SIGNATURELEN];
 	struct lltable          *ii_llt;        /* ARP state */
 };
-#define IN_IFEXTRA(_ifp)        ((struct in_ifextra *)(_ifp->if_inetdata))
+#define IN_IFEXTRA(_ifp)        (_ifp->if_inetdata)
 #define LLTABLE(ifp)            ((IN_IFEXTRA(ifp) == NULL) ? NULL : IN_IFEXTRA(ifp)->ii_llt)
 
 extern u_int32_t ipv4_ll_arp_aware;
@@ -517,7 +519,8 @@ extern void ip_input(struct mbuf *);
 extern void ip_input_process_list(struct mbuf *);
 extern int in_ifadown(struct ifaddr *ifa, int);
 extern void in_ifscrub(struct ifnet *, struct in_ifaddr *, int);
-extern u_int32_t inaddr_hashval(u_int32_t);
+extern uint32_t inaddr_hashval(uint32_t);
+extern struct in_ifaddrhashhead *inaddr_hashlookup(uint32_t);
 extern void in_purgeaddrs(struct ifnet *);
 extern void gre_input(struct mbuf *, int);
 extern void imf_leave(struct in_mfilter *);

@@ -39,11 +39,9 @@
 
 #define NDRTI_ZONE_NAME "nd6_route_info"        /* zone name */
 
-extern lck_mtx_t *nd6_mutex;
 static struct nd_route_info *nd6_rti_lookup(struct nd_route_info *);
 
-static ZONE_DECLARE(ndrti_zone, "nd6_route_info",
-    sizeof(struct nd_route_info), ZC_ZFREE_CLEARMEM);
+static KALLOC_TYPE_DEFINE(ndrti_zone, struct nd_route_info, NET_KT_DEFAULT);
 
 static boolean_t nd6_rti_list_busy = FALSE;             /* protected by nd6_mutex */
 

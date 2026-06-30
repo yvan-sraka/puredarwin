@@ -188,12 +188,8 @@ IODMACommand::initWithRefCon(void * refCon)
 	}
 
 	if (!reserved) {
-		reserved = IONew(IODMACommandInternal, 1);
-		if (!reserved) {
-			return false;
-		}
+		reserved = IOMallocType(IODMACommandInternal);
 	}
-	bzero(reserved, sizeof(IODMACommandInternal));
 	fRefCon = refCon;
 
 	return true;
@@ -332,14 +328,17 @@ IODMACommand::setSpecification(SegmentFunction        outSegFunc,
 	default:
 		return kIOReturnBadArgument;
 	}
-	;
 
 	if (mapper != fMapper) {
 		fMapper.reset(mapper, OSRetain);
 	}
 
 	fInternalState->fIterateOnly = (0 != (kIterateOnly & mappingOptions));
+	if (0 != (kIODMAMapOptionDextOwner & mappingOptions)) {
+		fInternalState->fDextLock = IOLockAlloc();
+	}
 	fInternalState->fDevice = device;
+
 
 	return kIOReturnSuccess;
 }
@@ -348,7 +347,13 @@ void
 IODMACommand::free()
 {
 	if (reserved) {
-		IODelete(reserved, IODMACommandInternal, 1);
+		if (fInternalState->fDextLock) {
+			if (fActive) {
+				CompleteDMA(kIODMACommandCompleteDMANoOptions);
+			}
+			IOLockFree(fInternalState->fDextLock);
+		}
+		IOFreeType(reserved, IODMACommandInternal);
 	}
 
 	fMapper.reset();
@@ -966,7 +971,7 @@ IODMACommand::prepare(UInt64 offset, UInt64 length, bool flushCache, bool synchr
 					}
 #endif /* defined(LOGTAG) */
 
-					state->fMapSegments = IONewZero(IODMACommandMapSegment, segCount);
+					state->fMapSegments = IONewZeroData(IODMACommandMapSegment, segCount);
 					if (!state->fMapSegments) {
 						ret = kIOReturnNoMemory;
 						break;
@@ -1096,7 +1101,7 @@ IODMACommand::complete(bool invalidateCache, bool synchronize)
 			state->fLocalMapperAllocValid  = false;
 			state->fLocalMapperAllocLength = 0;
 			if (state->fMapSegments) {
-				IODelete(state->fMapSegments, IODMACommandMapSegment, state->fMapSegmentsCount);
+				IODeleteData(state->fMapSegments, IODMACommandMapSegment, state->fMapSegmentsCount);
 				state->fMapSegments      = NULL;
 				state->fMapSegmentsCount = 0;
 			}
@@ -1428,7 +1433,7 @@ IODMACommand::genIOVMSegments(uint32_t op,
 					mapperPhys = fMapper->mapToPhysicalAddress(state->fIOVMAddr + checkOffset);
 					mapperPhys |= (phys & (fMapper->getPageSize() - 1));
 					if (mapperPhys != phys) {
-						panic("DMA[%p] mismatch at offset %llx + %llx, dma %llx mapperPhys %llx != %llx, len %llx\n",
+						panic("DMA[%p] mismatch at offset %llx + %llx, dma %llx mapperPhys %llx != %llx, len %llx",
 						    this, offset, checkOffset,
 						    state->fIOVMAddr + checkOffset, mapperPhys, phys, state->fLength);
 					}

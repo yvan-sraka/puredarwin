@@ -128,9 +128,8 @@
 #include <netinet6/mld6_var.h>
 
 /* Lock group and attribute for mld_mtx */
-static lck_attr_t       *mld_mtx_attr;
-static lck_grp_t        *mld_mtx_grp;
-static lck_grp_attr_t   *mld_mtx_grp_attr;
+static LCK_ATTR_DECLARE(mld_mtx_attr, 0, 0);
+static LCK_GRP_DECLARE(mld_mtx_grp, "mld_mtx");
 
 /*
  * Locking and reference counting:
@@ -162,7 +161,7 @@ static lck_grp_attr_t   *mld_mtx_grp_attr;
  * Any may be taken independently, but if any are held at the same time,
  * the above lock order must be followed.
  */
-static decl_lck_mtx_data(, mld_mtx);
+static LCK_MTX_DECLARE_ATTR(mld_mtx, &mld_mtx_grp, &mld_mtx_attr);
 
 SLIST_HEAD(mld_in6m_relhead, in6_multi);
 
@@ -213,9 +212,13 @@ static int      sysctl_mld_gsr SYSCTL_HANDLER_ARGS;
 static int      sysctl_mld_ifinfo SYSCTL_HANDLER_ARGS;
 static int      sysctl_mld_v2enable SYSCTL_HANDLER_ARGS;
 
-static int mld_timeout_run;             /* MLD timer is scheduled to run */
-static void mld_timeout(void *);
+static const uint32_t mld_timeout_delay = 1000; /* in milliseconds */
+static const uint32_t mld_timeout_leeway = 500; /* in millseconds  */
+static bool mld_timeout_run;             /* MLD timer is scheduled to run */
+static bool mld_fast_timeout_run;        /* MLD fast timer is scheduled to run */
+static void mld_timeout(thread_call_param_t, thread_call_param_t);
 static void mld_sched_timeout(void);
+static void mld_sched_fast_timeout(void);
 
 /*
  * Normative references: RFC 2710, RFC 3590, RFC 3810.
@@ -254,8 +257,7 @@ static unsigned int mld_mli_list_genid;
 	VERIFY(SLIST_EMPTY(_head));                                     \
 }
 
-static ZONE_DECLARE(mli_zone, "mld_ifinfo",
-    sizeof(struct mld_ifinfo), ZC_ZFREE_CLEARMEM);
+static KALLOC_TYPE_DEFINE(mli_zone, struct mld_ifinfo, NET_KT_DEFAULT);
 
 SYSCTL_DECL(_net_inet6);        /* Note: Not in any common header. */
 
@@ -698,7 +700,7 @@ mli_delete(const struct ifnet *ifp, struct mld_in6m_relhead *in6m_dthead)
 		}
 		MLI_UNLOCK(mli);
 	}
-	panic("%s: mld_ifinfo not found for ifp %p(%s)\n", __func__,
+	panic("%s: mld_ifinfo not found for ifp %p(%s)", __func__,
 	    ifp, ifp->if_xname);
 }
 
@@ -754,7 +756,7 @@ mli_alloc(zalloc_flags_t how)
 {
 	struct mld_ifinfo *mli = zalloc_flags(mli_zone, how | Z_ZERO);
 	if (mli != NULL) {
-		lck_mtx_init(&mli->mli_lock, mld_mtx_grp, mld_mtx_attr);
+		lck_mtx_init(&mli->mli_lock, &mld_mtx_grp, &mld_mtx_attr);
 		mli->mli_debug |= IFD_ALLOC;
 	}
 	return mli;
@@ -780,7 +782,7 @@ mli_free(struct mld_ifinfo *mli)
 	mli->mli_debug &= ~IFD_ALLOC;
 	MLI_UNLOCK(mli);
 
-	lck_mtx_destroy(&mli->mli_lock, mld_mtx_grp);
+	lck_mtx_destroy(&mli->mli_lock, &mld_mtx_grp);
 	zfree(mli_zone, mli);
 }
 
@@ -1303,7 +1305,7 @@ mld_v2_process_group_query(struct in6_multi *inm, int timer, struct mbuf *m0,
 	 */
 	if (inm->in6m_nsrc > 0) {
 		struct mbuf             *m;
-		uint8_t                 *sp;
+		struct in6_addr          addr;
 		int                      i, nrecorded;
 		int                      soff;
 
@@ -1311,20 +1313,22 @@ mld_v2_process_group_query(struct in6_multi *inm, int timer, struct mbuf *m0,
 		soff = off + sizeof(struct mldv2_query);
 		nrecorded = 0;
 		for (i = 0; i < nsrc; i++) {
-			sp = mtod(m, uint8_t *) + soff;
-			retval = in6m_record_source(inm,
-			    (const struct in6_addr *)(void *)sp);
+			m_copydata(m, soff, sizeof(addr), &addr);
+			retval = in6m_record_source(inm, &addr);
 			if (retval < 0) {
 				break;
 			}
 			nrecorded += retval;
 			soff += sizeof(struct in6_addr);
-			if (soff >= m->m_len) {
-				soff = soff - m->m_len;
+
+			while (m && (soff >= m->m_len)) {
+				soff -= m->m_len;
 				m = m->m_next;
-				if (m == NULL) {
-					break;
-				}
+			}
+
+			/* should not be possible: */
+			if (m == NULL) {
+				break;
 			}
 		}
 		if (nrecorded > 0) {
@@ -1594,18 +1598,29 @@ mld_set_timeout(struct mld_tparams *mtp)
 		if (mtp->sct != 0) {
 			state_change_timers_running6 = 1;
 		}
-		mld_sched_timeout();
+		if (mtp->fast) {
+			mld_sched_fast_timeout();
+		} else {
+			mld_sched_timeout();
+		}
 		MLD_UNLOCK();
 	}
+}
+
+void
+mld_set_fast_timeout(struct mld_tparams *mtp)
+{
+	VERIFY(mtp != NULL);
+	mtp->fast = true;
+	mld_set_timeout(mtp);
 }
 
 /*
  * MLD6 timer handler (per 1 second).
  */
 static void
-mld_timeout(void *arg)
+mld_timeout(thread_call_param_t arg0, thread_call_param_t arg1 __unused)
 {
-#pragma unused(arg)
 	struct ifqueue           scq;   /* State-change packets */
 	struct ifqueue           qrq;   /* Query response packets */
 	struct ifnet            *ifp;
@@ -1613,6 +1628,7 @@ mld_timeout(void *arg)
 	struct in6_multi        *inm;
 	int                      uri_sec = 0;
 	unsigned int genid = mld_mli_list_genid;
+	bool                     fast = arg0 != NULL;
 
 	SLIST_HEAD(, in6_multi) in6m_dthead;
 
@@ -1627,10 +1643,18 @@ mld_timeout(void *arg)
 
 	MLD_LOCK();
 
-	MLD_PRINTF(("%s: qpt %d, it %d, cst %d, sct %d\n", __func__,
+	MLD_PRINTF(("%s: qpt %d, it %d, cst %d, sct %d, fast %d\n", __func__,
 	    querier_present_timers_running6, interface_timers_running6,
-	    current_state_timers_running6, state_change_timers_running6));
+	    current_state_timers_running6, state_change_timers_running6, fast));
 
+	if (fast) {
+		/*
+		 * When running the fast timer, skip processing
+		 * of "querier present" timers since they are
+		 * based on 1-second intervals.
+		 */
+		goto skip_query_timers;
+	}
 	/*
 	 * MLDv1 querier present timer processing.
 	 */
@@ -1704,8 +1728,7 @@ mld_timeout(void *arg)
 		mli->mli_flags &= ~MLIF_PROCESSED;
 	}
 
-
-
+skip_query_timers:
 	if (!current_state_timers_running6 &&
 	    !state_change_timers_running6) {
 		goto out_locked;
@@ -1823,7 +1846,11 @@ next:
 
 out_locked:
 	/* re-arm the timer if there's work to do */
-	mld_timeout_run = 0;
+	if (fast) {
+		mld_fast_timeout_run = false;
+	} else {
+		mld_timeout_run = false;
+	}
 	mld_sched_timeout();
 	MLD_UNLOCK();
 
@@ -1834,13 +1861,49 @@ out_locked:
 static void
 mld_sched_timeout(void)
 {
+	static thread_call_t mld_timeout_tcall;
+	uint64_t deadline = 0, leeway = 0;
+
 	MLD_LOCK_ASSERT_HELD();
+	if (mld_timeout_tcall == NULL) {
+		mld_timeout_tcall =
+		    thread_call_allocate_with_options(mld_timeout,
+		    NULL,
+		    THREAD_CALL_PRIORITY_KERNEL,
+		    THREAD_CALL_OPTIONS_ONCE);
+	}
 
 	if (!mld_timeout_run &&
 	    (querier_present_timers_running6 || current_state_timers_running6 ||
 	    interface_timers_running6 || state_change_timers_running6)) {
-		mld_timeout_run = 1;
-		timeout(mld_timeout, NULL, hz);
+		mld_timeout_run = true;
+		clock_interval_to_deadline(mld_timeout_delay, NSEC_PER_MSEC,
+		    &deadline);
+		clock_interval_to_absolutetime_interval(mld_timeout_leeway,
+		    NSEC_PER_MSEC, &leeway);
+		thread_call_enter_delayed_with_leeway(mld_timeout_tcall, NULL,
+		    deadline, leeway,
+		    THREAD_CALL_DELAY_LEEWAY);
+	}
+}
+
+static void
+mld_sched_fast_timeout(void)
+{
+	static thread_call_t mld_fast_timeout_tcall;
+
+	MLD_LOCK_ASSERT_HELD();
+	if (mld_fast_timeout_tcall == NULL) {
+		mld_fast_timeout_tcall =
+		    thread_call_allocate_with_options(mld_timeout,
+		    mld_sched_fast_timeout,
+		    THREAD_CALL_PRIORITY_KERNEL,
+		    THREAD_CALL_OPTIONS_ONCE);
+	}
+	if (!mld_fast_timeout_run &&
+	    (current_state_timers_running6 || state_change_timers_running6)) {
+		mld_fast_timeout_run = true;
+		thread_call_enter(mld_fast_timeout_tcall);
 	}
 }
 
@@ -2280,12 +2343,14 @@ mld_v1_transmit_report(struct in6_multi *in6m, const uint8_t type)
 		IFA_LOCK(&ia->ia_ifa);
 	}
 	ip6->ip6_src = ia ? ia->ia_addr.sin6_addr : in6addr_any;
+	ip6_output_setsrcifscope(mh, IFSCOPE_NONE, ia);
 	if (ia != NULL) {
 		IFA_UNLOCK(&ia->ia_ifa);
 		IFA_REMREF(&ia->ia_ifa);
 		ia = NULL;
 	}
 	ip6->ip6_dst = in6m->in6m_addr;
+	ip6_output_setdstifscope(mh, in6m->ifscope, NULL);
 
 	md->m_len = sizeof(struct mld_hdr);
 	mld = mtod(md, struct mld_hdr *);
@@ -3645,7 +3710,7 @@ mld_dispatch_packet(struct mbuf *m)
 
 	ip6 = mtod(m0, struct ip6_hdr *);
 	(void)in6_setscope(&ip6->ip6_dst, ifp, NULL);
-
+	ip6_output_setdstifscope(m0, ifp->if_index, NULL);
 	/*
 	 * Retrieve the ICMPv6 type before handoff to ip6_output(),
 	 * so we can bump the stats.
@@ -3746,12 +3811,15 @@ mld_v2_encap_report(struct ifnet *ifp, struct mbuf *m)
 		IFA_LOCK(&ia->ia_ifa);
 	}
 	ip6->ip6_src = ia ? ia->ia_addr.sin6_addr : in6addr_any;
+	ip6_output_setsrcifscope(mh, IFSCOPE_NONE, ia);
+
 	if (ia != NULL) {
 		IFA_UNLOCK(&ia->ia_ifa);
 		IFA_REMREF(&ia->ia_ifa);
 		ia = NULL;
 	}
 	ip6->ip6_dst = in6addr_linklocal_allv2routers;
+	ip6_output_setdstifscope(mh, ifp->if_index, NULL);
 	/* scope ID will be set in netisr */
 
 	mld = (struct mldv2_report *)(ip6 + 1);
@@ -3797,12 +3865,6 @@ void
 mld_init(void)
 {
 	MLD_PRINTF(("%s: initializing\n", __func__));
-
-	/* Setup lock group and attribute for mld_mtx */
-	mld_mtx_grp_attr = lck_grp_attr_alloc_init();
-	mld_mtx_grp = lck_grp_alloc_init("mld_mtx\n", mld_mtx_grp_attr);
-	mld_mtx_attr = lck_attr_alloc_init();
-	lck_mtx_init(&mld_mtx, mld_mtx_grp, mld_mtx_attr);
 
 	ip6_initpktopts(&mld_po);
 	mld_po.ip6po_hlim = 1;
