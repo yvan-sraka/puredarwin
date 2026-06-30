@@ -5,6 +5,12 @@ on:
     branches: [main]
   push:
     branches: [main]
+  workflow_dispatch:
+    inputs:
+      arch:
+        description: "Target architecture (x86_64 or arm64, leave blank to run both)"
+        required: false
+        default: ""
 
 jobs:
   build:
@@ -20,6 +26,11 @@ jobs:
           # Apple Silicon / arm64 – native build on the arm64 runner image
           - arch: arm64
             runner: macos-15
+    # When triggered manually with a specific arch, skip the other matrix leg
+    if: >
+      github.event_name != 'workflow_dispatch' ||
+      inputs.arch == '' ||
+      inputs.arch == matrix.arch
 
     steps:
       - name: Checkout
