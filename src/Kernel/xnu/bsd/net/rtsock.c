@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2000-2020 Apple Inc. All rights reserved.
+ * Copyright (c) 2000-2021 Apple Inc. All rights reserved.
  *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
  *
@@ -88,11 +88,11 @@
 #include <netinet/ip6.h>
 #include <netinet6/nd6.h>
 
+#include <IOKit/IOBSD.h>
+
 extern struct rtstat rtstat;
 extern struct domain routedomain_s;
 static struct domain *routedomain = NULL;
-
-MALLOC_DEFINE(M_RTABLE, "routetbl", "routing tables");
 
 static struct sockaddr route_dst = { .sa_len = 2, .sa_family = PF_ROUTE, .sa_data = { 0, } };
 static struct sockaddr route_src = { .sa_len = 2, .sa_family = PF_ROUTE, .sa_data = { 0, } };
@@ -184,17 +184,13 @@ rts_attach(struct socket *so, int proto, struct proc *p)
 
 	VERIFY(so->so_pcb == NULL);
 
-	MALLOC(rp, struct rawcb *, sizeof(*rp), M_PCB, M_WAITOK | M_ZERO);
-	if (rp == NULL) {
-		return ENOBUFS;
-	}
-
+	rp = kalloc_type(struct rawcb, Z_WAITOK_ZERO_NOFAIL);
 	so->so_pcb = (caddr_t)rp;
 	/* don't use raw_usrreqs.pru_attach, it checks for SS_PRIV */
 	error = raw_attach(so, proto);
 	rp = sotorawcb(so);
 	if (error) {
-		FREE(rp, M_PCB);
+		kfree_type(struct rawcb, rp);
 		so->so_pcb = NULL;
 		so->so_flags |= SOF_PCBCLEARING;
 		return error;
@@ -308,6 +304,7 @@ static int
 route_output(struct mbuf *m, struct socket *so)
 {
 	struct rt_msghdr *rtm = NULL;
+	size_t rtm_len = 0;
 	struct rtentry *rt = NULL;
 	struct rtentry *saved_nrt = NULL;
 	struct radix_node_head *rnh;
@@ -340,11 +337,12 @@ route_output(struct mbuf *m, struct socket *so)
 		info.rti_info[RTAX_DST] = NULL;
 		senderr(EINVAL);
 	}
-	R_Malloc(rtm, struct rt_msghdr *, len);
+	rtm = kalloc_data(len, Z_WAITOK);
 	if (rtm == NULL) {
 		info.rti_info[RTAX_DST] = NULL;
 		senderr(ENOBUFS);
 	}
+	rtm_len = (size_t)len;
 	m_copydata(m, 0, len, (caddr_t)rtm);
 	if (rtm->rtm_version != RTM_VERSION) {
 		info.rti_info[RTAX_DST] = NULL;
@@ -449,7 +447,7 @@ route_output(struct mbuf *m, struct socket *so)
 	/*
 	 * Block changes on INTCOPROC interfaces.
 	 */
-	if (ifscope) {
+	if (ifscope != IFSCOPE_NONE) {
 		unsigned int intcoproc_scope = 0;
 		ifnet_head_lock_shared();
 		TAILQ_FOREACH(ifp, &ifnet_head, if_link) {
@@ -459,7 +457,26 @@ route_output(struct mbuf *m, struct socket *so)
 			}
 		}
 		ifnet_head_done();
-		if (intcoproc_scope == ifscope && current_proc()->p_pid != 0) {
+		if (intcoproc_scope == ifscope && proc_getpid(current_proc()) != 0) {
+			senderr(EINVAL);
+		}
+	}
+	/*
+	 * Require entitlement to change management interfaces
+	 */
+	if (management_control_unrestricted == false && if_management_interface_check_needed == true &&
+	    ifscope != IFSCOPE_NONE && proc_getpid(current_proc()) != 0) {
+		bool is_management = false;
+
+		ifnet_head_lock_shared();
+		if (IF_INDEX_IN_RANGE(ifscope)) {
+			if (IFNET_IS_MANAGEMENT(ifindex2ifnet[ifscope])) {
+				is_management = true;
+			}
+		}
+		ifnet_head_done();
+
+		if (is_management && !IOCurrentTaskHasEntitlement(MANAGEMENT_CONTROL_ENTITLEMENT)) {
 			senderr(EINVAL);
 		}
 	}
@@ -485,6 +502,14 @@ route_output(struct mbuf *m, struct socket *so)
 	    info.rti_info[RTAX_GATEWAY]->sa_family == AF_INET) {
 		sin_set_ifscope(info.rti_info[RTAX_GATEWAY], IFSCOPE_NONE);
 	}
+	if (info.rti_info[RTAX_DST]->sa_family == AF_INET6 &&
+	    IN6_IS_SCOPE_EMBED(&SIN6(info.rti_info[RTAX_DST])->sin6_addr) &&
+	    !IN6_IS_ADDR_UNICAST_BASED_MULTICAST(&SIN6(info.rti_info[RTAX_DST])->sin6_addr) &&
+	    SIN6(info.rti_info[RTAX_DST])->sin6_scope_id == 0) {
+		SIN6(info.rti_info[RTAX_DST])->sin6_scope_id = ntohs(SIN6(info.rti_info[RTAX_DST])->sin6_addr.s6_addr16[1]);
+		SIN6(info.rti_info[RTAX_DST])->sin6_addr.s6_addr16[1] = 0;
+	}
+
 	switch (rtm->rtm_type) {
 	case RTM_ADD:
 		if (info.rti_info[RTAX_GATEWAY] == NULL) {
@@ -615,7 +640,7 @@ report:
 				IFA_UNLOCK(ifa2);
 			}
 			struct rt_msghdr *out_rtm;
-			R_Malloc(out_rtm, struct rt_msghdr *, len);
+			out_rtm = kalloc_data(len, Z_WAITOK);
 			if (out_rtm == NULL) {
 				RT_UNLOCK(rt);
 				if (ifa2 != NULL) {
@@ -632,8 +657,9 @@ report:
 			if (ifa2 != NULL) {
 				IFA_UNLOCK(ifa2);
 			}
-			R_Free(rtm);
+			kfree_data(rtm, rtm_len);
 			rtm = out_rtm;
+			rtm_len = len;
 			rtm->rtm_flags = rt->rt_flags;
 			rt_getmetrics(rt, &rtm->rtm_rmx);
 			rtm->rtm_addrs = info.rti_addrs;
@@ -736,9 +762,7 @@ flush:
 	 */
 	if (!(so->so_options & SO_USELOOPBACK)) {
 		if (route_cb.any_count <= 1) {
-			if (rtm != NULL) {
-				R_Free(rtm);
-			}
+			kfree_data(rtm, rtm_len);
 			m_freem(m);
 			return error;
 		}
@@ -753,7 +777,7 @@ flush:
 		} else if (m->m_pkthdr.len > rtm->rtm_msglen) {
 			m_adj(m, rtm->rtm_msglen - m->m_pkthdr.len);
 		}
-		R_Free(rtm);
+		kfree_data(rtm, rtm_len);
 	}
 	if (sendonlytoself && m != NULL) {
 		error = 0;
@@ -1293,9 +1317,9 @@ again:
 		if (rw->w_req != NULL) {
 			if (rw->w_tmemsize < len) {
 				if (rw->w_tmem != NULL) {
-					FREE(rw->w_tmem, M_RTABLE);
+					kfree_data(rw->w_tmem, rw->w_tmemsize);
 				}
-				rw->w_tmem = _MALLOC(len, M_RTABLE, M_ZERO | M_WAITOK);
+				rw->w_tmem = (caddr_t) kalloc_data(len, Z_ZERO | Z_WAITOK);
 				if (rw->w_tmem != NULL) {
 					rw->w_tmemsize = len;
 				}
@@ -1733,7 +1757,7 @@ done:
  * all locks to allocate a temporary buffer that gets filled
  * in the second pass.
  *
- * Note that we are verifying the assumption that _MALLOC returns a buffer
+ * Note that we are verifying the assumption that kalloc() returns a buffer
  * that is at least 32 bits aligned and that the messages and addresses are
  * 32 bits aligned.
  */
@@ -1743,9 +1767,9 @@ sysctl_iflist(int af, struct walkarg *w)
 	struct ifnet *ifp;
 	struct ifaddr *ifa;
 	struct  rt_addrinfo info;
-	int     len = 0, error = 0;
+	int     error = 0;
 	int     pass = 0;
-	int     total_len = 0, current_len = 0;
+	size_t  len = 0, total_len = 0, total_buffer_len = 0, current_len = 0;
 	char    *total_buffer = NULL, *cp = NULL;
 	kauth_cred_t cred;
 
@@ -1774,7 +1798,11 @@ sysctl_iflist(int af, struct walkarg *w)
 			info.rti_info[RTAX_IFP] = ifa->ifa_addr;
 			len = rt_msg2(RTM_IFINFO, &info, NULL, NULL, &cred);
 			if (pass == 0) {
-				total_len += len;
+				if (os_add_overflow(total_len, len, &total_len)) {
+					ifnet_lock_done(ifp);
+					error = ENOBUFS;
+					break;
+				}
 			} else {
 				struct if_msghdr *ifm;
 
@@ -1806,6 +1834,7 @@ sysctl_iflist(int af, struct walkarg *w)
 				cp += len;
 				VERIFY(IS_P2ALIGNED(cp, sizeof(u_int32_t)));
 				current_len += len;
+				VERIFY(current_len <= total_len);
 			}
 			while ((ifa = ifa->ifa_link.tqe_next) != NULL) {
 				IFA_LOCK(ifa);
@@ -1825,7 +1854,11 @@ sysctl_iflist(int af, struct walkarg *w)
 				len = rt_msg2(RTM_NEWADDR, &info, NULL, NULL,
 				    &cred);
 				if (pass == 0) {
-					total_len += len;
+					if (os_add_overflow(total_len, len, &total_len)) {
+						IFA_UNLOCK(ifa);
+						error = ENOBUFS;
+						break;
+					}
 				} else {
 					struct ifa_msghdr *ifam;
 
@@ -1848,6 +1881,7 @@ sysctl_iflist(int af, struct walkarg *w)
 					VERIFY(IS_P2ALIGNED(cp,
 					    sizeof(u_int32_t)));
 					current_len += len;
+					VERIFY(current_len <= total_len);
 				}
 				IFA_UNLOCK(ifa);
 			}
@@ -1860,8 +1894,8 @@ sysctl_iflist(int af, struct walkarg *w)
 
 		if (error != 0) {
 			if (error == ENOBUFS) {
-				printf("%s: current_len (%d) + len (%d) > "
-				    "total_len (%d)\n", __func__, current_len,
+				printf("%s: current_len (%lu) + len (%lu) > "
+				    "total_len (%lu)\n", __func__, current_len,
 				    len, total_len);
 			}
 			break;
@@ -1873,10 +1907,10 @@ sysctl_iflist(int af, struct walkarg *w)
 				total_len = 1;
 			}
 			total_len += total_len >> 3;
-			total_buffer = _MALLOC(total_len, M_RTABLE,
-			    M_ZERO | M_WAITOK);
+			total_buffer_len = total_len;
+			total_buffer = (char *) kalloc_data(total_len, Z_ZERO | Z_WAITOK);
 			if (total_buffer == NULL) {
-				printf("%s: _MALLOC(%d) failed\n", __func__,
+				printf("%s: kalloc_data(%lu) failed\n", __func__,
 				    total_len);
 				error = ENOBUFS;
 				break;
@@ -1892,7 +1926,7 @@ sysctl_iflist(int af, struct walkarg *w)
 	}
 
 	if (total_buffer != NULL) {
-		_FREE(total_buffer, M_RTABLE);
+		kfree_data(total_buffer, total_buffer_len);
 	}
 
 	kauth_cred_unref(&cred);
@@ -1905,9 +1939,9 @@ sysctl_iflist2(int af, struct walkarg *w)
 	struct ifnet *ifp;
 	struct ifaddr *ifa;
 	struct  rt_addrinfo info;
-	int     len = 0, error = 0;
+	int     error = 0;
 	int     pass = 0;
-	int     total_len = 0, current_len = 0;
+	size_t  len = 0, total_len = 0, total_buffer_len = 0, current_len = 0;
 	char    *total_buffer = NULL, *cp = NULL;
 	kauth_cred_t cred;
 
@@ -1938,7 +1972,11 @@ sysctl_iflist2(int af, struct walkarg *w)
 			info.rti_info[RTAX_IFP] = ifa->ifa_addr;
 			len = rt_msg2(RTM_IFINFO2, &info, NULL, NULL, &cred);
 			if (pass == 0) {
-				total_len += len;
+				if (os_add_overflow(total_len, len, &total_len)) {
+					ifnet_lock_done(ifp);
+					error = ENOBUFS;
+					break;
+				}
 			} else {
 				struct if_msghdr2 *ifm;
 
@@ -1956,10 +1994,10 @@ sysctl_iflist2(int af, struct walkarg *w)
 				ifm->ifm_addrs = info.rti_addrs;
 				ifm->ifm_flags = (u_short)ifp->if_flags;
 				ifm->ifm_index = ifp->if_index;
-				ifm->ifm_snd_len = IFCQ_LEN(&ifp->if_snd);
-				ifm->ifm_snd_maxlen = IFCQ_MAXLEN(&ifp->if_snd);
+				ifm->ifm_snd_len = IFCQ_LEN(ifp->if_snd);
+				ifm->ifm_snd_maxlen = IFCQ_MAXLEN(ifp->if_snd);
 				ifm->ifm_snd_drops =
-				    (int)ifp->if_snd.ifcq_dropcnt.packets;
+				    (int)ifp->if_snd->ifcq_dropcnt.packets;
 				ifm->ifm_timer = ifp->if_timer;
 				if_data_internal_to_if_data64(ifp,
 				    &ifp->if_data, &ifm->ifm_data);
@@ -1975,6 +2013,7 @@ sysctl_iflist2(int af, struct walkarg *w)
 				cp += len;
 				VERIFY(IS_P2ALIGNED(cp, sizeof(u_int32_t)));
 				current_len += len;
+				VERIFY(current_len <= total_len);
 			}
 			while ((ifa = ifa->ifa_link.tqe_next) != NULL) {
 				IFA_LOCK(ifa);
@@ -1995,7 +2034,11 @@ sysctl_iflist2(int af, struct walkarg *w)
 				len = rt_msg2(RTM_NEWADDR, &info, NULL, NULL,
 				    &cred);
 				if (pass == 0) {
-					total_len += len;
+					if (os_add_overflow(total_len, len, &total_len)) {
+						IFA_UNLOCK(ifa);
+						error = ENOBUFS;
+						break;
+					}
 				} else {
 					struct ifa_msghdr *ifam;
 
@@ -2018,6 +2061,7 @@ sysctl_iflist2(int af, struct walkarg *w)
 					VERIFY(IS_P2ALIGNED(cp,
 					    sizeof(u_int32_t)));
 					current_len += len;
+					VERIFY(current_len <= total_len);
 				}
 				IFA_UNLOCK(ifa);
 			}
@@ -2088,8 +2132,8 @@ sysctl_iflist2(int af, struct walkarg *w)
 
 		if (error) {
 			if (error == ENOBUFS) {
-				printf("%s: current_len (%d) + len (%d) > "
-				    "total_len (%d)\n", __func__, current_len,
+				printf("%s: current_len (%lu) + len (%lu) > "
+				    "total_len (%lu)\n", __func__, current_len,
 				    len, total_len);
 			}
 			break;
@@ -2101,10 +2145,10 @@ sysctl_iflist2(int af, struct walkarg *w)
 				total_len = 1;
 			}
 			total_len += total_len >> 3;
-			total_buffer = _MALLOC(total_len, M_RTABLE,
-			    M_ZERO | M_WAITOK);
+			total_buffer_len = total_len;
+			total_buffer = (char *) kalloc_data(total_len, Z_ZERO | Z_WAITOK);
 			if (total_buffer == NULL) {
-				printf("%s: _MALLOC(%d) failed\n", __func__,
+				printf("%s: kalloc_data(%lu) failed\n", __func__,
 				    total_len);
 				error = ENOBUFS;
 				break;
@@ -2120,7 +2164,7 @@ sysctl_iflist2(int af, struct walkarg *w)
 	}
 
 	if (total_buffer != NULL) {
-		_FREE(total_buffer, M_RTABLE);
+		kfree_data(total_buffer, total_buffer_len);
 	}
 
 	kauth_cred_unref(&cred);
@@ -2206,7 +2250,7 @@ sysctl_rtsock SYSCTL_HANDLER_ARGS
 		break;
 	}
 	if (w.w_tmem != NULL) {
-		FREE(w.w_tmem, M_RTABLE);
+		kfree_data(w.w_tmem, w.w_tmemsize);
 	}
 	return error;
 }
@@ -2221,7 +2265,6 @@ static struct protosw routesw[] = {
 		.pr_flags =             PR_ATOMIC | PR_ADDR,
 		.pr_output =            route_output,
 		.pr_ctlinput =          raw_ctlinput,
-		.pr_init =              raw_init,
 		.pr_usrreqs =           &route_usrreqs,
 	}
 };

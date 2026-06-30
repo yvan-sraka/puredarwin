@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2007-2016 Apple Inc. All rights reserved.
+ * Copyright (c) 2007-2021 Apple Inc. All rights reserved.
  *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
  *
@@ -68,6 +68,10 @@
 #include <kern/monotonic.h>
 #endif /* MONOTONIC */
 
+#if KPERF
+#include <kperf/kptimer.h>
+#endif /* KPERF */
+
 #if HIBERNATION
 #include <IOKit/IOPlatformExpert.h>
 #include <IOKit/IOHibernatePrivate.h>
@@ -83,15 +87,19 @@ extern uint64_t         wake_abstime;
 void sleep_token_buffer_init(void);
 #endif
 
-
 extern uintptr_t resume_idle_cpu;
 extern uintptr_t start_cpu;
+vm_address_t   start_cpu_paddr;
 
 #if __ARM_KERNEL_PROTECT__
 extern void exc_vectors_table;
 #endif /* __ARM_KERNEL_PROTECT__ */
 
+#if APPLEVIRTUALPLATFORM
+extern void __attribute__((noreturn)) arm64_prepare_for_sleep(boolean_t deep_sleep, unsigned int cpu, uint64_t entry_pa);
+#else
 extern void __attribute__((noreturn)) arm64_prepare_for_sleep(boolean_t deep_sleep);
+#endif
 extern void arm64_force_wfi_clock_gate(void);
 #if defined(APPLETYPHOON)
 // <rdar://problem/15827409>
@@ -103,19 +111,15 @@ extern void typhoon_return_from_wfi(void);
 extern void arm64_retention_wfi(void);
 #endif
 
-vm_address_t   start_cpu_paddr;
-
 sysreg_restore_t sysreg_restore __attribute__((section("__DATA, __const"))) = {
 	.tcr_el1 = TCR_EL1_BOOT,
 };
-
 
 // wfi - wfi mode
 //  0 : disabled
 //  1 : normal
 //  2 : overhead simulation (delay & flags)
-static int wfi = 1;
-
+TUNABLE(unsigned int, wfi, "wfi", 1);
 #if DEVELOPMENT || DEBUG
 
 // wfi_flags
@@ -127,13 +131,24 @@ static int wfi_flags = 0;
 static uint64_t wfi_delay = 0;
 
 #endif /* DEVELOPMENT || DEBUG */
-#if DEVELOPMENT || DEBUG
-static bool idle_proximate_timer_wfe = true;
-static bool idle_proximate_io_wfe = true;
+
 #define CPUPM_IDLE_WFE 0x5310300
+#define CPUPM_IDLE_TIMER_WFE 0x5310304
+
+/* When recommended, issue WFE with [FI]IRQ unmasked in the idle
+ * loop. The default.
+ */
+uint32_t idle_proximate_io_wfe_unmasked = 1;
+#if DEVELOPMENT || DEBUG
+uint32_t idle_proximate_timer_wfe = 1;
+uint32_t idle_proximate_io_wfe_masked = 0;
 #else
-static const bool idle_proximate_timer_wfe = true;
-static const bool idle_proximate_io_wfe = true;
+/* Issue WFE in lieu of WFI when awaiting a proximate timer. */
+static uint32_t idle_proximate_timer_wfe = 1;
+/* When recommended, issue WFE with [FI]IRQ masked in the idle loop.
+ * Non-default, retained for experimentation.
+ */
+static uint32_t idle_proximate_io_wfe_masked = 0;
 #endif
 
 #if __ARM_GLOBAL_SLEEP_BIT__
@@ -182,11 +197,13 @@ arm64_immediate_ipi_test_callback(void *parm)
 
 uint64_t arm64_ipi_test_data[MAX_CPUS * 2];
 
+MACHINE_TIMEOUT(arm64_ipi_test_timeout, "arm64-ipi-test", 100, MACHINE_TIMEOUT_UNIT_MSEC, NULL);
+
 void
 arm64_ipi_test()
 {
 	volatile uint64_t *ipi_test_data, *immediate_ipi_test_data;
-	uint32_t timeout_ms = 100;
+	uint64_t timeout_ms = os_atomic_load(&arm64_ipi_test_timeout, relaxed);
 	uint64_t then, now, delta;
 	int current_cpu_number = getCpuDatap()->cpu_number;
 
@@ -214,7 +231,7 @@ arm64_ipi_test()
 			now = mach_absolute_time();
 			absolutetime_to_nanoseconds(now - then, &delta);
 			if ((delta / NSEC_PER_MSEC) > timeout_ms) {
-				panic("CPU %d was unable to immediate-IPI CPU %u within %dms", current_cpu_number, i, timeout_ms);
+				panic("CPU %d was unable to immediate-IPI CPU %u within %lldms", current_cpu_number, i, timeout_ms);
 			}
 		}
 
@@ -228,7 +245,7 @@ arm64_ipi_test()
 			now = mach_absolute_time();
 			absolutetime_to_nanoseconds(now - then, &delta);
 			if ((delta / NSEC_PER_MSEC) > timeout_ms) {
-				panic("CPU %d tried to IPI CPU %d but didn't get correct responses within %dms, responses: %llx, %llx",
+				panic("CPU %d tried to IPI CPU %d but didn't get correct responses within %lldms, responses: %llx, %llx",
 				    current_cpu_number, i, timeout_ms, *ipi_test_data, *immediate_ipi_test_data);
 			}
 		}
@@ -267,14 +284,6 @@ configure_coresight_registers(cpu_data_t *cdp)
 					uint64_t addr = cdp->cpu_regmap_paddr + CORESIGHT_OFFSET(i);
 					cdp->coresight_base[i] = (vm_offset_t)ml_io_map(addr, CORESIGHT_SIZE);
 				}
-
-				/*
-				 * At this point, failing to io map the
-				 * registers is considered as an error.
-				 */
-				if (!cdp->coresight_base[i]) {
-					panic("unable to ml_io_map coresight regions");
-				}
 			}
 			/* Unlock EDLAR, CTILAR, PMLAR */
 			if (i != CORESIGHT_UTT) {
@@ -303,17 +312,23 @@ cpu_sleep(void)
 {
 	cpu_data_t     *cpu_data_ptr = getCpuDatap();
 
-	pmap_switch_user_ttb(kernel_pmap);
 	cpu_data_ptr->cpu_active_thread = current_thread();
 	cpu_data_ptr->cpu_reset_handler = (uintptr_t) start_cpu_paddr;
 	cpu_data_ptr->cpu_flags |= SleepState;
-	cpu_data_ptr->cpu_user_debug = NULL;
+
+	if (cpu_data_ptr->cpu_user_debug != NULL) {
+		arm_debug_set(NULL);
+	}
+
 #if KPC
 	kpc_idle();
 #endif /* KPC */
 #if MONOTONIC
 	mt_cpu_down(cpu_data_ptr);
 #endif /* MONOTONIC */
+#if KPERF
+	kptimer_stop_curcpu();
+#endif /* KPERF */
 
 	CleanPoC_Dcache();
 
@@ -327,7 +342,11 @@ cpu_sleep(void)
 		cpu_data_ptr->cpu_reset_handler = (uintptr_t)0;
 		__builtin_arm_dsb(DSB_ISH);
 		CleanPoU_Dcache();
+#if APPLEVIRTUALPLATFORM
+		arm64_prepare_for_sleep(deep_sleep, cpu_data_ptr->cpu_number, ml_vtophys((vm_offset_t)&LowResetVectorBase));
+#else
 		arm64_prepare_for_sleep(deep_sleep);
+#endif
 	}
 #else
 	PE_cpu_machine_quiesce(cpu_data_ptr->cpu_id);
@@ -337,16 +356,16 @@ cpu_sleep(void)
 
 /*
  *	Routine:	cpu_interrupt_is_pending
- *	Function:	Returns the value of ISR.  Due to how this register is
- *			is implemented, this returns 0 if there are no
- *			interrupts pending, so it can be used as a boolean test.
+ *	Function:	Returns a bool signifying a non-zero ISR_EL1,
+ *			indicating a pending IRQ, FIQ or external abort.
  */
-int
+
+bool
 cpu_interrupt_is_pending(void)
 {
 	uint64_t isr_value;
 	isr_value = __builtin_arm_rsr64("ISR_EL1");
-	return (int)isr_value;
+	return isr_value != 0;
 }
 
 static bool
@@ -355,38 +374,107 @@ cpu_proximate_timer(void)
 	return !SetIdlePop();
 }
 
-static bool
-wfe_to_deadline_or_interrupt(uint32_t cid, uint64_t wfe_deadline, __unused cpu_data_t *cdp)
+#ifdef ARM64_BOARD_CONFIG_T6000
+int wfe_allowed = 0;
+#else
+int wfe_allowed = 1;
+#endif /* ARM64_BOARD_CONFIG_T6000 */
+
+#if DEVELOPMENT || DEBUG
+#define WFE_STAT(x)     \
+	do {            \
+	        (x);    \
+	} while(0)
+#else
+#define WFE_STAT(x)     do {} while(0)
+#endif /* DEVELOPMENT || DEBUG */
+
+bool
+wfe_to_deadline_or_interrupt(uint32_t cid, uint64_t wfe_deadline, cpu_data_t *cdp, bool unmask)
 {
 	bool ipending = false;
-	while ((ipending = (cpu_interrupt_is_pending() != 0)) == false) {
-		/* Assumes event stream enablement
-		 * TODO: evaluate temporarily stretching the per-CPU event
-		 * interval to a larger value for possible efficiency
-		 * improvements.
+	uint64_t irqc = 0, nirqc = 0;
+
+	/* The ARMv8 architecture permits a processor dwelling in WFE
+	 * with F/IRQ masked to ignore a pending interrupt, i.e.
+	 * not classify it as an 'event'. This is potentially
+	 * problematic with AICv2's IRQ distribution model, as
+	 * a transient interrupt masked interval can cause an SIQ
+	 * query rejection, possibly routing the interrupt to
+	 * another core/cluster in a powergated state.
+	 * Hence, optionally unmask IRQs+FIQs across WFE.
+	 */
+	if (unmask) {
+		/* Latch SW IRQ+FIQ counter prior to unmasking
+		 * interrupts.
 		 */
-		__builtin_arm_wfe();
-#if DEVELOPMENT || DEBUG
-		cdp->wfe_count++;
-#endif
+		irqc = nirqc = os_atomic_load(&cdp->cpu_stat.irq_ex_cnt_wake, relaxed);
+		/* Unmask IRQ+FIQ. Mirrors mask used by machine_idle()
+		 * with ASYNCF omission. Consider that this could
+		 * delay recognition of an async abort, including
+		 * those triggered by ISRs
+		 */
+		__builtin_arm_wsr("DAIFClr", (DAIFSC_IRQF | DAIFSC_FIQF));
+	}
+
+	while ((ipending = (cpu_interrupt_is_pending())) == false) {
+		if (unmask) {
+			/* If WFE was issued with IRQs unmasked, an
+			 * interrupt may have been processed.
+			 * Consult the SW IRQ counter to determine
+			 * whether the 'idle loop' must be
+			 * re-evaluated.
+			 */
+			nirqc = os_atomic_load(&cdp->cpu_stat.irq_ex_cnt_wake, relaxed);
+			if (nirqc != irqc) {
+				break;
+			}
+		}
+
+		if (__probable(wfe_allowed)) {
+			/*
+			 * If IRQs are unmasked, there's a small window
+			 * where an 'extra' WFE may be issued after
+			 * the consultation of the SW interrupt counter
+			 * and new interrupt arrival. Hence this WFE
+			 * relies on the [FI]RQ interrupt handler
+			 * epilogue issuing a 'SEVL', to post an
+			 * event which causes the next WFE on the same
+			 * PE to retire immediately.
+			 */
+
+			__builtin_arm_wfe();
+		}
+
+		WFE_STAT(cdp->wfe_count++);
 		if (wfe_deadline != ~0ULL) {
-#if DEVELOPMENT || DEBUG
-			cdp->wfe_deadline_checks++;
-#endif
+			WFE_STAT(cdp->wfe_deadline_checks++);
 			/* Check if the WFE recommendation has expired.
 			 * We do not recompute the deadline here.
 			 */
 			if ((ml_cluster_wfe_timeout(cid) == 0) ||
 			    mach_absolute_time() >= wfe_deadline) {
-#if DEVELOPMENT || DEBUG
-				cdp->wfe_terminations++;
-#endif
+				WFE_STAT(cdp->wfe_terminations++);
 				break;
 			}
 		}
 	}
-	/* TODO: worth refreshing pending interrupt status? */
-	return ipending;
+
+	if (unmask) {
+		/* Re-mask IRQ+FIQ
+		 * Mirrors mask used by machine_idle(), with ASYNCF
+		 * omission
+		 */
+		__builtin_arm_wsr64("DAIFSet", (DAIFSC_IRQF | DAIFSC_FIQF));
+		/* Refetch SW interrupt counter with IRQs masked
+		 * It is important that this routine accurately flags
+		 * any observed interrupts via its return value,
+		 * inaccuracy may lead to an erroneous WFI fallback.
+		 */
+		nirqc = os_atomic_load(&cdp->cpu_stat.irq_ex_cnt_wake, relaxed);
+	}
+
+	return ipending || (nirqc != irqc);
 }
 
 /*
@@ -411,14 +499,13 @@ cpu_idle(void)
 	}
 
 	bool ipending = false;
-	uint32_t cid = ~0U;
+	uint32_t cid = cpu_data_ptr->cpu_cluster_id;
 
-	if (__probable(idle_proximate_io_wfe == true)) {
+	if (idle_proximate_io_wfe_masked == 1) {
 		uint64_t wfe_deadline = 0;
 		/* Check for an active perf. controller generated
 		 * WFE recommendation for this cluster.
 		 */
-		cid = cpu_data_ptr->cpu_cluster_id;
 		uint64_t wfe_ttd = 0;
 		if ((wfe_ttd = ml_cluster_wfe_timeout(cid)) != 0) {
 			wfe_deadline = mach_absolute_time() + wfe_ttd;
@@ -428,10 +515,9 @@ cpu_idle(void)
 			/* Poll issuing event-bounded WFEs until an interrupt
 			 * arrives or the WFE recommendation expires
 			 */
-			ipending = wfe_to_deadline_or_interrupt(cid, wfe_deadline, cpu_data_ptr);
-#if DEVELOPMENT || DEBUG
-			KDBG(CPUPM_IDLE_WFE, ipending, cpu_data_ptr->wfe_count, wfe_deadline, 0);
-#endif
+			KDBG(CPUPM_IDLE_WFE | DBG_FUNC_START, ipending, cpu_data_ptr->wfe_count, wfe_ttd, cid);
+			ipending = wfe_to_deadline_or_interrupt(cid, wfe_deadline, cpu_data_ptr, false);
+			KDBG(CPUPM_IDLE_WFE | DBG_FUNC_END, ipending, cpu_data_ptr->wfe_count, wfe_deadline);
 			if (ipending == true) {
 				/* Back to machine_idle() */
 				Idle_load_context();
@@ -440,11 +526,13 @@ cpu_idle(void)
 	}
 
 	if (__improbable(cpu_proximate_timer())) {
-		if (idle_proximate_timer_wfe == true) {
+		if (idle_proximate_timer_wfe == 1) {
 			/* Poll issuing WFEs until the expected
 			 * timer FIQ arrives.
 			 */
-			ipending = wfe_to_deadline_or_interrupt(cid, ~0ULL, cpu_data_ptr);
+			KDBG(CPUPM_IDLE_TIMER_WFE | DBG_FUNC_START, ipending, cpu_data_ptr->wfe_count, ~0ULL);
+			ipending = wfe_to_deadline_or_interrupt(cid, ~0ULL, cpu_data_ptr, false);
+			KDBG(CPUPM_IDLE_TIMER_WFE | DBG_FUNC_END, ipending, cpu_data_ptr->wfe_count, ~0ULL);
 			assert(ipending == true);
 		}
 		Idle_load_context();
@@ -453,10 +541,6 @@ cpu_idle(void)
 	lastPop = cpu_data_ptr->rtcPop;
 
 	cpu_data_ptr->cpu_active_thread = current_thread();
-	if (cpu_data_ptr->cpu_user_debug) {
-		arm_debug_set(NULL);
-	}
-	cpu_data_ptr->cpu_user_debug = NULL;
 
 	if (wfi && (cpu_data_ptr->cpu_idle_notify != NULL)) {
 		cpu_data_ptr->cpu_idle_notify(cpu_data_ptr->cpu_id, TRUE, &new_idle_timeout_ticks);
@@ -535,9 +619,6 @@ cpu_idle(void)
 			clock_delay_until(deadline);
 		}
 #endif /* DEVELOPMENT || DEBUG */
-#if !defined(APPLE_ARM64_ARCH_FAMILY)
-		platform_cache_idle_exit();
-#endif
 	}
 
 	ClearIdlePop(TRUE);
@@ -585,6 +666,10 @@ cpu_idle_exit(boolean_t from_reset)
 		timer_resync_deadlines();
 	}
 
+#if KASAN_TBI
+	kasan_unpoison_curstack(false);
+#endif /* KASAN_TBI */
+
 	Idle_load_context();
 }
 
@@ -604,7 +689,6 @@ cpu_init(void)
 
 		if (cdp == &BootCpuData) {
 			do_cpuid();
-			do_cacheid();
 			do_mvfpid();
 		} else {
 			/*
@@ -613,6 +697,9 @@ cpu_init(void)
 			 */
 			pmap_cpu_data_init();
 		}
+
+		do_cacheid();
+
 		/* ARM_SMP: Assuming identical cpu */
 		do_debugid();
 
@@ -654,29 +741,21 @@ cpu_init(void)
 void
 cpu_stack_alloc(cpu_data_t *cpu_data_ptr)
 {
-	vm_offset_t             irq_stack = 0;
-	vm_offset_t             exc_stack = 0;
+	vm_offset_t irq_stack = 0;
+	vm_offset_t exc_stack = 0;
 
-	kern_return_t kr = kernel_memory_allocate(kernel_map, &irq_stack,
-	    INTSTACK_SIZE + (2 * PAGE_SIZE),
-	    PAGE_MASK,
+	kmem_alloc(kernel_map, &irq_stack,
+	    INTSTACK_SIZE + ptoa(2), KMA_NOFAIL | KMA_PERMANENT | KMA_ZERO |
 	    KMA_GUARD_FIRST | KMA_GUARD_LAST | KMA_KSTACK | KMA_KOBJECT,
 	    VM_KERN_MEMORY_STACK);
-	if (kr != KERN_SUCCESS) {
-		panic("Unable to allocate cpu interrupt stack\n");
-	}
 
 	cpu_data_ptr->intstack_top = irq_stack + PAGE_SIZE + INTSTACK_SIZE;
 	cpu_data_ptr->istackptr = cpu_data_ptr->intstack_top;
 
-	kr = kernel_memory_allocate(kernel_map, &exc_stack,
-	    EXCEPSTACK_SIZE + (2 * PAGE_SIZE),
-	    PAGE_MASK,
+	kmem_alloc(kernel_map, &exc_stack,
+	    EXCEPSTACK_SIZE + ptoa(2), KMA_NOFAIL | KMA_PERMANENT | KMA_ZERO |
 	    KMA_GUARD_FIRST | KMA_GUARD_LAST | KMA_KSTACK | KMA_KOBJECT,
 	    VM_KERN_MEMORY_STACK);
-	if (kr != KERN_SUCCESS) {
-		panic("Unable to allocate cpu exception stack\n");
-	}
 
 	cpu_data_ptr->excepstack_top = exc_stack + PAGE_SIZE + EXCEPSTACK_SIZE;
 	cpu_data_ptr->excepstackptr = cpu_data_ptr->excepstack_top;
@@ -696,8 +775,12 @@ cpu_data_free(cpu_data_t *cpu_data_ptr)
 		CpuDataEntries[cpu_number].cpu_data_paddr = 0;
 		__builtin_arm_dmb(DMB_ISH); // Ensure prior stores to cpu array are visible
 	}
-	(kfree)((void *)(cpu_data_ptr->intstack_top - INTSTACK_SIZE), INTSTACK_SIZE);
-	(kfree)((void *)(cpu_data_ptr->excepstack_top - EXCEPSTACK_SIZE), EXCEPSTACK_SIZE);
+	kmem_free(kernel_map,
+	    cpu_data_ptr->intstack_top - INTSTACK_SIZE - PAGE_SIZE,
+	    INTSTACK_SIZE + 2 * PAGE_SIZE);
+	kmem_free(kernel_map,
+	    cpu_data_ptr->excepstack_top - EXCEPSTACK_SIZE - PAGE_SIZE,
+	    EXCEPSTACK_SIZE + 2 * PAGE_SIZE);
 }
 
 void
@@ -752,14 +835,13 @@ cpu_data_init(cpu_data_t *cpu_data_ptr)
 #if !XNU_MONITOR
 	pmap_cpu_data_t * pmap_cpu_data_ptr = &cpu_data_ptr->cpu_pmap_cpu_data;
 
-	pmap_cpu_data_ptr->cpu_nested_pmap = (struct pmap *) NULL;
 	pmap_cpu_data_ptr->cpu_number = PMAP_INVALID_CPU_NUM;
 	pmap_cpu_data_ptr->pv_free.list = NULL;
 	pmap_cpu_data_ptr->pv_free.count = 0;
-	pmap_cpu_data_ptr->pv_free_tail = NULL;
-
+	pmap_cpu_data_ptr->pv_free_spill_marker = NULL;
+	pmap_cpu_data_ptr->cpu_nested_pmap = (struct pmap *) NULL;
 	bzero(&(pmap_cpu_data_ptr->cpu_sw_asids[0]), sizeof(pmap_cpu_data_ptr->cpu_sw_asids));
-#endif
+#endif /* !XNU_MONITOR */
 	cpu_data_ptr->halt_status = CPU_NOT_HALTED;
 #if __ARM_KERNEL_PROTECT__
 	cpu_data_ptr->cpu_exc_vectors = (vm_offset_t)&exc_vectors_table;
@@ -769,7 +851,6 @@ cpu_data_init(cpu_data_t *cpu_data_ptr)
 	cpu_data_ptr->rop_key = 0;
 	cpu_data_ptr->jop_key = ml_default_jop_pid();
 #endif
-
 }
 
 kern_return_t
@@ -811,23 +892,22 @@ kern_return_t
 cpu_start(int cpu)
 {
 	cpu_data_t *cpu_data_ptr = CpuDataEntries[cpu].cpu_data_vaddr;
+	processor_t processor = PERCPU_GET_RELATIVE(processor, cpu_data, cpu_data_ptr);
 
-	kprintf("cpu_start() cpu: %d\n", cpu);
+	if (processor_should_kprintf(processor, true)) {
+		kprintf("cpu_start() cpu: %d\n", cpu);
+	}
 
 	if (cpu == cpu_number()) {
 		cpu_machine_init();
 		configure_coresight_registers(cpu_data_ptr);
 	} else {
 		thread_t first_thread;
-		processor_t processor;
-
 		cpu_data_ptr->cpu_reset_handler = (vm_offset_t) start_cpu_paddr;
-
 #if !XNU_MONITOR
 		cpu_data_ptr->cpu_pmap_cpu_data.cpu_nested_pmap = NULL;
 #endif
 
-		processor = PERCPU_GET_RELATIVE(processor, cpu_data, cpu_data_ptr);
 		if (processor->startup_thread != THREAD_NULL) {
 			first_thread = processor->startup_thread;
 		} else {
@@ -985,17 +1065,29 @@ ml_arm_sleep(void)
 			HIBLOG("powering off after writing hibernation image\n");
 			int halt_result = -1;
 			if (PE_halt_restart) {
+				/**
+				 * Drain serial FIFOs now as the normal call further down won't
+				 * be hit when the CPU halts here for hibernation. Here, it'll
+				 * make sure the preceding HIBLOG is flushed as well.
+				 */
+				serial_go_to_sleep();
 				halt_result = (*PE_halt_restart)(kPEHaltCPU);
 			}
 			panic("can't shutdown: PE_halt_restart returned %d", halt_result);
 		}
 #endif /* HIBERNATION */
 
+		serial_go_to_sleep();
+
 #if MONOTONIC
 		mt_sleep();
 #endif /* MONOTONIC */
 		/* ARM64-specific preparation */
+#if APPLEVIRTUALPLATFORM
+		arm64_prepare_for_sleep(true, cpu_data_ptr->cpu_number, ml_vtophys((vm_offset_t)&LowResetVectorBase));
+#else
 		arm64_prepare_for_sleep(true);
+#endif
 	} else {
 #if __ARM_GLOBAL_SLEEP_BIT__
 		/*
@@ -1025,7 +1117,11 @@ ml_arm_sleep(void)
 		}
 
 		/* ARM64-specific preparation */
+#if APPLEVIRTUALPLATFORM
+		arm64_prepare_for_sleep(true, cpu_data_ptr->cpu_number, ml_vtophys((vm_offset_t)&LowResetVectorBase));
+#else
 		arm64_prepare_for_sleep(true);
+#endif
 	}
 }
 
@@ -1036,7 +1132,6 @@ cpu_machine_idle_init(boolean_t from_boot)
 	cpu_data_t              *cpu_data_ptr   = getCpuDatap();
 
 	if (from_boot) {
-		int             wfi_tmp = 1;
 		uint32_t        production = 1;
 		DTEntry         entry;
 
@@ -1056,13 +1151,14 @@ cpu_machine_idle_init(boolean_t from_boot)
 		uint32_t wfe_mode = 0;
 		if (PE_parse_boot_argn("wfe_mode", &wfe_mode, sizeof(wfe_mode))) {
 			idle_proximate_timer_wfe = ((wfe_mode & 1) == 1);
-			idle_proximate_io_wfe = ((wfe_mode & 2) == 2);
+			idle_proximate_io_wfe_masked = ((wfe_mode & 2) == 2);
+			extern uint32_t idle_proximate_io_wfe_unmasked;
+			idle_proximate_io_wfe_unmasked = ((wfe_mode & 4) == 4);
 		}
 #endif
-		PE_parse_boot_argn("wfi", &wfi_tmp, sizeof(wfi_tmp));
 
 		// bits 7..0 give the wfi type
-		switch (wfi_tmp & 0xff) {
+		switch (wfi & 0xff) {
 		case 0:
 			// disable wfi
 			wfi = 0;
@@ -1075,8 +1171,8 @@ cpu_machine_idle_init(boolean_t from_boot)
 			// 15..8  - flags
 			// 7..0   - 2
 			wfi = 2;
-			wfi_flags = (wfi_tmp >> 8) & 0xFF;
-			nanoseconds_to_absolutetime(((wfi_tmp >> 16) & 0xFFFF) * NSEC_PER_MSEC, &wfi_delay);
+			wfi_flags = (wfi >> 8) & 0xFF;
+			nanoseconds_to_absolutetime(((wfi >> 16) & 0xFFFF) * NSEC_PER_MSEC, &wfi_delay);
 			break;
 #endif /* DEVELOPMENT || DEBUG */
 
@@ -1085,7 +1181,6 @@ cpu_machine_idle_init(boolean_t from_boot)
 			// do nothing
 			break;
 		}
-
 		ResetHandlerData.assist_reset_handler = 0;
 		ResetHandlerData.cpu_data_entries = ml_static_vtop((vm_offset_t)CpuDataEntries);
 
@@ -1112,7 +1207,6 @@ cpu_machine_idle_init(boolean_t from_boot)
 			coresight_debug_enabled = TRUE;
 #endif
 		}
-
 		start_cpu_paddr = ml_static_vtop((vm_offset_t)&start_cpu);
 		resume_idle_cpu_paddr = ml_static_vtop((vm_offset_t)&resume_idle_cpu);
 	}
@@ -1132,7 +1226,6 @@ cpu_machine_idle_init(boolean_t from_boot)
 	}
 	;
 #endif
-
 	cpu_data_ptr->cpu_reset_handler = resume_idle_cpu_paddr;
 	clean_dcache((vm_offset_t)cpu_data_ptr, sizeof(cpu_data_t), FALSE);
 }

@@ -74,7 +74,6 @@
 #include <mach/thread_act.h>
 #include <mach/task_special_ports.h>
 #include <mach/vm_param.h>
-#include <ipc/ipc_init.h>
 #include <kern/assert.h>
 #include <kern/mach_param.h>
 #include <kern/misc_protos.h>
@@ -118,16 +117,17 @@
 #include <machine/commpage.h>
 #include <machine/machine_routines.h>
 #include <libkern/version.h>
+#include <pexpert/device_tree.h>
 #include <sys/codesign.h>
 #include <sys/kdebug.h>
 #include <sys/random.h>
 #include <sys/ktrace.h>
+#include <sys/trust_caches.h>
+#include <sys/code_signing.h>
 #include <libkern/section_keywords.h>
 
-#include <kern/ltable.h>
 #include <kern/waitq.h>
 #include <ipc/ipc_voucher.h>
-#include <voucher/ipc_pthread_priority_internal.h>
 #include <mach/host_info.h>
 #include <pthread/workqueue_internal.h>
 
@@ -143,8 +143,6 @@
 #if CONFIG_CSR
 #include <sys/csr.h>
 #endif
-
-#include <bank/bank_internal.h>
 
 #if ALTERNATE_DEBUGGER
 #include <arm64/alternate_debugger.h>
@@ -167,6 +165,10 @@ extern void vnguard_policy_init(void);
 
 #if HYPERVISOR
 #include <kern/hv_support.h>
+#endif
+
+#if CONFIG_UBSAN_MINIMAL
+#include <san/ubsan_minimal.h>
 #endif
 
 #include <san/kasan.h>
@@ -214,18 +216,7 @@ SECURITY_READ_ONLY_LATE(startup_subsystem_id_t) startup_phase = STARTUP_SUB_NONE
 
 extern int serverperfmode;
 
-#if DEBUG || DEVELOPMENT
 TUNABLE(startup_debug_t, startup_debug, "startup_debug", 0);
-#endif
-
-/* size of kernel trace buffer, disabled by default */
-TUNABLE(unsigned int, new_nkdbufs, "trace", 0);
-TUNABLE(unsigned int, wake_nkdbufs, "trace_wake", 0);
-TUNABLE(unsigned int, write_trace_on_panic, "trace_panic", 0);
-TUNABLE(unsigned int, trace_wrap, "trace_wrap", 0);
-
-/* mach leak logging */
-TUNABLE(int, log_leaks, "-l", 0);
 
 static inline void
 kernel_bootstrap_log(const char *message)
@@ -287,18 +278,67 @@ kernel_startup_bootstrap(void)
 	qsort(startup_entries, n, sizeof(struct startup_entry), startup_entry_cmp);
 
 	/*
-	 * Then initialize all tunables, and early locks
+	 * Then initialize all tunables, timeouts, and locks
 	 */
-	kernel_startup_initialize_upto(STARTUP_SUB_LOCKS_EARLY);
+	kernel_startup_initialize_upto(STARTUP_SUB_LOCKS);
 }
 
 __startup_func
-extern void
+void
 kernel_startup_tunable_init(const struct startup_tunable_spec *spec)
 {
-	if (PE_parse_boot_argn(spec->name, spec->var_addr, spec->var_len)) {
+	if (spec->var_is_str) {
+		PE_parse_boot_arg_str(spec->name, spec->var_addr, spec->var_len);
+	} else if (PE_parse_boot_argn(spec->name, spec->var_addr, spec->var_len)) {
 		if (spec->var_is_bool) {
 			/* make sure bool's are valued in {0, 1} */
+			*(bool *)spec->var_addr = *(uint8_t *)spec->var_addr;
+		}
+	}
+}
+
+__startup_func
+void
+kernel_startup_tunable_dt_init(const struct startup_tunable_dt_spec *spec)
+{
+	DTEntry base;
+
+	if (SecureDTLookupEntry(NULL, spec->dt_base, &base) != kSuccess) {
+		base = NULL;
+	}
+
+	bool found_in_chosen = false;
+
+	if (spec->dt_chosen_override) {
+		DTEntry chosen, chosen_base;
+
+		if (SecureDTLookupEntry(NULL, "chosen", &chosen) != kSuccess) {
+			chosen = NULL;
+		}
+
+		if (chosen != NULL && SecureDTLookupEntry(chosen, spec->dt_base, &chosen_base) == kSuccess) {
+			base = chosen_base;
+			found_in_chosen = true;
+		}
+	}
+
+	uint64_t const *data;
+	unsigned int data_size = spec->var_len;
+
+	if (base != NULL && SecureDTGetProperty(base, spec->dt_name, (const void **)&data, &data_size) == kSuccess) {
+		if (data_size != spec->var_len) {
+			panic("unexpected tunable size %u in DT entry %s/%s/%s",
+			    data_size, found_in_chosen ? "/chosen" : "", spec->dt_base, spec->dt_name);
+		}
+
+		/* No need to handle bools specially, they are 1 byte integers in the DT. */
+		memcpy(spec->var_addr, data, spec->var_len);
+	}
+
+	/* boot-arg overrides. */
+
+	if (PE_parse_boot_argn(spec->boot_arg_name, spec->var_addr, spec->var_len)) {
+		if (spec->var_is_bool) {
 			*(bool *)spec->var_addr = *(uint8_t *)spec->var_addr;
 		}
 	}
@@ -309,20 +349,21 @@ kernel_startup_log(startup_subsystem_id_t subsystem)
 {
 	static const char *names[] = {
 		[STARTUP_SUB_TUNABLES] = "tunables",
-		[STARTUP_SUB_LOCKS_EARLY] = "locks_early",
+		[STARTUP_SUB_TIMEOUTS] = "timeouts",
+		[STARTUP_SUB_LOCKS] = "locks",
 		[STARTUP_SUB_KPRINTF] = "kprintf",
 
 		[STARTUP_SUB_PMAP_STEAL] = "pmap_steal",
-		[STARTUP_SUB_VM_KERNEL] = "vm_kernel",
 		[STARTUP_SUB_KMEM] = "kmem",
-		[STARTUP_SUB_KMEM_ALLOC] = "kmem_alloc",
 		[STARTUP_SUB_ZALLOC] = "zalloc",
 		[STARTUP_SUB_PERCPU] = "percpu",
-		[STARTUP_SUB_LOCKS] = "locks",
+		[STARTUP_SUB_EVENT] = "event",
 
 		[STARTUP_SUB_CODESIGNING] = "codesigning",
+		[STARTUP_SUB_KTRACE] = "ktrace",
 		[STARTUP_SUB_OSLOG] = "oslog",
 		[STARTUP_SUB_MACH_IPC] = "mach_ipc",
+		[STARTUP_SUB_THREAD_CALL] = "thread_call",
 		[STARTUP_SUB_SYSCTL] = "sysctl",
 		[STARTUP_SUB_EARLY_BOOT] = "early_boot",
 
@@ -338,6 +379,16 @@ kernel_startup_log(startup_subsystem_id_t subsystem)
 		kernel_bootstrap_log(names[subsystem]);
 	}
 	logged = subsystem;
+}
+
+__startup_func
+void
+event_register_handler(struct event_hdr *hdr)
+{
+	struct event_hdr *head = hdr->next;
+
+	hdr->next = head->next;
+	head->next = hdr;
 }
 
 __startup_func
@@ -391,7 +442,17 @@ kernel_bootstrap(void)
 	machine_info.major_version = version_major;
 	machine_info.minor_version = version_minor;
 
+#if CONFIG_ATM
+	/* Initialize the Activity Trace Resource Manager. */
+	kernel_bootstrap_log("atm_init");
+	atm_init();
+#endif
 	kernel_startup_initialize_upto(STARTUP_SUB_OSLOG);
+
+#if CONFIG_UBSAN_MINIMAL
+	kernel_bootstrap_log("UBSan minimal runtime init");
+	ubsan_minimal_init();
+#endif
 
 #if KASAN
 	kernel_bootstrap_log("kasan_late_init");
@@ -421,9 +482,6 @@ kernel_bootstrap(void)
 
 	kernel_bootstrap_log("sched_init");
 	sched_init();
-
-	kernel_bootstrap_log("waitq_bootstrap");
-	waitq_bootstrap();
 
 #if CONFIG_MACF
 	kernel_bootstrap_log("mac_policy_init");
@@ -464,6 +522,10 @@ kernel_bootstrap(void)
 	coalitions_init();
 #endif
 
+	kernel_bootstrap_log("code_signing_init");
+	code_signing_init();
+	code_signing_configuration(NULL, NULL);
+
 	kernel_bootstrap_log("task_init");
 	task_init();
 
@@ -479,23 +541,8 @@ kernel_bootstrap(void)
 	kernel_bootstrap_log("turnstiles_init");
 	turnstiles_init();
 
-#if CONFIG_ATM
-	/* Initialize the Activity Trace Resource Manager. */
-	kernel_bootstrap_log("atm_init");
-	atm_init();
-#endif
 	kernel_bootstrap_log("mach_init_activity_id");
 	mach_init_activity_id();
-
-	/* Initialize the BANK Manager. */
-	kernel_bootstrap_log("bank_init");
-	bank_init();
-
-	kernel_bootstrap_log("ipc_pthread_priority_init");
-	ipc_pthread_priority_init();
-
-	/* initialize the corpse config based on boot-args */
-	corpses_init();
 
 	/* initialize host_statistics */
 	host_statistics_init();
@@ -517,11 +564,8 @@ kernel_bootstrap(void)
 	result = kernel_thread_create((thread_continue_t)kernel_bootstrap_thread, NULL, MAXPRI_KERNEL, &thread);
 
 	if (result != KERN_SUCCESS) {
-		panic("kernel_bootstrap: result = %08X\n", result);
+		panic("kernel_bootstrap: result = %08X", result);
 	}
-
-	/* The static init_thread is re-used as the bootstrap thread */
-	assert(thread == current_thread());
 
 	/* TODO: do a proper thread_start() (without the thread_setrun()) */
 	thread->state = TH_RUN;
@@ -548,7 +592,11 @@ SECURITY_READ_ONLY_LATE(uint64_t) vm_kernel_addrhash_salt_ext;
 static void
 kernel_bootstrap_thread(void)
 {
-	processor_t             processor = current_processor();
+	processor_t processor = current_processor();
+
+#if (DEVELOPMENT || DEBUG)
+	platform_stall_panic_or_spin(PLATFORM_STALL_XNU_LOCATION_KERNEL_BOOTSTRAP);
+#endif
 
 	kernel_bootstrap_thread_log("idle_thread_create");
 	/*
@@ -571,21 +619,10 @@ kernel_bootstrap_thread(void)
 	kernel_bootstrap_thread_log("thread_daemon_init");
 	thread_daemon_init();
 
-	/* Create kernel map entry reserve */
-	vm_kernel_reserved_entry_init();
-
 	/*
 	 * Thread callout service.
 	 */
-	kernel_bootstrap_thread_log("thread_call_initialize");
-	thread_call_initialize();
-
-	/*
-	 * Work interval subsystem initialization.
-	 * Needs to be done once thread calls have been initialized.
-	 */
-	kernel_bootstrap_thread_log("work_interval_initialize");
-	work_interval_subsystem_init();
+	kernel_startup_initialize_upto(STARTUP_SUB_THREAD_CALL);
 
 	/*
 	 * Remain on current processor as
@@ -593,12 +630,6 @@ kernel_bootstrap_thread(void)
 	 */
 	kernel_bootstrap_thread_log("thread_bind");
 	thread_bind(processor);
-
-	/*
-	 * Initialize ipc thread call support.
-	 */
-	kernel_bootstrap_thread_log("ipc_thread_call_init");
-	ipc_thread_call_init();
 
 	/*
 	 * Kick off memory mapping adjustments.
@@ -628,10 +659,6 @@ kernel_bootstrap_thread(void)
 	alternate_debugger_init();
 #endif
 
-#if KPC
-	kpc_init();
-#endif
-
 #if HYPERVISOR
 	kernel_bootstrap_thread_log("hv_support_init");
 	hv_support_init();
@@ -642,16 +669,20 @@ kernel_bootstrap_thread(void)
 	bootprofile_init();
 #endif
 
-	char trace_typefilter[256] = {};
-	PE_parse_boot_arg_str("trace_typefilter", trace_typefilter,
-	    sizeof(trace_typefilter));
-#if KPERF
-	kperf_init();
-#endif /* KPERF */
-	kdebug_init(new_nkdbufs, trace_typefilter,
-	    (trace_wrap ? KDOPT_WRAPPING : 0) | KDOPT_ATBOOT);
-
 	kernel_startup_initialize_upto(STARTUP_SUB_SYSCTL);
+
+	/*
+	 * Initialize the globals used for permuting kernel
+	 * addresses that may be exported to userland as tokens
+	 * using VM_KERNEL_ADDRPERM()/VM_KERNEL_ADDRPERM_EXTERNAL().
+	 * Force the random number to be odd to avoid mapping a non-zero
+	 * word-aligned address to zero via addition.
+	 */
+	vm_kernel_addrperm = (vm_offset_t)(early_random() | 1);
+	buf_kernel_addrperm = (vm_offset_t)(early_random() | 1);
+	vm_kernel_addrperm_ext = (vm_offset_t)(early_random() | 1);
+	vm_kernel_addrhash_salt = early_random();
+	vm_kernel_addrhash_salt_ext = early_random();
 
 #ifdef  IOKIT
 	kernel_bootstrap_log("PE_init_iokit");
@@ -666,7 +697,7 @@ kernel_bootstrap_thread(void)
 	 */
 	kernel_startup_initialize_upto(STARTUP_SUB_EARLY_BOOT);
 
-#if INTERRUPT_MASKED_DEBUG
+#if SCHED_HYGIENE_DEBUG
 	// Reset interrupts masked timeout before we enable interrupts
 	ml_spin_debug_clear_self();
 #endif
@@ -698,9 +729,19 @@ kernel_bootstrap_thread(void)
 	sdt_early_init();
 #endif
 
+#if CODE_SIGNING_MONITOR
+	kernel_bootstrap_log("provisioning_profile_init");
+	csm_initialize_provisioning_profiles();
+#endif
+
 #ifndef BCM2837
 	kernel_bootstrap_log("trust_cache_init");
-	trust_cache_init();
+
+	/* Initialize the runtime for the trust cache interface */
+	trust_cache_runtime_init();
+
+	/* Load the static and engineering trust caches */
+	load_static_trust_cache();
 #endif
 
 	kernel_startup_initialize_upto(STARTUP_SUB_LOCKDOWN);
@@ -714,27 +755,18 @@ kernel_bootstrap_thread(void)
 	kernel_bootstrap_log("OSKextRemoveKextBootstrap");
 	OSKextRemoveKextBootstrap();
 
-	/*
-	 * Initialize the globals used for permuting kernel
-	 * addresses that may be exported to userland as tokens
-	 * using VM_KERNEL_ADDRPERM()/VM_KERNEL_ADDRPERM_EXTERNAL().
-	 * Force the random number to be odd to avoid mapping a non-zero
-	 * word-aligned address to zero via addition.
-	 * Note: at this stage we can use the cryptographically secure PRNG
-	 * rather than early_random().
-	 */
-	read_random(&vm_kernel_addrperm, sizeof(vm_kernel_addrperm));
-	vm_kernel_addrperm |= 1;
-	read_random(&buf_kernel_addrperm, sizeof(buf_kernel_addrperm));
-	buf_kernel_addrperm |= 1;
-	read_random(&vm_kernel_addrperm_ext, sizeof(vm_kernel_addrperm_ext));
-	vm_kernel_addrperm_ext |= 1;
-	read_random(&vm_kernel_addrhash_salt, sizeof(vm_kernel_addrhash_salt));
-	read_random(&vm_kernel_addrhash_salt_ext, sizeof(vm_kernel_addrhash_salt_ext));
-
 	/* No changes to kernel text and rodata beyond this point. */
 	kernel_bootstrap_log("machine_lockdown");
 	machine_lockdown();
+
+#ifdef CONFIG_XNUPOST
+	kern_return_t result = kernel_list_tests();
+	result = kernel_do_post();
+	if (result != KERN_SUCCESS) {
+		panic("kernel_do_post: Tests failed with result = 0x%08x", result);
+	}
+	kernel_bootstrap_log("kernel_do_post - done");
+#endif /* CONFIG_XNUPOST */
 
 #ifdef  IOKIT
 	kernel_bootstrap_log("PE_lockdown_iokit");
@@ -745,15 +777,6 @@ kernel_bootstrap_thread(void)
 	 * at the latest
 	 */
 	vm_set_restrictions(machine_info.max_cpus);
-
-#ifdef CONFIG_XNUPOST
-	kern_return_t result = kernel_list_tests();
-	result = kernel_do_post();
-	if (result != KERN_SUCCESS) {
-		panic("kernel_do_post: Tests failed with result = 0x%08x\n", result);
-	}
-	kernel_bootstrap_log("kernel_do_post - done");
-#endif /* CONFIG_XNUPOST */
 
 
 #if KPERF
@@ -916,24 +939,21 @@ load_context(
 	processor->deadline = UINT64_MAX;
 	thread->last_processor = processor;
 	processor_up(processor);
-	processor->last_dispatch = mach_absolute_time();
-	timer_start(&thread->system_timer, processor->last_dispatch);
-	processor->thread_timer = processor->kernel_timer = &thread->system_timer;
-
-	timer_start(&processor->system_state, processor->last_dispatch);
-	processor->current_state = &processor->system_state;
-
-#if __AMP__
-	if (processor->processor_set->pset_cluster_type == PSET_AMP_P) {
-		timer_start(&thread->ptime, processor->last_dispatch);
-	}
-#endif
+	struct recount_snap snap = { 0 };
+	recount_snapshot(&snap);
+	processor->last_dispatch = snap.rsn_time_mach;
+	recount_processor_run(&processor->pr_recount, &snap);
+	recount_update_snap(&snap);
 
 	cpu_quiescent_counter_join(processor->last_dispatch);
 
 	PMAP_ACTIVATE_USER(thread, processor->cpu_id);
 
 	load_context_kprintf("machine_load_context\n");
+
+#if KASAN_TBI
+	__asan_handle_no_return();
+#endif /* KASAN_TBI */
 
 	machine_load_context(thread);
 	/*NOTREACHED*/

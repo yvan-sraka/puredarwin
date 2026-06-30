@@ -55,6 +55,7 @@ __BEGIN_DECLS
 #include <san/kasan.h>
 #endif
 
+
 #if PRAGMA_MARK
 #pragma mark Constants &c.
 #endif /* PRAGMA_MARK */
@@ -133,6 +134,7 @@ OSlibkernInit(void)
 	OSMetaClassBase::initialize();
 
 	g_kernel_kmod_info.address = (vm_address_t) &_mh_execute_header;
+
 	if (kOSReturnSuccess != OSRuntimeInitializeCPP(NULL)) {
 		// &g_kernel_kmod_info, gOSSectionNamesStandard, 0, 0)) {
 		panic("OSRuntime: C++ runtime failed to initialize.");
@@ -549,12 +551,14 @@ OSRuntimeUnloadCPPForSegment(
 /*********************************************************************
 * C++ Allocators & Deallocators
 *********************************************************************/
+__typed_allocators_ignore_push
+
 void *
 operator new(size_t size)
 {
 	assert(size);
-	return kheap_alloc_tag_bt(KERN_OS_MALLOC, size,
-	           (zalloc_flags_t) (Z_WAITOK | Z_ZERO), VM_KERN_MEMORY_LIBKERN);
+	return kheap_alloc(KERN_OS_MALLOC, size,
+	           Z_VM_TAG_BT(Z_WAITOK_ZERO, VM_KERN_MEMORY_LIBKERN));
 }
 
 void
@@ -568,10 +572,10 @@ noexcept
 }
 
 void *
-operator new[](unsigned long sz)
+operator new[](unsigned long size)
 {
-	return kheap_alloc_tag_bt(KERN_OS_MALLOC, sz,
-	           (zalloc_flags_t) (Z_WAITOK | Z_ZERO), VM_KERN_MEMORY_LIBKERN);
+	return kheap_alloc(KERN_OS_MALLOC, size,
+	           Z_VM_TAG_BT(Z_WAITOK_ZERO, VM_KERN_MEMORY_LIBKERN));
 }
 
 void
@@ -608,6 +612,8 @@ operator delete[](void * addr, size_t sz) noexcept
 		kheap_free(KERN_OS_MALLOC, addr, sz);
 	}
 }
+
+__typed_allocators_ignore_pop
 
 #endif /* __cplusplus >= 201103L */
 

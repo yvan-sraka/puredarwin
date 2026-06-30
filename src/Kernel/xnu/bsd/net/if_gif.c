@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2000-2020 Apple Inc. All rights reserved.
+ * Copyright (c) 2000-2021 Apple Inc. All rights reserved.
  *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
  *
@@ -113,11 +113,9 @@
 #define GIF_ZONE_MAX_ELEM       MIN(IFNETS_MAX, GIF_MAXUNIT)
 
 /* gif lock variables */
-static lck_grp_t        *gif_mtx_grp;
-static lck_grp_attr_t   *gif_mtx_grp_attr;
-static lck_attr_t       *gif_mtx_attr;
-decl_lck_mtx_data(static, gif_mtx_data);
-static lck_mtx_t        *gif_mtx = &gif_mtx_data;
+static LCK_GRP_DECLARE(gif_mtx_grp, "gif");
+static LCK_ATTR_DECLARE(gif_mtx_attr, 0, 0);
+static LCK_MTX_DECLARE_ATTR(gif_mtx, &gif_mtx_grp, &gif_mtx_attr);
 
 TAILQ_HEAD(gifhead, gif_softc) gifs = TAILQ_HEAD_INITIALIZER(gifs);
 
@@ -158,7 +156,7 @@ static void gif_detach(struct ifnet *);
 
 static struct if_clone gif_cloner =
     IF_CLONE_INITIALIZER(GIFNAME, gif_clone_create, gif_clone_destroy,
-    0, GIF_MAXUNIT, GIF_ZONE_MAX_ELEM, sizeof(struct gif_softc));
+    0, GIF_MAXUNIT);
 /*
  * Theory of operation: initially, one gif interface is created.
  * Any time a gif interface is configured, if there are no other
@@ -255,12 +253,6 @@ gif_init(void)
 	/* Initialize the list of interfaces */
 	TAILQ_INIT(&gifs);
 
-	/* Initialize the gif global lock */
-	gif_mtx_grp_attr = lck_grp_attr_alloc_init();
-	gif_mtx_grp = lck_grp_alloc_init("gif", gif_mtx_grp_attr);
-	gif_mtx_attr = lck_attr_alloc_init();
-	lck_mtx_init(gif_mtx, gif_mtx_grp, gif_mtx_attr);
-
 	/* Register protocol registration functions */
 	result = proto_register_plumber(PF_INET, APPLE_IF_FAM_GIF,
 	    gif_attach_proto_family, NULL);
@@ -278,7 +270,7 @@ gif_init(void)
 
 	result = if_clone_attach(&gif_cloner);
 	if (result != 0) {
-		panic("%s: if_clone_attach() failed, error %d\n", __func__, result);
+		panic("%s: if_clone_attach() failed, error %d", __func__, result);
 	}
 
 	gif_clone_create(&gif_cloner, 0, NULL);
@@ -304,8 +296,8 @@ static void
 gif_detach(struct ifnet *ifp)
 {
 	struct gif_softc *sc = ifp->if_softc;
-	lck_mtx_destroy(&sc->gif_lock, gif_mtx_grp);
-	if_clone_softc_deallocate(&gif_cloner, sc);
+	lck_mtx_destroy(&sc->gif_lock, &gif_mtx_grp);
+	kfree_type(struct gif_softc, sc);
 	ifp->if_softc = NULL;
 	(void) ifnet_release(ifp);
 }
@@ -317,7 +309,7 @@ gif_clone_create(struct if_clone *ifc, uint32_t unit, __unused void *params)
 	struct ifnet_init_eparams gif_init_params;
 	errno_t error = 0;
 
-	lck_mtx_lock(gif_mtx);
+	lck_mtx_lock(&gif_mtx);
 
 	/* Can't create more than GIF_MAXUNIT */
 	if (ngif >= GIF_MAXUNIT) {
@@ -325,19 +317,13 @@ gif_clone_create(struct if_clone *ifc, uint32_t unit, __unused void *params)
 		goto done;
 	}
 
-	sc = if_clone_softc_allocate(&gif_cloner);
-	if (sc == NULL) {
-		log(LOG_ERR, "gif_clone_create: failed to allocate gif%d\n",
-		    unit);
-		error = ENOBUFS;
-		goto done;
-	}
+	sc = kalloc_type(struct gif_softc, Z_WAITOK_ZERO_NOFAIL);
 
 	/* use the interface name as the unique id for ifp recycle */
 	snprintf(sc->gif_ifname, sizeof(sc->gif_ifname), "%s%d",
 	    ifc->ifc_name, unit);
 
-	lck_mtx_init(&sc->gif_lock, gif_mtx_grp, gif_mtx_attr);
+	lck_mtx_init(&sc->gif_lock, &gif_mtx_grp, &gif_mtx_attr);
 
 	bzero(&gif_init_params, sizeof(gif_init_params));
 	gif_init_params.ver = IFNET_INIT_CURRENT_VERSION;
@@ -361,7 +347,7 @@ gif_clone_create(struct if_clone *ifc, uint32_t unit, __unused void *params)
 	error = ifnet_allocate_extended(&gif_init_params, &sc->gif_if);
 	if (error != 0) {
 		printf("gif_clone_create, ifnet_allocate failed - %d\n", error);
-		if_clone_softc_deallocate(&gif_cloner, sc);
+		kfree_type(struct gif_softc, sc);
 		error = ENOBUFS;
 		goto done;
 	}
@@ -373,7 +359,7 @@ gif_clone_create(struct if_clone *ifc, uint32_t unit, __unused void *params)
 	if (sc->encap_cookie4 == NULL) {
 		printf("%s: unable to attach encap4\n", if_name(sc->gif_if));
 		ifnet_release(sc->gif_if);
-		if_clone_softc_deallocate(&gif_cloner, sc);
+		kfree_type(struct gif_softc, sc);
 		error = ENOBUFS;
 		goto done;
 	}
@@ -387,7 +373,7 @@ gif_clone_create(struct if_clone *ifc, uint32_t unit, __unused void *params)
 		}
 		printf("%s: unable to attach encap6\n", if_name(sc->gif_if));
 		ifnet_release(sc->gif_if);
-		if_clone_softc_deallocate(&gif_cloner, sc);
+		kfree_type(struct gif_softc, sc);
 		error = ENOBUFS;
 		goto done;
 	}
@@ -407,7 +393,7 @@ gif_clone_create(struct if_clone *ifc, uint32_t unit, __unused void *params)
 			encap_detach(sc->encap_cookie6);
 			sc->encap_cookie6 = NULL;
 		}
-		if_clone_softc_deallocate(&gif_cloner, sc);
+		kfree_type(struct gif_softc, sc);
 		goto done;
 	}
 	bpfattach(sc->gif_if, DLT_NULL, sizeof(u_int));
@@ -415,7 +401,7 @@ gif_clone_create(struct if_clone *ifc, uint32_t unit, __unused void *params)
 	TAILQ_INSERT_TAIL(&gifs, sc, gif_link);
 	ngif++;
 done:
-	lck_mtx_unlock(gif_mtx);
+	lck_mtx_unlock(&gif_mtx);
 
 	return error;
 }
@@ -428,7 +414,7 @@ gif_remove(struct ifnet *ifp)
 	const struct encaptab *encap_cookie4 = NULL;
 	const struct encaptab *encap_cookie6 = NULL;
 
-	lck_mtx_lock(gif_mtx);
+	lck_mtx_lock(&gif_mtx);
 	sc = ifp->if_softc;
 
 	if (sc == NULL) {
@@ -455,7 +441,7 @@ done:
 	if (sc != NULL) {
 		GIF_UNLOCK(sc);
 	}
-	lck_mtx_unlock(gif_mtx);
+	lck_mtx_unlock(&gif_mtx);
 
 	if (encap_cookie6 != NULL) {
 		error = encap_detach(encap_cookie6);
@@ -490,7 +476,7 @@ gif_clone_destroy(struct ifnet *ifp)
 
 	error = ifnet_detach(ifp);
 	if (error != 0) {
-		panic("gif_clone_destroy: ifnet_detach(%p) failed %d\n", ifp,
+		panic("gif_clone_destroy: ifnet_detach(%p) failed %d", ifp,
 		    error);
 	}
 	return 0;
@@ -873,10 +859,9 @@ gif_ioctl(
 
 		GIF_LOCK(sc);
 		if (sc->gif_psrc) {
-			FREE(sc->gif_psrc, M_IFADDR);
+			kfree_data(sc->gif_psrc, sc->gif_psrc->sa_len);
 		}
-		sa = (struct sockaddr *)_MALLOC(src->sa_len, M_IFADDR,
-		    M_WAITOK);
+		sa = (struct sockaddr *)kalloc_data(src->sa_len, Z_WAITOK);
 		if (sa == NULL) {
 			GIF_UNLOCK(sc);
 			return ENOBUFS;
@@ -885,10 +870,9 @@ gif_ioctl(
 		sc->gif_psrc = sa;
 
 		if (sc->gif_pdst) {
-			FREE(sc->gif_pdst, M_IFADDR);
+			kfree_data(sc->gif_pdst, sc->gif_pdst->sa_len);
 		}
-		sa = (struct sockaddr *)_MALLOC(dst->sa_len, M_IFADDR,
-		    M_WAITOK);
+		sa = (struct sockaddr *)kalloc_data(dst->sa_len, Z_WAITOK);
 		if (sa == NULL) {
 			GIF_UNLOCK(sc);
 			return ENOBUFS;
@@ -907,11 +891,11 @@ gif_ioctl(
 	case SIOCDIFPHYADDR:
 		GIF_LOCK(sc);
 		if (sc->gif_psrc) {
-			FREE(sc->gif_psrc, M_IFADDR);
+			kfree_data(sc->gif_psrc, sc->gif_psrc->sa_len);
 			sc->gif_psrc = NULL;
 		}
 		if (sc->gif_pdst) {
-			FREE(sc->gif_pdst, M_IFADDR);
+			kfree_data(sc->gif_pdst, sc->gif_pdst->sa_len);
 			sc->gif_pdst = NULL;
 		}
 		GIF_UNLOCK(sc);
@@ -1004,11 +988,11 @@ gif_delete_tunnel(struct gif_softc *sc)
 {
 	GIF_LOCK_ASSERT(sc);
 	if (sc->gif_psrc) {
-		FREE(sc->gif_psrc, M_IFADDR);
+		kfree_data(sc->gif_psrc, sc->gif_psrc->sa_len);
 		sc->gif_psrc = NULL;
 	}
 	if (sc->gif_pdst) {
-		FREE(sc->gif_pdst, M_IFADDR);
+		kfree_data(sc->gif_pdst, sc->gif_pdst->sa_len);
 		sc->gif_pdst = NULL;
 	}
 	ROUTE_RELEASE(&sc->gif_ro);

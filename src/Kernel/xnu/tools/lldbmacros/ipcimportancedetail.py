@@ -1,3 +1,8 @@
+from __future__ import absolute_import, print_function
+
+from builtins import hex
+from builtins import object
+
 from xnu import *
 
 """
@@ -17,7 +22,7 @@ class TaskNode(object):
     def __str__(self):
         out_arr = []
         if unsigned(self.task) != 0: 
-            out_arr.append(GetTaskSummary(self.task) + " " + GetProcSummary(Cast(self.task.bsd_info, 'proc *')) + " {: <#018x}".format(self.task.task_imp_base) )
+            out_arr.append(GetTaskSummary(self.task) + " " + GetProcSummary(GetProcFromTask(self.task)) + " {: <#018x}".format(self.task.task_imp_base) )
         else:
             out_arr.append("Unknown task.")
         #out_arr.append("TASK: {: <#018x} {: <s}".format(self.task, GetProcNameForTask(self.task))
@@ -93,15 +98,15 @@ class IIINode(object):
             cur_elem = cur_elem.GetParentNode()
         return out_str
         
-def GetIIIListFromIIE(iie, rootnode):
+def GetIIIListFromIIT(iit, rootnode):
     """ walk the iii queue and find each III element in a list format
     """
-    for i in IterateQueue(iie.iie_inherits, 'struct ipc_importance_inherit *',  'iii_inheritance'):
-        iieNode = IIINode(i, rootnode)
-        if unsigned(i.iii_elem.iie_bits) & 0x80000000:
-            rootnode.addChildNode(iieNode)
-            GetIIIListFromIIE(i.iii_elem, iieNode)
-            GetTaskNodeByKernelTaskObj(iieNode.GetToTask()).AddImportanceNode(iieNode)
+    for iii in IterateQueue(iit.iit_inherits, 'struct ipc_importance_inherit *',  'iii_inheritance'):
+        iiiNode = IIINode(iii, rootnode)
+        if unsigned(iii.iii_elem.iie_bits) & 0x80000000:
+            rootnode.addChildNode(iiiNode)
+            GetIIIListFromIIT(iii.iii_to_task, iiiNode)
+            GetTaskNodeByKernelTaskObj(iiiNode.GetToTask()).AddImportanceNode(iiiNode)
     return 
 
 AllTasksCollection = {}
@@ -119,17 +124,17 @@ def ShowInheritanceChains(cmd_args=[], cmd_options={}):
     """ show boost inheritance chains.
         Usage: (lldb) showboostinheritancechains  <task_t>
     """
-    print ' ' + GetIPCImportantTaskSummary.header + ' ' + GetIPCImportanceElemSummary.header
+    print(' ' + GetIPCImportantTaskSummary.header + ' ' + GetIPCImportanceElemSummary.header)
     for task in kern.tasks:
         if unsigned(task.task_imp_base):
-            print " " + GetIPCImportantTaskSummary(task.task_imp_base) + ' ' + GetIPCImportanceElemSummary(addressof(task.task_imp_base.iit_elem))
+            print(" " + GetIPCImportantTaskSummary(task.task_imp_base) + ' ' + GetIPCImportanceElemSummary(addressof(task.task_imp_base.iit_elem)))
             base_node = IIINode(Cast(task.task_imp_base, 'ipc_importance_inherit *'), None)
-            GetIIIListFromIIE(task.task_imp_base.iit_elem, base_node)
-            print base_node.GetChildSummaries(prefix="\t\t")
+            GetIIIListFromIIT(task.task_imp_base, base_node)
+            print(base_node.GetChildSummaries(prefix="\t\t"))
     
-    print "\n\n ======================== TASK REVERSE CHAIN OF IMPORTANCES ========================="
-    print TaskNode.GetHeaderString()
-    for k in AllTasksCollection.keys():
+    print("\n\n ======================== TASK REVERSE CHAIN OF IMPORTANCES =========================")
+    print(TaskNode.GetHeaderString())
+    for k in list(AllTasksCollection.keys()):
         t = AllTasksCollection[k]
-        print "\n" + str(t)
+        print("\n" + str(t))
 

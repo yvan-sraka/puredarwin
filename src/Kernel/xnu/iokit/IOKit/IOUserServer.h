@@ -32,7 +32,6 @@
 
 #include <IOKit/IORPC.h>
 
-#define kIOUserClassKey        "IOUserClass"
 #define kIOUserServerClassKey  "IOUserServer"
 #define kIOUserServerNameKey   "IOUserServerName"
 #define kIOUserServerTagKey    "IOUserServerTag"
@@ -54,8 +53,6 @@ enum{
 
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
 
-class OSObject;
-
 #define OSObject_Instantiate_ID       0x0000000100000001ULL
 
 enum {
@@ -68,6 +65,7 @@ struct OSObject_Instantiate_Msg_Content {
 	OSObjectRef  __object;
 };
 
+#pragma pack(push, 4)
 struct OSObject_Instantiate_Rpl_Content {
 	IORPCMessage  __hdr;
 	kern_return_t __result;
@@ -76,6 +74,7 @@ struct OSObject_Instantiate_Rpl_Content {
 	char          classname[128];
 	uint64_t      methods[0];
 };
+#pragma pack(pop)
 
 #pragma pack(4)
 struct OSObject_Instantiate_Msg {
@@ -103,9 +102,12 @@ typedef uint64_t IOTrapMessageBuffer[256];
 #include <DriverKit/IOUserServer.h>
 #include <libkern/c++/OSPtr.h>
 #include <libkern/c++/OSKext.h>
-
+#include <libkern/c++/OSBoundedArray.h>
+#include <libkern/c++/OSBoundedArrayRef.h>
+#include <sys/reason.h>
 class IOUserServer;
 class OSUserMetaClass;
+class OSObject;
 class IODispatchQueue;
 class IODispatchSource;
 class IOInterruptDispatchSource;
@@ -115,7 +117,7 @@ struct IOPStrings;
 
 struct OSObjectUserVars {
 	IOUserServer     * userServer;
-	IODispatchQueue ** queueArray;
+	OSBoundedArrayRef<IODispatchQueue *> queueArray;
 	OSUserMetaClass  * userMeta;
 	OSArray          * openProviders;
 	IOService        * controllingDriver;
@@ -127,7 +129,11 @@ struct OSObjectUserVars {
 	bool               stopped;
 	bool               userServerPM;
 	bool               willPower;
+	bool               powerState;
+	bool               resetPowerOnWake;
+	bool               deferredRegisterService;
 	uint32_t           powerOverride;
+	IOLock           * uvarsLock;
 };
 
 extern IOLock *        gIOUserServerLock;
@@ -142,31 +148,45 @@ void serverAdd(IOUserServer * server);
 void serverRemove(IOUserServer * server);
 void serverAck(IOUserServer * server);
 bool serverSlept(void);
-void systemHalt(void);
+void systemHalt(int howto);
 };
 
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
 
-class IOUserServer : public IOUserClient
+class IOUserServer : public IOUserClient2022
 {
 	OSDeclareDefaultStructorsWithDispatch(IOUserServer);
 
 	IOLock       *        fLock;
 	IOSimpleLock *        fInterruptLock;
-	task_t                fOwningTask;
 	OSDictionary  *       fEntitlements;
 	OSDictionary  *       fClasses;
 	IODispatchQueue     * fRootQueue;
 	OSArray             * fServices;
 
-	uint64_t              fPowerStates;
 	uint8_t               fRootNotifier;
 	uint8_t               fSystemPowerAck;
 	uint8_t               fSystemOff;
+	uint8_t               fPowerManagementFailed;
 	IOUserServerCheckInToken * fCheckInToken;
+	OSDextStatistics    * fStatistics;
+	bool                  fPlatformDriver;
+	OSString            * fTeamIdentifier;
+	unsigned int          fCSValidationCategory;
+public:
+	kern_allocation_name_t fAllocationName;
+	task_t                 fOwningTask;
+	os_reason_t            fTaskCrashReason;
 
 public:
 
+	/*
+	 * Launch a dext with the specified bundle ID, server name, and server tag. If reuseIfExists is true, this will attempt to find an existing IOUserServer instance or
+	 * a pending dext launch with the same server name.
+	 *
+	 * Returns a IOUserServer instance if one was found, or a token to track the pending dext launch. If both are NULL, then launching the dext failed.
+	 */
+	static  IOUserServer * launchUserServer(OSString * bundleID, const OSSymbol * serverName, OSNumber * serverTag, bool reuseIfExists, IOUserServerCheckInToken ** token, OSData *serverDUI);
 	static  IOUserClient * withTask(task_t owningTask);
 	virtual IOReturn       clientClose(void) APPLE_KEXT_OVERRIDE;
 	virtual bool           finalize(IOOptionBits options) APPLE_KEXT_OVERRIDE;
@@ -174,9 +194,9 @@ public:
 	virtual void           free() APPLE_KEXT_OVERRIDE;
 
 	virtual IOReturn       setProperties(OSObject * properties) APPLE_KEXT_OVERRIDE;
-	virtual IOReturn       externalMethod(uint32_t selector, IOExternalMethodArguments * args,
-	    IOExternalMethodDispatch * dispatch,
-	    OSObject * target, void * reference) APPLE_KEXT_OVERRIDE;
+	virtual IOReturn       externalMethod(uint32_t selector, IOExternalMethodArgumentsOpaque * args) APPLE_KEXT_OVERRIDE;
+	static IOReturn        externalMethodStart(OSObject * target, void * reference, IOExternalMethodArguments * arguments);
+	static IOReturn        externalMethodRegisterClass(OSObject * target, void * reference, IOExternalMethodArguments * arguments);
 
 	virtual IOExternalTrap * getTargetAndTrapForIndex(IOService ** targetP, UInt32 index) APPLE_KEXT_OVERRIDE;
 
@@ -189,26 +209,32 @@ public:
 	static void            serviceDidStop(IOService * client, IOService * provider);
 	IOReturn               serviceOpen(IOService * provider, IOService * client);
 	IOReturn               serviceClose(IOService * provider, IOService * client);
+	IOReturn               serviceJoinPMTree(IOService * service);
 	IOReturn               serviceSetPowerState(IOService * controllingDriver, IOService * service, IOPMPowerFlags flags, IOPMPowerStateIndex powerState);
 	IOReturn               serviceNewUserClient(IOService * service, task_t owningTask, void * securityID,
 	    uint32_t type, OSDictionary * properties, IOUserClient ** handler);
 	IOReturn               serviceNewUserClient(IOService * service, task_t owningTask, void * securityID,
 	    uint32_t type, OSDictionary * properties, OSSharedPtr<IOUserClient>& handler);
 	IOReturn               exit(const char * reason);
+	IOReturn               kill(const char * reason);
 
 	bool                   serviceMatchesCheckInToken(IOUserServerCheckInToken *token);
 	bool                   checkEntitlements(IOService * provider, IOService * dext);
-	bool                   checkEntitlements(OSDictionary * entitlements, OSObject * prop,
+	static bool            checkEntitlements(OSDictionary * entitlements, LIBKERN_CONSUMED OSObject * prop,
 	    IOService * provider, IOService * dext);
 
 	void                   setTaskLoadTag(OSKext *kext);
 	void                   setDriverKitUUID(OSKext *kext);
+	void                   setDriverKitStatistics(OSKext *kext);
 	void                   setCheckInToken(IOUserServerCheckInToken *token);
 	void                   systemPower(bool powerOff);
-	void                               systemHalt(void);
+	void                               systemHalt(int howto);
+	static void            powerSourceChanged(bool acAttached);
+
 	IOReturn                                setPowerState(unsigned long state, IOService * service) APPLE_KEXT_OVERRIDE;
 	IOReturn                                powerStateWillChangeTo(IOPMPowerFlags flags, unsigned long state, IOService * service) APPLE_KEXT_OVERRIDE;
 	IOReturn                                powerStateDidChangeTo(IOPMPowerFlags flags, unsigned long state, IOService * service) APPLE_KEXT_OVERRIDE;
+	void                                    setPowerManagementFailed(bool failed);
 
 	IOPStrings *           copyInStringArray(const char * string, uint32_t userSize);
 	uint32_t               stringArrayIndex(IOPStrings * array, const char * look);
@@ -236,25 +262,94 @@ public:
 	IOReturn               rpc(IORPC rpc);
 	IOReturn               server(ipc_kmsg_t requestkmsg, ipc_kmsg_t * preply);
 	kern_return_t          waitInterruptTrap(void * p1, void * p2, void * p3, void * p4, void * p5, void * p6);
+	static bool            shouldLeakObjects();
+	static void            beginLeakingObjects();
+	bool                   isPlatformDriver();
+	int                    getCSValidationCategory();
 };
 
-typedef void (*IOUserServerCheckInNotificationHandler)(class IOUserServerCheckInToken*, void*);
+typedef void (*IOUserServerCheckInCancellationHandler)(class IOUserServerCheckInToken*, void*);
+
+// OSObject wrapper around IOUserServerCheckInCancellationHandler
+class _IOUserServerCheckInCancellationHandler : public OSObject {
+	OSDeclareDefaultStructors(_IOUserServerCheckInCancellationHandler);
+public:
+	static _IOUserServerCheckInCancellationHandler *
+	withHandler(IOUserServerCheckInCancellationHandler handler, void * args);
+
+	void call(IOUserServerCheckInToken * token);
+private:
+	IOUserServerCheckInCancellationHandler fHandler;
+	void                                 * fHandlerArgs;
+};
 
 class IOUserServerCheckInToken : public OSObject
 {
+	enum State {
+		kIOUserServerCheckInPending,
+		kIOUserServerCheckInCanceled,
+		kIOUserServerCheckInComplete,
+	};
+
 	OSDeclareDefaultStructors(IOUserServerCheckInToken);
 public:
-	static IOUserServerCheckInToken * create();
-	void setNoSendersNotification(IOUserServerCheckInNotificationHandler handler, void *handlerArgs);
-	void clearNotification();
-	static void notifyNoSenders(IOUserServerCheckInToken * token);
+	virtual void free() APPLE_KEXT_OVERRIDE;
+
+	/*
+	 * Cancel all pending dext launches.
+	 */
+	static void cancelAll();
+
+	/*
+	 * Set handler to be invoked when launch is cancelled. Returns an wrapper object for the handler to be released by the caller.
+	 * The handler always runs under the lock for this IOUserServerCheckInToken.
+	 * The returned object can be used with removeCancellationHandler().
+	 */
+	_IOUserServerCheckInCancellationHandler * setCancellationHandler(IOUserServerCheckInCancellationHandler handler, void *handlerArgs);
+
+	/*
+	 * Remove previously set cancellation handler.
+	 */
+	void removeCancellationHandler(_IOUserServerCheckInCancellationHandler * handler);
+
+	/*
+	 * Cancel the launch
+	 */
+	void cancel();
+
+	/*
+	 * Mark launch as completed.
+	 */
+	void complete();
+
+	const OSSymbol * copyServerName() const;
+	OSNumber * copyServerTag() const;
+
 private:
-	IOUserServerCheckInNotificationHandler handler;
-	void *handlerArgs;
+	static IOUserServerCheckInToken * findExistingToken(const OSSymbol * serverName);
+	bool init(const OSSymbol * userServerName, OSNumber * serverTag, OSKext *driverKext, OSData *serverDUI);
+	bool dextTerminate(void);
+
+	friend class IOUserServer;
+
+
+
+private:
+	IOUserServerCheckInToken::State          fState;
+	size_t                                   fPendingCount;
+	const OSSymbol                         * fServerName;
+	const OSSymbol                         * fExecutableName;
+	OSNumber                               * fServerTag;
+	OSSet                                  * fHandlers;
+	OSString                               * fKextBundleID;
+	bool                                     fNeedDextDec;
 };
 
 extern "C" kern_return_t
 IOUserServerUEXTTrap(OSObject * object, void * p1, void * p2, void * p3, void * p4, void * p5, void * p6);
+
+extern "C" void
+IOUserServerRecordExitReason(task_t task, os_reason_t reason);
 
 #endif /* XNU_KERNEL_PRIVATE */
 #endif /* _IOUSERSERVER_H */

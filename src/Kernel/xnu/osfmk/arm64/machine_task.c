@@ -58,6 +58,8 @@
 #include <kern/thread.h>
 #include <arm/misc_protos.h>
 
+#include <IOKit/IOBSD.h>
+
 
 extern zone_t ads_zone;
 
@@ -79,10 +81,8 @@ machine_task_set_state(
 		}
 
 		if (task->task_debug == NULL) {
-			task->task_debug = zalloc(ads_zone);
-			if (task->task_debug == NULL) {
-				return KERN_FAILURE;
-			}
+			task->task_debug = zalloc_flags(ads_zone,
+			    Z_WAITOK | Z_NOFAIL);
 		}
 
 		copy_legacy_debug_state(tstate, (arm_legacy_debug_state_t *) task->task_debug, FALSE); /* FALSE OR TRUE doesn't matter since we are ignoring it for arm */
@@ -99,10 +99,8 @@ machine_task_set_state(
 		}
 
 		if (task->task_debug == NULL) {
-			task->task_debug = zalloc(ads_zone);
-			if (task->task_debug == NULL) {
-				return KERN_FAILURE;
-			}
+			task->task_debug = zalloc_flags(ads_zone,
+			    Z_WAITOK | Z_NOFAIL);
 		}
 
 		copy_debug_state32(tstate, (arm_debug_state32_t *) task->task_debug, FALSE); /* FALSE OR TRUE doesn't matter since we are ignoring it for arm */
@@ -120,10 +118,8 @@ machine_task_set_state(
 		}
 
 		if (task->task_debug == NULL) {
-			task->task_debug = zalloc(ads_zone);
-			if (task->task_debug == NULL) {
-				return KERN_FAILURE;
-			}
+			task->task_debug = zalloc_flags(ads_zone,
+			    Z_WAITOK | Z_NOFAIL);
 		}
 
 		copy_debug_state64(tstate, (arm_debug_state64_t *) task->task_debug, FALSE); /* FALSE OR TRUE doesn't matter since we are ignoring it for arm */
@@ -250,4 +246,57 @@ machine_task_init(__unused task_t new_task,
     __unused task_t parent_task,
     __unused boolean_t memory_inherit)
 {
+}
+
+/*
+ * machine_task_process_signature
+ *
+ * Called to allow code signature dependent adjustments to the task
+ * state. It is not safe to assume that this function is only called
+ * once per task, as a signature may be attached later.
+ *
+ * On error, this function should point error_msg to a static error
+ * string (the caller will not free it).
+ */
+kern_return_t
+machine_task_process_signature(
+	task_t task,
+	uint32_t const __unused platform,
+	uint32_t const __unused sdk,
+	char const ** __unused error_msg)
+{
+	assert(error_msg != NULL);
+
+	kern_return_t kr = KERN_SUCCESS;
+
+	bool const x18_entitled =
+	    IOTaskHasEntitlement(task, "com.apple.private.custom-x18-abi") ||
+	    IOTaskHasEntitlement(task, "com.apple.private.uexc");
+
+#if !__ARM_KERNEL_PROTECT__
+	task->preserve_x18 = x18_entitled;
+
+	/*
+	 * Temporary override for tasks before macOS 13.
+	 * Those were allowed to use x18 for their purposes on Apple Silicon.
+	 */
+
+	if (platform == PLATFORM_MACOS && sdk < 0xd0000) {
+		task->preserve_x18 = true;
+	}
+#else /* !__ARM_KERNEL_PROTECT__ */
+	if (x18_entitled) {
+		/*
+		 * This *will* make you sad, because it means you are
+		 * trying to use x18 on a device where that's just not
+		 * possible. As these are private entitlements, we can
+		 * prevent confusing damage now.
+		 */
+
+		*error_msg = "process has entitlement that indicates custom x18 ABI usage, not available on this device";
+		kr = KERN_FAILURE;
+	}
+#endif /* !__ARM_KERNEL_PROTECT__ */
+
+	return kr;
 }

@@ -85,6 +85,7 @@
 
 #ifdef XNU_KERNEL_PRIVATE
 #include <mach/coalition.h>             /* COALITION_NUM_TYPES */
+#include <sys/codesign.h>
 #endif
 
 #ifndef KERNEL
@@ -242,7 +243,19 @@ extern bool proc_is_exotic(proc_t p);
 extern bool proc_is_alien(proc_t p);
 proc_t current_proc_EXTERNAL(void);
 
-extern int      msleep(void *chan, lck_mtx_t *mtx, int pri, const char *wmesg, struct timespec * ts );
+#if XNU_KERNEL_PRIVATE
+
+extern bool proc_is_driver(proc_t p);
+extern bool proc_is_third_party_debuggable_driver(proc_t p);
+
+#endif /* XNU_KERNEL_PRIVATE */
+
+/*
+ * __unsafe_indexable is a workaround for
+ * rdar://88409003 (PredefinedExpr trips C string detection)
+ */
+extern int      msleep(void *chan, lck_mtx_t *mtx, int pri, const char *__unsafe_indexable wmesg, struct timespec * ts );
+extern int      msleep0(void *chan, lck_mtx_t *mtx, int pri, const char *__unsafe_indexable wmesg, int timo, int (*continuation)(int));
 extern void     wakeup(void *chan);
 extern void wakeup_one(caddr_t chan);
 
@@ -287,6 +300,8 @@ extern int proc_ppid(proc_t);
 extern int proc_original_ppid(proc_t);
 /* returns the start time of the given process */
 extern int proc_starttime(proc_t, struct timeval *);
+/* returns whether the given process is on simulated platform */
+extern boolean_t proc_is_simulated(const proc_t);
 /* returns the platform (macos, ios, watchos, tvos, ...) of the given process */
 extern uint32_t proc_platform(const proc_t);
 /* returns the minimum sdk version used by the current process */
@@ -408,14 +423,41 @@ extern void proc_set_responsible_pid(proc_t target_proc, pid_t responsible_pid);
 /* return 1 if process is forcing case-sensitive HFS+ access, 0 for default */
 extern int proc_is_forcing_hfs_case_sensitivity(proc_t);
 
+/* returns 1 if the process is parent of a vfork */
+extern int proc_lvfork(proc_t);
+
+/* increments process block output operations counter. returns original value if valid long pointer was passed */
+extern int proc_increment_ru_oublock(proc_t, long *);
+
+/* Check if process is aborted, but not killed by a signal or is not the exiting thread or is not attempting to dump core */
+extern int proc_isabortedsignal(proc_t);
+
 /* return true if the process is translated, false for default */
 extern boolean_t proc_is_translated(proc_t);
+
+/* return true if this is an x86_64 process running under translation */
+extern bool proc_is_x86_64_compat(proc_t);
 
 /* true if the process ignores errors from content protection APIs */
 extern bool proc_ignores_content_protection(proc_t proc);
 
 /* true if the file system shouldn't update mtime for operations by the process */
 extern bool proc_skip_mtime_update(proc_t proc);
+
+/* return true if the process is flagged as allow-low-space */
+extern bool proc_allow_low_space_writes(proc_t p);
+
+/* return true if process needs to use alternative extended attribute for symlinks */
+bool proc_use_alternative_symlink_ea(proc_t p);
+
+/* return true if rsr is set for process */
+bool proc_is_rsr(proc_t p);
+
+/*
+ * Return true if the process disallows read or write access for files that
+ * it opens with O_EVTONLY.
+ */
+extern bool proc_disallow_rw_for_o_evtonly(proc_t p);
 
 /*!
  *  @function    proc_exitstatus
@@ -444,9 +486,6 @@ extern bool proc_is_traced(proc_t p);
 
 extern void proc_coalitionids(proc_t, uint64_t[COALITION_NUM_TYPES]);
 
-#ifdef CONFIG_32BIT_TELEMETRY
-extern void proc_log_32bit_telemetry(proc_t p);
-#endif /* CONFIG_32BIT_TELEMETRY */
 extern uint64_t get_current_unique_pid(void);
 #endif /* XNU_KERNEL_PRIVATE*/
 

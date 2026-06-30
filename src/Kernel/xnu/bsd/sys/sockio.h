@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2000-2019 Apple Inc. All rights reserved.
+ * Copyright (c) 2000-2021 Apple Inc. All rights reserved.
  *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
  *
@@ -180,6 +180,8 @@
 #define SIOCSIFCAP       _IOW('i', 90, struct ifreq)    /* set IF features */
 #define SIOCGIFCAP      _IOWR('i', 91, struct ifreq)    /* get IF features */
 
+#define SIOCSIFMANAGEMENT       _IOWR('i', 92, struct ifreq)   /* set management interface */
+
 #define SIOCIFCREATE    _IOWR('i', 120, struct ifreq)   /* create clone if */
 #define SIOCIFDESTROY    _IOW('i', 121, struct ifreq)   /* destroy clone if */
 #define SIOCIFCREATE2   _IOWR('i', 122, struct ifreq)   /* create clone if with data */
@@ -297,6 +299,7 @@
 #define SIOCSECNMODE            _IOW('i', 177, struct ifreq)
 
 #define SIOCSIFORDER    _IOWR('i', 178, struct if_order)
+#define SIOCGIFORDER    _IOWR('i', 179, struct if_order)
 
 #define SIOCSQOSMARKINGMODE     _IOWR('i', 180, struct ifreq)
 #define SIOCSFASTLANECAPABLE    SIOCSQOSMARKINGMODE
@@ -357,6 +360,16 @@
 #define SIOCGETROUTERMODE _IOWR('i', 209, struct ifreq)   /* get IPv4 router mode state */
 
 #define SIOCSIFNETWORKID _IOWR('i', 210, struct if_netidreq)   /* set Network Identifier for a given interface */
+
+#define SIOCSIFMARKWAKEPKT _IOWR('i', 211, struct ifreq) /* to mark the next input packet with wake flag */
+
+#define SIOCSIFESTTHROUGHPUT _IOWR('i', 212, struct ifreq) /* set ifru_estimated_throughput */
+#define SIOCSIFRADIODETAILS _IOWR('i', 213, struct ifreq) /* set ifru_radio_details */
+
+#define SIOCSIFLINKQUALITYMETRIC _IOWR('i', 214, struct ifreq) /* set LQM */
+
+#define SIOCSIFNOTRAFFICSHAPING _IOWR('i', 215, struct ifreq) /* skip dummynet and netem traffic shaping */
+#define SIOCGIFNOTRAFFICSHAPING _IOWR('i', 216, struct ifreq) /* skip dummynet and netem traffic shaping */
 #endif /* PRIVATE */
 
 #endif /* !_SYS_SOCKIO_H_ */

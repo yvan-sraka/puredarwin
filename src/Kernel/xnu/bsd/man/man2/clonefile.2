@@ -16,7 +16,7 @@
 .\" 
 .\"     @(#)clonefile.2
 .
-.Dd December 04, 2015
+.Dd June 3, 2021
 .Dt CLONEFILE 2
 .Os Darwin
 .Sh NAME
@@ -68,6 +68,9 @@ the current user does not have privileges to change ownership
 .
 .It
 setuid and setgid bits are turned off in the mode bits for regular files.
+.It
+inherit target directory's access control lists. If the optional flag CLONE_ACL is passed, it will additionally
+copy the ACLs from the source file and also apply the inherited ACLs from the target directory.
 .El
 .Pp
 Subsequent writes to either the original or cloned file are private to the file being modified (copy-on-write).
@@ -143,6 +146,12 @@ The symbolic link is itself cloned if
 .Fa src
 names a symbolic link.
 .
+.El
+.Pp
+.Bl -tag -width CLONE_ACL
+.
+.It CLONE_ACL
+Copy ACLs from the source file.
 .El
 .Pp
 The
@@ -240,6 +249,26 @@ names an  existing file that is  neither a directory nor a symbolic link to a di
 or the path argument contains at least one non <slash> character and ends with one or
 more trailing <slash> characters and the last pathname component names an existing file that
 is neither a directory nor a symbolic link to a directory.
+.
+.It Bq Er EDEADLK
+A component of either pathname refers to a
+.Dq dataless
+directory that requires materialization and the I/O policy of the current
+thread or process disallows dataless directory materialization
+.Po see
+.Xr getiopolicy_np 3
+.Pc .
+.
+.It Bq Er EDEADLK
+The
+.Fa src
+pathname refers to a
+.Dq dataless
+file that must be materialized before being cloned and the I/O policy of
+the current thread or process disallows file materialization
+.Po see
+.Xr getiopolicy_np 3
+.Pc .
 .El
 .Pp
 In addition, the
@@ -273,6 +302,7 @@ or
 is neither                                                                         
 .Dv AT_FDCWD                                                                       
 nor a file descriptor associated with a directory.                              
+.
 .El  
 .
 .Pp

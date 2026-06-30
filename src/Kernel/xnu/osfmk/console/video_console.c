@@ -94,12 +94,10 @@
 #include <kern/kern_types.h>
 #include <kern/kalloc.h>
 #include <kern/debug.h>
-#include <kern/spl.h>
 #include <kern/thread_call.h>
 
 #include <vm/pmap.h>
 #include <vm/vm_kern.h>
-#include <machine/io_map_entries.h>
 #include <machine/machine_cpu.h>
 
 #include <pexpert/pexpert.h>
@@ -220,11 +218,8 @@ enum vt100state_e {
 enum{
 	/* secs */
 	kProgressAcquireDelay   = 0,
-#if !defined(XNU_TARGET_OS_OSX)
-	kProgressReacquireDelay = 5,
-#else
-	kProgressReacquireDelay = 5,
-#endif
+	kProgressReacquireDelay = (12 * 60 * 60),     /* 12 hrs, ie. disabled unless overridden
+	                                               * by kVCAcquireImmediate */
 };
 
 static int8_t vc_rotate_matr[4][2][2] = {
@@ -352,7 +347,6 @@ gc_enable( boolean_t enable )
 	uint32_t buffer_columns = 0;
 	uint32_t buffer_rows = 0;
 	uint32_t buffer_size = 0;
-	spl_t s;
 
 	if (enable == FALSE) {
 		// only disable console output if it goes to the graphics console
@@ -363,7 +357,6 @@ gc_enable( boolean_t enable )
 		gc_ops.enable(FALSE);
 	}
 
-	s = splhigh();
 	VCPUTC_LOCK_LOCK();
 
 	if (gc_buffer_size) {
@@ -384,15 +377,13 @@ gc_enable( boolean_t enable )
 		gc_buffer_size       = 0;
 
 		VCPUTC_LOCK_UNLOCK();
-		splx( s );
 
-		kheap_free( KHEAP_DATA_BUFFERS, buffer_attributes, buffer_size );
-		kheap_free( KHEAP_DATA_BUFFERS, buffer_characters, buffer_size );
-		kheap_free( KHEAP_DATA_BUFFERS, buffer_colorcodes, buffer_size );
-		kheap_free( KHEAP_DATA_BUFFERS, buffer_tab_stops, buffer_columns );
+		kfree_data(buffer_attributes, buffer_size);
+		kfree_data(buffer_characters, buffer_size);
+		kfree_data(buffer_colorcodes, buffer_size);
+		kfree_data(buffer_tab_stops, buffer_columns);
 	} else {
 		VCPUTC_LOCK_UNLOCK();
-		splx( s );
 	}
 
 	if (enable) {
@@ -402,27 +393,19 @@ gc_enable( boolean_t enable )
 			buffer_size    = buffer_columns * buffer_rows;
 
 			if (buffer_size) {
-				buffer_attributes = kheap_alloc( KHEAP_DATA_BUFFERS, buffer_size, Z_WAITOK );
-				buffer_characters = kheap_alloc( KHEAP_DATA_BUFFERS, buffer_size, Z_WAITOK );
-				buffer_colorcodes = kheap_alloc( KHEAP_DATA_BUFFERS, buffer_size, Z_WAITOK );
-				buffer_tab_stops  = kheap_alloc( KHEAP_DATA_BUFFERS, buffer_columns, Z_WAITOK );
+				buffer_attributes = kalloc_data(buffer_size, Z_WAITOK);
+				buffer_characters = kalloc_data(buffer_size, Z_WAITOK);
+				buffer_colorcodes = kalloc_data(buffer_size, Z_WAITOK);
+				buffer_tab_stops  = kalloc_data(buffer_columns, Z_WAITOK);
 
 				if (buffer_attributes == NULL ||
 				    buffer_characters == NULL ||
 				    buffer_colorcodes == NULL ||
 				    buffer_tab_stops == NULL) {
-					if (buffer_attributes) {
-						kheap_free( KHEAP_DATA_BUFFERS, buffer_attributes, buffer_size );
-					}
-					if (buffer_characters) {
-						kheap_free( KHEAP_DATA_BUFFERS, buffer_characters, buffer_size );
-					}
-					if (buffer_colorcodes) {
-						kheap_free( KHEAP_DATA_BUFFERS, buffer_colorcodes, buffer_size );
-					}
-					if (buffer_tab_stops) {
-						kheap_free( KHEAP_DATA_BUFFERS, buffer_tab_stops, buffer_columns );
-					}
+					kfree_data(buffer_attributes, buffer_size);
+					kfree_data(buffer_characters, buffer_size);
+					kfree_data(buffer_colorcodes, buffer_size);
+					kfree_data(buffer_tab_stops, buffer_columns);
 
 					buffer_attributes = NULL;
 					buffer_characters = NULL;
@@ -440,7 +423,6 @@ gc_enable( boolean_t enable )
 			}
 		}
 
-		s = splhigh();
 		VCPUTC_LOCK_LOCK();
 
 		gc_buffer_attributes = buffer_attributes;
@@ -454,7 +436,6 @@ gc_enable( boolean_t enable )
 		gc_reset_screen();
 
 		VCPUTC_LOCK_UNLOCK();
-		splx( s );
 
 		gc_ops.clear_screen(gc_x, gc_y, 0, vinfo.v_rows, 2);
 		gc_ops.show_cursor(gc_x, gc_y);
@@ -1247,7 +1228,7 @@ gc_update_color(int color, boolean_t fore)
 }
 
 void
-vcputc(__unused int l, __unused int u, int c)
+vcputc_options(char c, __unused bool poll)
 {
 	if (gc_initialized && gc_enabled) {
 		VCPUTC_LOCK_LOCK();
@@ -1256,8 +1237,17 @@ vcputc(__unused int l, __unused int u, int c)
 			gc_putchar(c);
 			gc_show_cursor(gc_x, gc_y);
 		}
+#if SCHED_HYGIENE_DEBUG
+		abandon_preemption_disable_measurement();
+#endif /* SCHED_HYGIENE_DEBUG */
 		VCPUTC_LOCK_UNLOCK();
 	}
+}
+
+void
+vcputc(char c)
+{
+	vcputc_options(c, false);
 }
 
 /*
@@ -1654,7 +1644,6 @@ vc_render_font(short newdepth)
 	unsigned char *rendered_font;
 	unsigned int rendered_font_size;
 	int rendered_char_size;
-	spl_t s;
 
 	if (vm_initialized == FALSE) {
 		return; /* nothing to do */
@@ -1663,7 +1652,6 @@ vc_render_font(short newdepth)
 		return; /* nothing to do */
 	}
 
-	s = splhigh();
 	VCPUTC_LOCK_LOCK();
 
 	rendered_font      = vc_rendered_font;
@@ -1675,17 +1663,13 @@ vc_render_font(short newdepth)
 	vc_rendered_char_size = 0;
 
 	VCPUTC_LOCK_UNLOCK();
-	splx(s);
 
-	if (rendered_font) {
-		kheap_free(KHEAP_DATA_BUFFERS, rendered_font, rendered_font_size);
-		rendered_font = NULL;
-	}
+	kfree_data(rendered_font, rendered_font_size);
 
 	if (newdepth) {
 		rendered_char_size = ISO_CHAR_HEIGHT * (((newdepth + 7) / 8) * ISO_CHAR_WIDTH);
 		rendered_font_size = (ISO_CHAR_MAX - ISO_CHAR_MIN + 1) * rendered_char_size;
-		rendered_font = kheap_alloc(KHEAP_DATA_BUFFERS, rendered_font_size, Z_WAITOK);
+		rendered_font = kalloc_data(rendered_font_size, Z_WAITOK);
 	}
 
 	if (rendered_font == NULL) {
@@ -1698,7 +1682,6 @@ vc_render_font(short newdepth)
 
 	olddepth = newdepth;
 
-	s = splhigh();
 	VCPUTC_LOCK_LOCK();
 
 	vc_rendered_font      = rendered_font;
@@ -1706,7 +1689,6 @@ vc_render_font(short newdepth)
 	vc_rendered_char_size = rendered_char_size;
 
 	VCPUTC_LOCK_UNLOCK();
-	splx(s);
 }
 
 static void
@@ -2005,22 +1987,8 @@ vc_blit_rect_8(int x, int y, __unused int bx,
 	}
 }
 
-/* For ARM, 16-bit is 565 (RGB); it is 1555 (XRGB) on other platforms */
+/* 16-bit is 1555 (XRGB) on all platforms */
 
-#ifdef __arm__
-#define CLUT_MASK_R     0xf8
-#define CLUT_MASK_G     0xfc
-#define CLUT_MASK_B     0xf8
-#define CLUT_SHIFT_R    << 8
-#define CLUT_SHIFT_G    << 3
-#define CLUT_SHIFT_B    >> 3
-#define MASK_R          0xf800
-#define MASK_G          0x07e0
-#define MASK_B          0x001f
-#define MASK_R_8        0x7f800
-#define MASK_G_8        0x01fe0
-#define MASK_B_8        0x000ff
-#else
 #define CLUT_MASK_R     0xf8
 #define CLUT_MASK_G     0xf8
 #define CLUT_MASK_B     0xf8
@@ -2033,7 +2001,6 @@ vc_blit_rect_8(int x, int y, __unused int bx,
 #define MASK_R_8        0x3fc00
 #define MASK_G_8        0x01fe0
 #define MASK_B_8        0x000ff
-#endif
 
 static void
 vc_blit_rect_16( int x, int y, int bx,
@@ -2501,7 +2468,6 @@ vc_progress_initialize( vc_progress_element * desc,
 void
 vc_progress_set(boolean_t enable, uint32_t vc_delay)
 {
-	spl_t            s;
 	void             *saveBuf = NULL;
 	vm_size_t        saveLen = 0;
 	unsigned int     count;
@@ -2529,7 +2495,6 @@ vc_progress_set(boolean_t enable, uint32_t vc_delay)
 			internal_enable_progressmeter(kProgressMeterKernel);
 		}
 
-		s = splhigh();
 		simple_lock(&vc_progress_lock, LCK_GRP_NULL);
 
 		if (vc_progress_enable != enable) {
@@ -2546,7 +2511,6 @@ vc_progress_set(boolean_t enable, uint32_t vc_delay)
 		}
 
 		simple_unlock(&vc_progress_lock);
-		splx(s);
 
 		if (!enable) {
 			internal_enable_progressmeter(kProgressMeterOff);
@@ -2558,7 +2522,7 @@ vc_progress_set(boolean_t enable, uint32_t vc_delay)
 
 	if (enable) {
 		saveLen = (vc_progress->width * vc_uiscale) * (vc_progress->height * vc_uiscale) * ((vinfo.v_depth + 7) / 8);
-		saveBuf = kheap_alloc( KHEAP_DATA_BUFFERS, saveLen, Z_WAITOK );
+		saveBuf = kalloc_data(saveLen, Z_WAITOK);
 
 		switch (vinfo.v_depth) {
 		case 8:
@@ -2599,7 +2563,6 @@ vc_progress_set(boolean_t enable, uint32_t vc_delay)
 		}
 	}
 
-	s = splhigh();
 	simple_lock(&vc_progress_lock, LCK_GRP_NULL);
 
 	if (vc_progress_enable != enable) {
@@ -2630,11 +2593,8 @@ vc_progress_set(boolean_t enable, uint32_t vc_delay)
 	}
 
 	simple_unlock(&vc_progress_lock);
-	splx(s);
 
-	if (saveBuf) {
-		kheap_free( KHEAP_DATA_BUFFERS, saveBuf, saveLen );
-	}
+	kfree_data(saveBuf, saveLen);
 }
 
 #if defined(XNU_TARGET_OS_OSX)
@@ -2656,10 +2616,8 @@ vc_progressmeter_range(uint32_t pos)
 static void
 vc_progressmeter_task(__unused void *arg0, __unused void *arg)
 {
-	spl_t    s;
 	uint64_t interval;
 
-	s = splhigh();
 	simple_lock(&vc_progress_lock, LCK_GRP_NULL);
 	if (kProgressMeterKernel == vc_progressmeter_enable) {
 		uint32_t pos = (vc_progressmeter_count >> 13);
@@ -2676,7 +2634,6 @@ vc_progressmeter_task(__unused void *arg0, __unused void *arg)
 		}
 	}
 	simple_unlock(&vc_progress_lock);
-	splx(s);
 }
 
 void
@@ -2690,12 +2647,10 @@ vc_progress_setdiskspeed(uint32_t speed)
 static void
 vc_progress_task(__unused void *arg0, __unused void *arg)
 {
-	spl_t     s;
 	int       x, y, width, height;
 	uint64_t  x_pos, y_pos;
 	const unsigned char * data;
 
-	s = splhigh();
 	simple_lock(&vc_progress_lock, LCK_GRP_NULL);
 
 	if (vc_progress_enable) {
@@ -2768,7 +2723,6 @@ vc_progress_task(__unused void *arg0, __unused void *arg)
 		}while (FALSE);
 	}
 	simple_unlock(&vc_progress_lock);
-	splx(s);
 }
 
 /*
@@ -2792,9 +2746,6 @@ static boolean_t    lastVideoMapKmap = FALSE;
 static void
 gc_pause( boolean_t pause, boolean_t graphics_now )
 {
-	spl_t s;
-
-	s = splhigh();
 	VCPUTC_LOCK_LOCK();
 
 	disableConsoleOutput = (pause && !console_is_serial());
@@ -2821,27 +2772,11 @@ gc_pause( boolean_t pause, boolean_t graphics_now )
 	}
 
 	simple_unlock(&vc_progress_lock);
-	splx(s);
 }
 
 static void
 vc_initialize(__unused struct vc_info * vinfo_p)
 {
-#ifdef __arm__
-	unsigned long cnt, data16, data32;
-
-	if (vinfo.v_depth == 16) {
-		for (cnt = 0; cnt < 8; cnt++) {
-			data32 = vc_colors[cnt][2];
-			data16  = (data32 & 0x0000F8) <<  8;
-			data16 |= (data32 & 0x00FC00) >>  5;
-			data16 |= (data32 & 0xF80000) >> 19;
-			data16 |= data16 << 16;
-			vc_colors[cnt][1] = data16;
-		}
-	}
-#endif
-
 	vinfo.v_rows = vinfo.v_height / ISO_CHAR_HEIGHT;
 	vinfo.v_columns = vinfo.v_width / ISO_CHAR_WIDTH;
 	vinfo.v_rowscanbytes = ((vinfo.v_depth + 7) / 8) * vinfo.v_width;
@@ -2920,13 +2855,24 @@ initialize_screen(PE_Video * boot_vinfo, unsigned int op)
 			gc_acquired = TRUE;
 		} else {
 			if (makeMapping) {
+#if HAS_UCNORMAL_MEM
+				/*
+				 * Framebuffers would normally use VM_WIMG_RT, which
+				 * io_map doesn't support.  However this buffer is set up
+				 * by the bootloader and doesn't require D$ cleaning, so
+				 * VM_WIMG_RT and VM_WIMG_WCOMB are functionally
+				 * equivalent.
+				 */
+				unsigned int flags = VM_WIMG_WCOMB;
+#else
 				unsigned int flags = VM_WIMG_IO;
+#endif
 				if (boot_vinfo->v_length != 0) {
 					newMapSize = (unsigned int) round_page(boot_vinfo->v_length);
 				} else {
 					newMapSize = (unsigned int) round_page(new_vinfo.v_height * new_vinfo.v_rowbytes);                      /* Remember size */
 				}
-				newVideoVirt = io_map_spec((vm_map_offset_t)new_vinfo.v_physaddr, newMapSize, flags);   /* Allocate address space for framebuffer */
+				newVideoVirt = ml_io_map_unmappable((vm_map_offset_t)new_vinfo.v_physaddr, newMapSize, flags);   /* Allocate address space for framebuffer */
 			}
 			new_vinfo.v_baseaddr = newVideoVirt + boot_vinfo->v_offset;                     /* Set the new framebuffer address */
 		}
@@ -3074,7 +3020,6 @@ initialize_screen(PE_Video * boot_vinfo, unsigned int op)
 #if defined(__x86_64__)
 	case kPERefreshBootGraphics:
 	{
-		spl_t     s;
 		boolean_t save;
 
 		if (kBootArgsFlagBlack & ((boot_args *) PE_state.bootArgs)->flags) {
@@ -3086,14 +3031,12 @@ initialize_screen(PE_Video * boot_vinfo, unsigned int op)
 
 		internal_enable_progressmeter(kProgressMeterKernel);
 
-		s = splhigh();
 		simple_lock(&vc_progress_lock, LCK_GRP_NULL);
 
 		vc_progressmeter_drawn = 0;
 		internal_set_progressmeter(vc_progressmeter_range(vc_progressmeter_count >> 13));
 
 		simple_unlock(&vc_progress_lock);
-		splx(s);
 
 		internal_enable_progressmeter(kProgressMeterOff);
 		vc_progress_white = save;
@@ -3145,10 +3088,10 @@ vcattach(void)
 				continue;
 			}
 
-			vcputc( 0, 0, msgbufp->msg_bufc[index] );
+			vcputc( msgbufp->msg_bufc[index] );
 
 			if (msgbufp->msg_bufc[index] == '\n') {
-				vcputc( 0, 0, '\r' );
+				vcputc( '\r' );
 			}
 		}
 	}
@@ -3242,7 +3185,6 @@ extern void IORecordProgressBackbuffer(void * buffer, size_t size, uint32_t them
 static void
 internal_enable_progressmeter(int new_value)
 {
-	spl_t     s;
 	void    * new_buffer;
 	boolean_t stashBackbuffer;
 	int flags = vinfo.v_rotate;
@@ -3250,12 +3192,10 @@ internal_enable_progressmeter(int new_value)
 	stashBackbuffer = FALSE;
 	new_buffer = NULL;
 	if (new_value) {
-		new_buffer = kheap_alloc(KHEAP_DATA_BUFFERS,
-		    (kProgressBarWidth * vc_uiscale) *
+		new_buffer = kalloc_data((kProgressBarWidth * vc_uiscale) *
 		    (kProgressBarHeight * vc_uiscale) * sizeof(int), Z_WAITOK);
 	}
 
-	s = splhigh();
 	simple_lock(&vc_progress_lock, LCK_GRP_NULL);
 
 	if (kProgressMeterUser == new_value) {
@@ -3286,7 +3226,6 @@ internal_enable_progressmeter(int new_value)
 	}
 
 	simple_unlock(&vc_progress_lock);
-	splx(s);
 
 	if (new_buffer) {
 		if (stashBackbuffer) {
@@ -3296,8 +3235,7 @@ internal_enable_progressmeter(int new_value)
 			    * sizeof(int),
 			    vc_progress_white);
 		}
-		kheap_free(KHEAP_DATA_BUFFERS, new_buffer,
-		    (kProgressBarWidth * vc_uiscale) *
+		kfree_data(new_buffer, (kProgressBarWidth * vc_uiscale) *
 		    (kProgressBarHeight * vc_uiscale) * sizeof(int));
 	}
 }
@@ -3344,9 +3282,6 @@ vc_enable_progressmeter(int new_value)
 void
 vc_set_progressmeter(int new_value)
 {
-	spl_t s;
-
-	s = splhigh();
 	simple_lock(&vc_progress_lock, LCK_GRP_NULL);
 
 	if (vc_progressmeter_enable) {
@@ -3358,7 +3293,6 @@ vc_set_progressmeter(int new_value)
 	}
 
 	simple_unlock(&vc_progress_lock);
-	splx(s);
 }
 
 #endif /* defined(XNU_TARGET_OS_OSX) */

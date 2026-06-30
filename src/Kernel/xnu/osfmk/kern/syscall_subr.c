@@ -207,7 +207,7 @@ thread_switch(
 	boolean_t                       depress_option = FALSE;
 	boolean_t                       wait_option = FALSE;
 	wait_interrupt_t                interruptible = THREAD_ABORTSAFE;
-	port_to_thread_options_t        ptt_options = PORT_TO_THREAD_NOT_CURRENT_THREAD;
+	port_intrans_options_t        ptt_options = PORT_INTRANS_THREAD_NOT_CURRENT_THREAD;
 
 	/*
 	 *	Validate and process option.
@@ -233,12 +233,12 @@ thread_switch(
 	case SWITCH_OPTION_OSLOCK_DEPRESS:
 		depress_option = TRUE;
 		interruptible |= THREAD_WAIT_NOREPORT;
-		ptt_options |= PORT_TO_THREAD_IN_CURRENT_TASK;
+		ptt_options |= PORT_INTRANS_THREAD_IN_CURRENT_TASK;
 		break;
 	case SWITCH_OPTION_OSLOCK_WAIT:
 		wait_option = TRUE;
 		interruptible |= THREAD_WAIT_NOREPORT;
-		ptt_options |= PORT_TO_THREAD_IN_CURRENT_TASK;
+		ptt_options |= PORT_INTRANS_THREAD_IN_CURRENT_TASK;
 		break;
 	default:
 		return KERN_INVALID_ARGUMENT;
@@ -413,6 +413,14 @@ thread_handoff_deallocate(thread_t thread, thread_handoff_option_t option)
  * POLLDEPRESS can be active anywhere up until thread termination.
  */
 
+void
+thread_depress_timer_setup(thread_t self)
+{
+	self->depress_timer = kalloc_type(struct timer_call,
+	    Z_ZERO | Z_WAITOK | Z_NOFAIL);
+	timer_call_setup(self->depress_timer, thread_depress_expire, self);
+}
+
 /*
  * Depress thread's priority to lowest possible for the specified interval,
  * with an interval of zero resulting in no timeout being scheduled.
@@ -437,7 +445,7 @@ thread_depress_abstime(uint64_t interval)
 			uint64_t deadline;
 
 			clock_absolutetime_interval_to_deadline(interval, &deadline);
-			if (!timer_call_enter(&self->depress_timer, deadline, TIMER_CALL_USER_CRITICAL)) {
+			if (!timer_call_enter(self->depress_timer, deadline, TIMER_CALL_USER_CRITICAL)) {
 				self->depress_timer_active++;
 			}
 		}
@@ -529,7 +537,7 @@ thread_depress_abort_locked(thread_t thread)
 
 	thread_recompute_sched_pri(thread, SETPRI_LAZY);
 
-	if (timer_call_cancel(&thread->depress_timer)) {
+	if (timer_call_cancel(thread->depress_timer)) {
 		thread->depress_timer_active--;
 	}
 
@@ -566,7 +574,7 @@ thread_poll_yield(thread_t self)
 		uint64_t yield_expiration = abstime +
 		    (total_computation >> sched_poll_yield_shift);
 
-		if (!timer_call_enter(&self->depress_timer, yield_expiration,
+		if (!timer_call_enter(self->depress_timer, yield_expiration,
 		    TIMER_CALL_USER_CRITICAL)) {
 			self->depress_timer_active++;
 		}

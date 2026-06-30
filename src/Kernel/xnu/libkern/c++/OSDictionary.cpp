@@ -91,16 +91,14 @@ OSDictionary::initWithCapacity(unsigned int inCapacity)
 		return false;
 	}
 
-	unsigned int size = inCapacity * sizeof(dictEntry);
 //fOptions |= kSort;
 
-	dictionary = (dictEntry *) kalloc_container(size);
+	dictionary = kallocp_type_container(dictEntry, &inCapacity, Z_WAITOK_ZERO);
 	if (!dictionary) {
 		return false;
 	}
 
-	os::uninitialized_value_construct(dictionary, dictionary + inCapacity);
-	OSCONTAINER_ACCUMSIZE(size);
+	OSCONTAINER_ACCUMSIZE(inCapacity * sizeof(dictEntry));
 
 	count = 0;
 	capacity = inCapacity;
@@ -282,7 +280,7 @@ OSDictionary::free()
 	(void) super::setOptions(0, kImmutable);
 	flushCollection();
 	if (dictionary) {
-		kfree(dictionary, capacity * sizeof(dictEntry));
+		kfree_type(dictEntry, capacity, dictionary);
 		OSCONTAINER_ACCUMSIZE( -(capacity * sizeof(dictEntry)));
 	}
 
@@ -318,8 +316,7 @@ unsigned int
 OSDictionary::ensureCapacity(unsigned int newCapacity)
 {
 	dictEntry *newDict;
-	vm_size_t finalCapacity;
-	vm_size_t oldSize, newSize;
+	unsigned int finalCapacity;
 
 	if (newCapacity <= capacity) {
 		return capacity;
@@ -334,29 +331,12 @@ OSDictionary::ensureCapacity(unsigned int newCapacity)
 		return capacity;
 	}
 
-	newSize = sizeof(dictEntry) * finalCapacity;
-
-	newDict = (dictEntry *) kallocp_container(&newSize);
+	newDict = kreallocp_type_container(dictEntry, dictionary,
+	    capacity, &finalCapacity, Z_WAITOK_ZERO);
 	if (newDict) {
-		// use all of the actual allocation size
-		finalCapacity = (newSize / sizeof(dictEntry));
-		if (finalCapacity > UINT_MAX) {
-			// failure, too large
-			kfree(newDict, newSize);
-			return capacity;
-		}
-
-		oldSize = sizeof(dictEntry) * capacity;
-
-		os::uninitialized_move(dictionary, dictionary + capacity, newDict);
-		os::uninitialized_value_construct(newDict + capacity, newDict + finalCapacity);
-		os::destroy(dictionary, dictionary + capacity);
-
-		OSCONTAINER_ACCUMSIZE(((size_t)newSize) - ((size_t)oldSize));
-		kfree(dictionary, oldSize);
-
+		OSCONTAINER_ACCUMSIZE(sizeof(dictEntry) * (finalCapacity - capacity));
 		dictionary = newDict;
-		capacity = (unsigned int) finalCapacity;
+		capacity = finalCapacity;
 	}
 
 	return capacity;
@@ -368,8 +348,8 @@ OSDictionary::flushCollection()
 	haveUpdated();
 
 	for (unsigned int i = 0; i < count; i++) {
-		dictionary[i].key->taggedRelease(OSTypeID(OSCollection));
-		dictionary[i].value->taggedRelease(OSTypeID(OSCollection));
+		dictionary[i].key.reset();
+		dictionary[i].value.reset();
 	}
 	count = 0;
 }

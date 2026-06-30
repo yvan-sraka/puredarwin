@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2003-2020 Apple Inc. All rights reserved.
+ * Copyright (c) 2003-2023 Apple Inc. All rights reserved.
  *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
  *
@@ -108,72 +108,43 @@
 #include <net/multicast_list.h>
 #include <net/ether_if_module.h>
 
+#if !XNU_TARGET_OS_OSX
+#if (DEVELOPMENT || DEBUG)
+#include <pexpert/pexpert.h>
+#endif
+#endif /* !XNU_TARGET_OS_OSX */
+
 #define VLANNAME        "vlan"
 
 /**
 ** vlan locks
 **/
-static __inline__ lck_grp_t *
-my_lck_grp_alloc_init(const char * grp_name)
-{
-	lck_grp_t *         grp;
-	lck_grp_attr_t *    grp_attrs;
 
-	grp_attrs = lck_grp_attr_alloc_init();
-	grp = lck_grp_alloc_init(grp_name, grp_attrs);
-	lck_grp_attr_free(grp_attrs);
-	return grp;
-}
-
-static __inline__ lck_mtx_t *
-my_lck_mtx_alloc_init(lck_grp_t * lck_grp)
-{
-	lck_attr_t *        lck_attrs;
-	lck_mtx_t *         lck_mtx;
-
-	lck_attrs = lck_attr_alloc_init();
-	lck_mtx = lck_mtx_alloc_init(lck_grp, lck_attrs);
-	lck_attr_free(lck_attrs);
-	return lck_mtx;
-}
-
-static lck_mtx_t *      vlan_lck_mtx;
-
-static __inline__ void
-vlan_lock_init(void)
-{
-	lck_grp_t *         vlan_lck_grp;
-
-	vlan_lck_grp = my_lck_grp_alloc_init("if_vlan");
-	vlan_lck_mtx = my_lck_mtx_alloc_init(vlan_lck_grp);
-}
+static LCK_GRP_DECLARE(vlan_lck_grp, "if_vlan");
+static LCK_MTX_DECLARE(vlan_lck_mtx, &vlan_lck_grp);
 
 static __inline__ void
 vlan_assert_lock_held(void)
 {
-	LCK_MTX_ASSERT(vlan_lck_mtx, LCK_MTX_ASSERT_OWNED);
-	return;
+	LCK_MTX_ASSERT(&vlan_lck_mtx, LCK_MTX_ASSERT_OWNED);
 }
 
 static __inline__ void
 vlan_assert_lock_not_held(void)
 {
-	LCK_MTX_ASSERT(vlan_lck_mtx, LCK_MTX_ASSERT_NOTOWNED);
-	return;
+	LCK_MTX_ASSERT(&vlan_lck_mtx, LCK_MTX_ASSERT_NOTOWNED);
 }
 
 static __inline__ void
 vlan_lock(void)
 {
-	lck_mtx_lock(vlan_lck_mtx);
-	return;
+	lck_mtx_lock(&vlan_lck_mtx);
 }
 
 static __inline__ void
 vlan_unlock(void)
 {
-	lck_mtx_unlock(vlan_lck_mtx);
-	return;
+	lck_mtx_unlock(&vlan_lck_mtx);
 }
 
 /**
@@ -230,7 +201,6 @@ typedef struct ifvlan * ifvlan_ref;
 
 typedef struct vlan_globals_s {
 	struct vlan_parent_list     parent_list;
-	int                         verbose;
 } * vlan_globals_ref;
 
 static vlan_globals_ref g_vlan;
@@ -248,7 +218,7 @@ vlan_parent_release(vlan_parent_ref vlp);
 /**
 ** vlan_parent_ref vlp_flags in-lines
 **/
-static __inline__ int
+static __inline__ bool
 vlan_parent_flags_supports_vlan_mtu(vlan_parent_ref vlp)
 {
 	return (vlp->vlp_flags & VLPF_SUPPORTS_VLAN_MTU) != 0;
@@ -261,7 +231,7 @@ vlan_parent_flags_set_supports_vlan_mtu(vlan_parent_ref vlp)
 	return;
 }
 
-static __inline__ int
+static __inline__ bool
 vlan_parent_flags_change_in_progress(vlan_parent_ref vlp)
 {
 	return (vlp->vlp_flags & VLPF_CHANGE_IN_PROGRESS) != 0;
@@ -281,7 +251,7 @@ vlan_parent_flags_clear_change_in_progress(vlan_parent_ref vlp)
 	return;
 }
 
-static __inline__ int
+static __inline__ bool
 vlan_parent_flags_detaching(struct vlan_parent * vlp)
 {
 	return (vlp->vlp_flags & VLPF_DETACHING) != 0;
@@ -294,7 +264,7 @@ vlan_parent_flags_set_detaching(struct vlan_parent * vlp)
 	return;
 }
 
-static __inline__ int
+static __inline__ bool
 vlan_parent_flags_link_event_required(vlan_parent_ref vlp)
 {
 	return (vlp->vlp_flags & VLPF_LINK_EVENT_REQUIRED) != 0;
@@ -318,7 +288,7 @@ vlan_parent_flags_clear_link_event_required(vlan_parent_ref vlp)
 /**
 ** ifvlan_flags in-lines routines
 **/
-static __inline__ int
+static __inline__ bool
 ifvlan_flags_promisc(ifvlan_ref ifv)
 {
 	return (ifv->ifv_flags & IFVF_PROMISC) != 0;
@@ -364,15 +334,36 @@ ifvlan_flags_set_detaching(ifvlan_ref ifv)
 	return;
 }
 
-#if 0
 SYSCTL_DECL(_net_link);
-SYSCTL_NODE(_net_link, IFT_L2VLAN, vlan, CTLFLAG_RW | CTLFLAG_LOCKED, 0, "IEEE 802.1Q VLAN");
+SYSCTL_NODE(_net_link, IFT_L2VLAN, vlan, CTLFLAG_RW | CTLFLAG_LOCKED, 0,
+    "IEEE 802.1Q VLAN");
+
+static unsigned int vlan_debug;
+
+SYSCTL_UINT(_net_link_vlan, OID_AUTO, debug,
+    CTLFLAG_RW | CTLFLAG_LOCKED,
+    &vlan_debug, 0,
+    "Enable VLAN debug mode");
+
+#if !XNU_TARGET_OS_OSX
+static unsigned int vlan_enabled;
+
+#if (DEVELOPMENT || DEBUG)
+
+SYSCTL_UINT(_net_link_vlan, OID_AUTO, enabled,
+    CTLFLAG_RD | CTLFLAG_LOCKED,
+    &vlan_enabled, 0,
+    "VLAN interface support enabled");
+
+#endif /* DEVELOPMENT || DEBUG */
+#endif /* !XNU_TARGET_OS_OSX */
+
+#if 0
 SYSCTL_NODE(_net_link_vlan, PF_LINK, link, CTLFLAG_RW | CTLFLAG_LOCKED, 0, "for consistency");
 #endif
 
 #define VLAN_UNITMAX    IF_MAXUNIT
 #define VLAN_ZONE_MAX_ELEM      MIN(IFNETS_MAX, VLAN_UNITMAX)
-#define M_VLAN          M_DEVBUF
 
 static  int vlan_clone_create(struct if_clone *, u_int32_t, void *);
 static  int vlan_clone_destroy(struct ifnet *);
@@ -392,9 +383,7 @@ static struct if_clone vlan_cloner = IF_CLONE_INITIALIZER(VLANNAME,
     vlan_clone_create,
     vlan_clone_destroy,
     0,
-    VLAN_UNITMAX,
-    VLAN_ZONE_MAX_ELEM,
-    sizeof(struct ifvlan));
+    VLAN_UNITMAX);
 static  void interface_link_event(struct ifnet * ifp, u_int32_t event_code);
 static  void vlan_parent_link_event(struct ifnet * p,
     u_int32_t event_code);
@@ -408,10 +397,10 @@ static void
 ifvlan_retain(ifvlan_ref ifv)
 {
 	if (ifv->ifv_signature != IFV_SIGNATURE) {
-		panic("ifvlan_retain: bad signature\n");
+		panic("ifvlan_retain: bad signature");
 	}
 	if (ifv->ifv_retain_count == 0) {
-		panic("ifvlan_retain: retain count is 0\n");
+		panic("ifvlan_retain: retain count is 0");
 	}
 	OSIncrementAtomic(&ifv->ifv_retain_count);
 }
@@ -422,19 +411,19 @@ ifvlan_release(ifvlan_ref ifv)
 	u_int32_t           old_retain_count;
 
 	if (ifv->ifv_signature != IFV_SIGNATURE) {
-		panic("ifvlan_release: bad signature\n");
+		panic("ifvlan_release: bad signature");
 	}
 	old_retain_count = OSDecrementAtomic(&ifv->ifv_retain_count);
 	switch (old_retain_count) {
 	case 0:
-		panic("ifvlan_release: retain count is 0\n");
+		panic("ifvlan_release: retain count is 0");
 		break;
 	case 1:
-		if (g_vlan->verbose) {
+		if (vlan_debug != 0) {
 			printf("ifvlan_release(%s)\n", ifv->ifv_name);
 		}
 		ifv->ifv_signature = 0;
-		if_clone_softc_deallocate(&vlan_cloner, ifv);
+		kfree_type(struct ifvlan, ifv);
 		break;
 	default:
 		break;
@@ -519,16 +508,13 @@ vlan_globals_init(void)
 	if (g_vlan != NULL) {
 		return 0;
 	}
-	v = _MALLOC(sizeof(*v), M_VLAN, M_WAITOK);
-	if (v != NULL) {
-		LIST_INIT(&v->parent_list);
-		v->verbose = 0;
-	}
+	v = kalloc_type(struct vlan_globals_s, Z_WAITOK | Z_NOFAIL);
+	LIST_INIT(&v->parent_list);
 	vlan_lock();
 	if (g_vlan != NULL) {
 		vlan_unlock();
 		if (v != NULL) {
-			_FREE(v, M_VLAN);
+			kfree_type(struct vlan_globals_s, v);
 		}
 		return 0;
 	}
@@ -571,10 +557,10 @@ static void
 vlan_parent_retain(vlan_parent_ref vlp)
 {
 	if (vlp->vlp_signature != VLP_SIGNATURE) {
-		panic("vlan_parent_retain: signature is bad\n");
+		panic("vlan_parent_retain: signature is bad");
 	}
 	if (vlp->vlp_retain_count == 0) {
-		panic("vlan_parent_retain: retain count is 0\n");
+		panic("vlan_parent_retain: retain count is 0");
 	}
 	OSIncrementAtomic(&vlp->vlp_retain_count);
 }
@@ -585,21 +571,21 @@ vlan_parent_release(vlan_parent_ref vlp)
 	u_int32_t           old_retain_count;
 
 	if (vlp->vlp_signature != VLP_SIGNATURE) {
-		panic("vlan_parent_release: signature is bad\n");
+		panic("vlan_parent_release: signature is bad");
 	}
 	old_retain_count = OSDecrementAtomic(&vlp->vlp_retain_count);
 	switch (old_retain_count) {
 	case 0:
-		panic("vlan_parent_release: retain count is 0\n");
+		panic("vlan_parent_release: retain count is 0");
 		break;
 	case 1:
-		if (g_vlan->verbose) {
+		if (vlan_debug != 0) {
 			struct ifnet * ifp = vlp->vlp_ifp;
 			printf("vlan_parent_release(%s%d)\n", ifnet_name(ifp),
 			    ifnet_unit(ifp));
 		}
 		vlp->vlp_signature = 0;
-		FREE(vlp, M_VLAN);
+		kfree_type(struct vlan_parent, vlp);
 		break;
 	default:
 		break;
@@ -626,17 +612,17 @@ vlan_parent_wait(vlan_parent_ref vlp, const char * msg)
 
 	/* other add/remove/multicast-change in progress */
 	while (vlan_parent_flags_change_in_progress(vlp)) {
-		if (g_vlan->verbose) {
+		if (vlan_debug != 0) {
 			struct ifnet * ifp = vlp->vlp_ifp;
 
 			printf("%s%d: %s msleep\n", ifnet_name(ifp), ifnet_unit(ifp), msg);
 		}
 		waited = 1;
-		(void)msleep(vlp, vlan_lck_mtx, PZERO, msg, 0);
+		(void)msleep(vlp, &vlan_lck_mtx, PZERO, msg, 0);
 	}
 	/* prevent other vlan parent remove/add from taking place */
 	vlan_parent_flags_set_change_in_progress(vlp);
-	if (g_vlan->verbose && waited) {
+	if (vlan_debug != 0 && waited) {
 		struct ifnet * ifp = vlp->vlp_ifp;
 
 		printf("%s%d: %s woke up\n", ifnet_name(ifp), ifnet_unit(ifp), msg);
@@ -673,7 +659,7 @@ vlan_parent_signal(vlan_parent_ref vlp, const char * msg)
 
 				interface_link_event(ifp, event_code);
 			}
-			if (g_vlan->verbose) {
+			if (vlan_debug != 0) {
 				printf("%s%d: propagated link event to vlans\n",
 				    ifnet_name(vlp_ifp), ifnet_unit(vlp_ifp));
 			}
@@ -682,7 +668,7 @@ vlan_parent_signal(vlan_parent_ref vlp, const char * msg)
 	}
 	vlan_parent_flags_clear_change_in_progress(vlp);
 	wakeup((caddr_t)vlp);
-	if (g_vlan->verbose) {
+	if (vlan_debug != 0) {
 		printf("%s%d: %s wakeup\n",
 		    ifnet_name(vlp_ifp), ifnet_unit(vlp_ifp), msg);
 	}
@@ -817,15 +803,12 @@ vlan_parent_create(struct ifnet * p, vlan_parent_ref * ret_vlp)
 	vlan_parent_ref     vlp;
 
 	*ret_vlp = NULL;
-	vlp = _MALLOC(sizeof(*vlp), M_VLAN, M_WAITOK | M_ZERO);
-	if (vlp == NULL) {
-		return ENOMEM;
-	}
+	vlp = kalloc_type(struct vlan_parent, Z_WAITOK | Z_ZERO | Z_NOFAIL);
 	error = siocgifdevmtu(p, &vlp->vlp_devmtu);
 	if (error != 0) {
 		printf("vlan_parent_create (%s%d): siocgifdevmtu failed, %d\n",
 		    ifnet_name(p), ifnet_unit(p), error);
-		FREE(vlp, M_VLAN);
+		kfree_type(struct vlan_parent, vlp);
 		return error;
 	}
 	LIST_INIT(&vlp->vlp_vlan_list);
@@ -921,15 +904,54 @@ vlan_parent_remove_vlan(__unused vlan_parent_ref vlp, ifvlan_ref ifv)
 static int
 vlan_clone_attach(void)
 {
-	int error;
-
-	error = if_clone_attach(&vlan_cloner);
-	if (error != 0) {
-		return error;
-	}
-	vlan_lock_init();
-	return 0;
+	return if_clone_attach(&vlan_cloner);
 }
+
+#if !XNU_TARGET_OS_OSX
+
+static const char *
+findsubstr(const char * haystack, const char * needle, size_t needle_len)
+{
+	const char *    scan;
+
+	for (scan = haystack; *scan != '\0'; scan++) {
+		if (strncmp(scan, needle, needle_len) == 0) {
+			return scan;
+		}
+	}
+	return NULL;
+}
+
+static inline bool
+my_os_release_type_matches(const char *variant, size_t variant_len)
+{
+	const char *found;
+	extern char osreleasetype[];
+
+	found = findsubstr(osreleasetype,
+	    variant,
+	    variant_len);
+	return found != NULL;
+}
+
+static inline bool
+vlan_is_enabled(void)
+{
+	const char darwin_osreleasetype[] = "Darwin";
+	const char restore_osreleasetype[] = "Restore";
+	const char nonui_osreleasetype[] = "NonUI";
+	if (vlan_enabled != 0) {
+		return true;
+	}
+	if (my_os_release_type_matches(darwin_osreleasetype, sizeof(darwin_osreleasetype) - 1) ||
+	    my_os_release_type_matches(restore_osreleasetype, sizeof(restore_osreleasetype) - 1) ||
+	    my_os_release_type_matches(nonui_osreleasetype, sizeof(nonui_osreleasetype) - 1)) {
+		vlan_enabled = 1;
+	}
+	return vlan_enabled != 0;
+}
+
+#endif /* !XNU_TARGET_OS_OSX */
 
 static int
 vlan_clone_create(struct if_clone *ifc, u_int32_t unit, __unused void *params)
@@ -939,14 +961,17 @@ vlan_clone_create(struct if_clone *ifc, u_int32_t unit, __unused void *params)
 	ifnet_t                                         ifp;
 	struct ifnet_init_eparams       vlan_init;
 
+#if !XNU_TARGET_OS_OSX
+	if (!vlan_is_enabled()) {
+		return EOPNOTSUPP;
+	}
+#endif /* !XNU_TARGET_OS_OSX */
+
 	error = vlan_globals_init();
 	if (error != 0) {
 		return error;
 	}
-	ifv = if_clone_softc_allocate(&vlan_cloner);
-	if (ifv == NULL) {
-		return ENOBUFS;
-	}
+	ifv = kalloc_type(struct ifvlan, Z_WAITOK_ZERO_NOFAIL);
 	ifv->ifv_retain_count = 1;
 	ifv->ifv_signature = IFV_SIGNATURE;
 	multicast_list_init(&ifv->ifv_multicast);
@@ -1186,30 +1211,20 @@ vlan_input(ifnet_t p, __unused protocol_family_t protocol,
 		switch (ifnet_type(p)) {
 		case IFT_ETHER:
 		case IFT_IEEE8023ADLAG:
-			if (m->m_len < ETHER_VLAN_ENCAP_LEN) {
-				m_freem(m);
-				return 0;
+			if (m->m_len < sizeof(struct ether_vlan_header)) {
+				goto done;
 			}
 			evl = (struct ether_vlan_header *)(void *)frame_header;
 			if (ntohs(evl->evl_proto) == ETHERTYPE_VLAN) {
 				/* don't allow VLAN within VLAN */
-				m_freem(m);
-				return 0;
+				goto done;
 			}
 			tag = EVL_VLANOFTAG(ntohs(evl->evl_tag));
-
-			/*
-			 * Restore the original ethertype.  We'll remove
-			 * the encapsulation after we've found the vlan
-			 * interface corresponding to the tag.
-			 */
-			evl->evl_encap_proto = evl->evl_proto;
 			break;
 		default:
 			printf("vlan_demux: unsupported if type %u",
 			    ifnet_type(p));
-			m_freem(m);
-			return 0;
+			goto done;
 		}
 	}
 	if (tag != 0) {
@@ -1217,8 +1232,7 @@ vlan_input(ifnet_t p, __unused protocol_family_t protocol,
 
 		if ((ifnet_eflags(p) & IFEF_VLAN) == 0) {
 			/* don't bother looking through the VLAN list */
-			m_freem(m);
-			return 0;
+			goto done;
 		}
 		vlan_lock();
 		ifv = vlan_lookup_parent_and_tag(p, tag);
@@ -1229,34 +1243,47 @@ vlan_input(ifnet_t p, __unused protocol_family_t protocol,
 		    || ifvlan_flags_ready(ifv) == 0
 		    || (ifnet_flags(ifp) & IFF_UP) == 0) {
 			vlan_unlock();
-			m_freem(m);
-			return 0;
+			goto done;
 		}
 		vlan_unlock();
 	}
 	if (soft_vlan) {
 		/*
-		 * Packet had an in-line encapsulation header;
-		 * remove it.  The original header has already
-		 * been fixed up above.
+		 * Remove the VLAN encapsulation header by shifting the
+		 * ethernet destination and source addresses over by the
+		 * encapsulation header length (4 bytes).
 		 */
+		struct {
+			uint8_t dhost[ETHER_ADDR_LEN];
+			uint8_t shost[ETHER_ADDR_LEN];
+		} save_ether;
+
+		assert(((char *)evl) == frame_header);
+		bcopy(evl, &save_ether, sizeof(save_ether));
+		bcopy(&save_ether, ((char *)evl) + ETHER_VLAN_ENCAP_LEN,
+		    sizeof(save_ether));
+		frame_header += ETHER_VLAN_ENCAP_LEN;
 		m->m_len -= ETHER_VLAN_ENCAP_LEN;
 		m->m_data += ETHER_VLAN_ENCAP_LEN;
 		m->m_pkthdr.len -= ETHER_VLAN_ENCAP_LEN;
 		m->m_pkthdr.csum_flags = 0; /* can't trust hardware checksum */
 	}
+	m->m_pkthdr.pkt_hdr = frame_header;
 	if (tag != 0) {
 		m->m_pkthdr.rcvif = ifp;
-		m->m_pkthdr.pkt_hdr = frame_header;
 		(void)ifnet_stat_increment_in(ifp, 1,
 		    m->m_pkthdr.len + ETHER_HDR_LEN, 0);
 		bpf_tap_in(ifp, DLT_EN10MB, m, frame_header, ETHER_HDR_LEN);
 		/* We found a vlan interface, inject on that interface. */
 		dlil_input_packet_list(ifp, m);
 	} else {
-		m->m_pkthdr.pkt_hdr = frame_header;
 		/* Send priority-tagged packet up through the parent */
 		dlil_input_packet_list(p, m);
+	}
+	m = NULL;
+done:
+	if (m != NULL) {
+		m_freem(m);
 	}
 	return 0;
 }
@@ -1368,6 +1395,11 @@ vlan_config(struct ifnet * ifp, struct ifnet * p, int tag)
 			vlan_lock();
 			goto signal_done;
 		}
+	}
+
+	/* inherit management restriction from parent by default */
+	if (IFNET_IS_MANAGEMENT(p)) {
+		ifnet_set_management(ifp, true);
 	}
 
 	/* configure parent to receive our multicast addresses */
@@ -1525,7 +1557,7 @@ vlan_unconfig(ifvlan_ref ifv, int need_to_wait)
 
 	/* remember whether we're the last VLAN on the parent */
 	if (LIST_NEXT(LIST_FIRST(&vlp->vlp_vlan_list), ifv_vlan_list) == NULL) {
-		if (g_vlan->verbose) {
+		if (vlan_debug != 0) {
 			printf("vlan_unconfig: last vlan on %s%d\n",
 			    ifnet_name(p), ifnet_unit(p));
 		}
@@ -1542,6 +1574,11 @@ vlan_unconfig(ifvlan_ref ifv, int need_to_wait)
 
 	/* Clear our MAC address. */
 	ifnet_set_lladdr_and_type(ifp, NULL, 0, IFT_L2VLAN);
+
+	/* if we enabled promiscuous mode, disable it */
+	if (ifvlan_flags_promisc(ifv)) {
+		(void)ifnet_set_promiscuous(p, 0);
+	}
 
 	/* detach VLAN "protocol" */
 	if (last_vlan) {
@@ -1597,36 +1634,55 @@ vlan_set_promisc(struct ifnet * ifp)
 {
 	int                         error = 0;
 	ifvlan_ref                  ifv;
+	bool                        is_promisc;
+	int                         val;
 	vlan_parent_ref             vlp;
+	struct ifnet *              vlp_ifp = NULL;
 
+	is_promisc = (ifnet_flags(ifp) & IFF_PROMISC) != 0;
+
+	/* determine whether promiscuous state needs to be changed */
 	vlan_lock();
 	ifv = ifnet_get_ifvlan_retained(ifp);
 	if (ifv == NULL) {
 		error = EBUSY;
 		goto done;
 	}
-
 	vlp = ifv->ifv_vlp;
-	if (vlp == NULL) {
+	if (vlp != NULL) {
+		vlp_ifp = vlp->vlp_ifp;
+	}
+	if (vlp_ifp == NULL) {
 		goto done;
 	}
-	if ((ifnet_flags(ifp) & IFF_PROMISC) != 0) {
-		if (!ifvlan_flags_promisc(ifv)) {
-			error = ifnet_set_promiscuous(vlp->vlp_ifp, 1);
-			if (error == 0) {
-				ifvlan_flags_set_promisc(ifv);
-			}
-		}
-	} else {
-		if (ifvlan_flags_promisc(ifv)) {
-			error = ifnet_set_promiscuous(vlp->vlp_ifp, 0);
-			if (error == 0) {
-				ifvlan_flags_clear_promisc(ifv);
-			}
-		}
+	if (is_promisc == ifvlan_flags_promisc(ifv)) {
+		/* already in the right state */
+		goto done;
 	}
+	vlan_unlock();
+
+	/* state needs to be changed, set promiscuous state on parent */
+	val = is_promisc ? 1 : 0;
+	error = ifnet_set_promiscuous(vlp_ifp, val);
+	if (error != 0) {
+		printf("%s: ifnet_set_promiscuous(%s, %d) failed %d\n",
+		    ifp->if_xname, vlp_ifp->if_xname, val, error);
+		goto unlocked_done;
+	}
+	printf("%s: ifnet_set_promiscuous(%s, %d) succeeded\n",
+	    ifp->if_xname, vlp_ifp->if_xname, val);
+
+	/* update our internal state */
+	vlan_lock();
+	if (is_promisc) {
+		ifvlan_flags_set_promisc(ifv);
+	} else {
+		ifvlan_flags_clear_promisc(ifv);
+	}
+
 done:
 	vlan_unlock();
+unlocked_done:
 	if (ifv != NULL) {
 		ifvlan_release(ifv);
 	}
@@ -2117,6 +2173,13 @@ __private_extern__ int
 vlan_family_init(void)
 {
 	int error = 0;
+
+#if !XNU_TARGET_OS_OSX
+#if (DEVELOPMENT || DEBUG)
+	/* check whether "vlan" boot-arg is enabled */
+	(void)PE_parse_boot_argn("vlan", &vlan_enabled, sizeof(vlan_enabled));
+#endif /* DEVELOPMENT || DEBUG */
+#endif /* !XNU_TARGET_OS_OSX */
 
 	error = proto_register_plumber(PF_INET, IFNET_FAMILY_VLAN,
 	    vlan_attach_inet, vlan_detach_inet);

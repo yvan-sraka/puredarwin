@@ -27,7 +27,6 @@
  */
 
 #include <i386/machine_routines.h>
-#include <i386/io_map_entries.h>
 #include <i386/cpuid.h>
 #include <i386/fpu.h>
 #include <mach/processor.h>
@@ -87,7 +86,7 @@ extern uint64_t panic_restart_timeout;
 
 boolean_t virtualized = FALSE;
 
-decl_simple_lock_data(static, ml_timer_evaluation_slock);
+static SIMPLE_LOCK_DECLARE(ml_timer_evaluation_slock, 0);
 uint32_t ml_timer_eager_evaluations;
 uint64_t ml_timer_eager_evaluation_max;
 static boolean_t ml_timer_evaluation_in_progress = FALSE;
@@ -106,17 +105,25 @@ ml_io_map(
 	vm_offset_t phys_addr,
 	vm_size_t size)
 {
-	return io_map(phys_addr, size, VM_WIMG_IO);
+	return io_map(phys_addr, size, VM_WIMG_IO, VM_PROT_DEFAULT, false);
 }
 
-/* boot memory allocation */
 vm_offset_t
-ml_static_malloc(
-	__unused vm_size_t size)
+ml_io_map_wcomb(
+	vm_offset_t phys_addr,
+	vm_size_t size)
 {
-	return (vm_offset_t)NULL;
+	return io_map(phys_addr, size, VM_WIMG_WCOMB, VM_PROT_DEFAULT, false);
 }
 
+vm_offset_t
+ml_io_map_unmappable(
+	vm_offset_t             phys_addr,
+	vm_size_t               size,
+	unsigned int            flags)
+{
+	return io_map(phys_addr, size, flags, VM_PROT_DEFAULT, true);
+}
 
 void
 ml_get_bouncepool_info(vm_offset_t *phys_addr, vm_size_t *size)
@@ -141,7 +148,7 @@ vm_offset_t
 ml_static_slide(
 	vm_offset_t vaddr)
 {
-	return VM_KERNEL_SLIDE(vaddr);
+	return vaddr + vm_kernel_slide;
 }
 
 /*
@@ -184,7 +191,7 @@ vm_offset_t
 ml_static_unslide(
 	vm_offset_t vaddr)
 {
-	return VM_KERNEL_UNSLIDE(vaddr);
+	return vaddr - vm_kernel_slide;
 }
 
 /*
@@ -224,10 +231,6 @@ ml_static_mfree(
 
 		pmap_remove(kernel_pmap, vaddr_cur, vaddr_cur + map_size);
 		while (map_size > 0) {
-			if (++kernel_pmap->stats.resident_count > kernel_pmap->stats.resident_max) {
-				kernel_pmap->stats.resident_max = kernel_pmap->stats.resident_count;
-			}
-
 			assert(pmap_valid_page(ppn));
 			if (IS_MANAGED_PAGE(ppn)) {
 				vm_page_create(ppn, (ppn + 1));
@@ -534,11 +537,6 @@ register_cpu(
 	 */
 	this_cpu_datap->cpu_phys_number = lapic_id;
 
-	this_cpu_datap->cpu_console_buf = console_cpu_alloc(boot_cpu);
-	if (this_cpu_datap->cpu_console_buf == NULL) {
-		goto failed;
-	}
-
 #if KPC
 	if (kpc_register_cpu(this_cpu_datap) != TRUE) {
 		goto failed;
@@ -562,7 +560,6 @@ register_cpu(
 	return KERN_SUCCESS;
 
 failed:
-	console_cpu_free(this_cpu_datap->cpu_console_buf);
 #if KPC
 	kpc_unregister_cpu(this_cpu_datap);
 #endif /* KPC */
@@ -607,7 +604,7 @@ ml_processor_register(
 	cpunum = ml_get_cpuid( lapic_id );
 
 	if (cpunum == 0xFFFFFFFF) { /* never heard of it? */
-		panic( "trying to start invalid/unregistered CPU %d\n", lapic_id );
+		panic( "trying to start invalid/unregistered CPU %d", lapic_id );
 	}
 
 	this_cpu_datap = cpu_datap(cpunum);
@@ -630,7 +627,7 @@ ml_processor_register(
 
 
 void
-ml_cpu_get_info(ml_cpu_info_t *cpu_infop)
+ml_cpu_get_info_type(ml_cpu_info_t *cpu_infop, cluster_type_t cluster_type __unused)
 {
 	boolean_t       os_supports_sse;
 	i386_cpu_info_t *cpuid_infop;
@@ -687,6 +684,57 @@ ml_cpu_get_info(ml_cpu_info_t *cpu_infop)
 		cpu_infop->l3_settings = 0;
 		cpu_infop->l3_cache_size = 0xFFFFFFFF;
 	}
+}
+
+/*
+ *	Routine:        ml_cpu_get_info
+ *	Function: Fill out the ml_cpu_info_t structure with parameters associated
+ *	with the boot cluster.
+ */
+void
+ml_cpu_get_info(ml_cpu_info_t * ml_cpu_info)
+{
+	ml_cpu_get_info_type(ml_cpu_info, CLUSTER_TYPE_SMP);
+}
+
+unsigned int
+ml_get_cpu_number_type(cluster_type_t cluster_type __unused, bool logical, bool available)
+{
+	/*
+	 * At present no supported x86 system features more than 1 CPU type. Because
+	 * of this, the cluster_type parameter is ignored.
+	 */
+	if (logical && available) {
+		return machine_info.logical_cpu;
+	} else if (logical && !available) {
+		return machine_info.logical_cpu_max;
+	} else if (!logical && available) {
+		return machine_info.physical_cpu;
+	} else {
+		return machine_info.physical_cpu_max;
+	}
+}
+
+void
+ml_get_cluster_type_name(cluster_type_t cluster_type __unused, char *name, size_t name_size)
+{
+	strlcpy(name, "Standard", name_size);
+}
+
+unsigned int
+ml_get_cluster_number_type(cluster_type_t cluster_type __unused)
+{
+	/*
+	 * At present no supported x86 system has more than 1 CPU type and multiple
+	 * clusters.
+	 */
+	return 1;
+}
+
+unsigned int
+ml_get_cpu_types(void)
+{
+	return 1 << CLUSTER_TYPE_SMP;
 }
 
 int
@@ -826,7 +874,7 @@ ml_get_timebase_entropy(void)
  *	Routine:        ml_init_lock_timeout
  *	Function:
  */
-void
+static void __startup_func
 ml_init_lock_timeout(void)
 {
 	uint64_t        abstime;
@@ -867,27 +915,27 @@ ml_init_lock_timeout(void)
 	}
 
 #if DEVELOPMENT || DEBUG
-	reportphyreaddelayabs = LockTimeOut >> 1;
+	report_phy_read_delay = LockTimeOut >> 1;
 #endif
 	if (PE_parse_boot_argn("phyreadmaxus", &slto, sizeof(slto))) {
 		default_timeout_ns = slto * NSEC_PER_USEC;
 		nanoseconds_to_absolutetime(default_timeout_ns, &abstime);
-		reportphyreaddelayabs = abstime;
+		report_phy_read_delay = abstime;
 	}
 
 	if (PE_parse_boot_argn("phywritemaxus", &slto, sizeof(slto))) {
 		nanoseconds_to_absolutetime((uint64_t)slto * NSEC_PER_USEC, &abstime);
-		reportphywritedelayabs = abstime;
+		report_phy_write_delay = abstime;
 	}
 
 	if (PE_parse_boot_argn("tracephyreadus", &slto, sizeof(slto))) {
 		nanoseconds_to_absolutetime((uint64_t)slto * NSEC_PER_USEC, &abstime);
-		tracephyreaddelayabs = abstime;
+		trace_phy_read_delay = abstime;
 	}
 
 	if (PE_parse_boot_argn("tracephywriteus", &slto, sizeof(slto))) {
 		nanoseconds_to_absolutetime((uint64_t)slto * NSEC_PER_USEC, &abstime);
-		tracephywritedelayabs = abstime;
+		trace_phy_write_delay = abstime;
 	}
 
 	if (PE_parse_boot_argn("mtxspin", &mtxspin, sizeof(mtxspin))) {
@@ -918,39 +966,39 @@ ml_init_lock_timeout(void)
 		if (!PE_parse_boot_argn("vti", &vti, sizeof(vti))) {
 			vti = 6;
 		}
-		printf("Timeouts adjusted for virtualization (<<%d)\n", vti);
-		kprintf("Timeouts adjusted for virtualization (<<%d):\n", vti);
+
 #define VIRTUAL_TIMEOUT_INFLATE_ABS(_timeout)              \
 MACRO_BEGIN                                                \
-	kprintf("%24s: 0x%016llx ", #_timeout, _timeout);      \
 	_timeout = virtual_timeout_inflate_abs(vti, _timeout); \
-	kprintf("-> 0x%016llx\n",  _timeout);                  \
 MACRO_END
 
 #define VIRTUAL_TIMEOUT_INFLATE_TSC(_timeout)              \
 MACRO_BEGIN                                                \
-	kprintf("%24s: 0x%016llx ", #_timeout, _timeout);      \
 	_timeout = virtual_timeout_inflate_tsc(vti, _timeout); \
-	kprintf("-> 0x%016llx\n",  _timeout);                  \
 MACRO_END
 #define VIRTUAL_TIMEOUT_INFLATE_US(_timeout)               \
 MACRO_BEGIN                                                \
-	kprintf("%24s:         0x%08x ", #_timeout, _timeout); \
 	_timeout = virtual_timeout_inflate_us(vti, _timeout);  \
-	kprintf("-> 0x%08x\n",  _timeout);                     \
 MACRO_END
+		/*
+		 * These timeout values are inflated because they cause
+		 * the kernel to panic when they expire.
+		 * (Needed when running as a guest VM as the host OS
+		 * may not always schedule vcpu threads in time to
+		 * meet the deadline implied by the narrower time
+		 * window used on hardware.)
+		 */
 		VIRTUAL_TIMEOUT_INFLATE_US(LockTimeOutUsec);
 		VIRTUAL_TIMEOUT_INFLATE_ABS(LockTimeOut);
 		VIRTUAL_TIMEOUT_INFLATE_TSC(LockTimeOutTSC);
 		VIRTUAL_TIMEOUT_INFLATE_ABS(TLBTimeOut);
-		VIRTUAL_TIMEOUT_INFLATE_ABS(MutexSpin);
-		VIRTUAL_TIMEOUT_INFLATE_ABS(low_MutexSpin);
-		VIRTUAL_TIMEOUT_INFLATE_ABS(reportphyreaddelayabs);
+		VIRTUAL_TIMEOUT_INFLATE_ABS(report_phy_read_delay);
+		VIRTUAL_TIMEOUT_INFLATE_TSC(lock_panic_timeout);
 	}
 
 	interrupt_latency_tracker_setup();
-	simple_lock_init(&ml_timer_evaluation_slock, 0);
 }
+STARTUP(TIMEOUTS, STARTUP_RANK_MIDDLE, ml_init_lock_timeout);
 
 /*
  * Threshold above which we should attempt to block
@@ -991,6 +1039,12 @@ ml_cpu_up(void)
 	return;
 }
 
+void
+ml_cpu_up_update_counts(__unused int cpu_id)
+{
+	return;
+}
+
 /*
  * This is called from the machine-independent layer
  * to perform machine-dependent info updates.
@@ -1003,19 +1057,12 @@ ml_cpu_down(void)
 	return;
 }
 
-/*
- * The following are required for parts of the kernel
- * that cannot resolve these functions as inlines:
- */
-extern thread_t current_act(void) __attribute__((const));
-thread_t
-current_act(void)
+void
+ml_cpu_down_update_counts(__unused int cpu_id)
 {
-	return current_thread_fast();
+	return;
 }
 
-#undef current_thread
-extern thread_t current_thread(void) __attribute__((const));
 thread_t
 current_thread(void)
 {
@@ -1108,6 +1155,20 @@ ml_stack_size(void)
 }
 #endif
 
+#if CONFIG_KCOV
+kcov_cpu_data_t *
+current_kcov_data(void)
+{
+	return &current_cpu_datap()->cpu_kcov_data;
+}
+
+kcov_cpu_data_t *
+cpu_kcov_data(int cpuid)
+{
+	return &cpu_datap(cpuid)->cpu_kcov_data;
+}
+#endif /* CONFIG_KCOV */
+
 void
 kernel_preempt_check(void)
 {
@@ -1137,7 +1198,9 @@ kernel_preempt_check(void)
 boolean_t
 machine_timeout_suspended(void)
 {
-	return pmap_tlb_flush_timeout || spinlock_timed_out || panic_active() || mp_recent_debugger_activity() || ml_recent_wake();
+	return pmap_tlb_flush_timeout || lck_spinlock_timeout_in_progress ||
+	       panic_active() || mp_recent_debugger_activity() ||
+	       ml_recent_wake();
 }
 
 /* Eagerly evaluate all pending timer and thread callouts
@@ -1165,12 +1228,6 @@ boolean_t
 ml_timer_forced_evaluation(void)
 {
 	return ml_timer_evaluation_in_progress;
-}
-
-uint64_t
-ml_energy_stat(__unused thread_t t)
-{
-	return 0;
 }
 
 void
@@ -1232,7 +1289,7 @@ machine_lockdown(void)
 }
 
 bool
-ml_cpu_can_exit(__unused int cpu_id)
+ml_cpu_can_exit(__unused int cpu_id, __unused processor_reason_t reason)
 {
 	return true;
 }
@@ -1258,11 +1315,34 @@ ml_cpu_end_loop(void)
 }
 
 size_t
-ml_get_vm_reserved_regions(bool vm_is64bit, struct vm_reserved_region **regions)
+ml_get_vm_reserved_regions(bool vm_is64bit, const struct vm_reserved_region **regions)
 {
 #pragma unused(vm_is64bit)
 	assert(regions != NULL);
 
 	*regions = NULL;
 	return 0;
+}
+
+void
+ml_cpu_power_enable(__unused int cpu_id)
+{
+}
+
+void
+ml_cpu_power_disable(__unused int cpu_id)
+{
+}
+
+int
+ml_page_protection_type(void)
+{
+	return 0; // not supported on x86
+}
+
+bool
+ml_addr_in_non_xnu_stack(__unused uintptr_t addr)
+{
+	/* There are no non-XNU stacks on x86 systems. */
+	return false;
 }

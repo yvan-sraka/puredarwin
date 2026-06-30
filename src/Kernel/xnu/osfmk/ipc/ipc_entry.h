@@ -72,7 +72,7 @@
 #include <mach/kern_return.h>
 
 #include <kern/kern_types.h>
-#include <kern/zalloc.h>
+#include <kern/kalloc.h>
 
 #include <ipc/ipc_types.h>
 
@@ -109,18 +109,22 @@
 #endif
 
 struct ipc_entry {
-	struct ipc_object  *XNU_PTRAUTH_SIGNED_PTR("ipc_entry.ie_object") ie_object;
+	union {
+		struct ipc_object *XNU_PTRAUTH_SIGNED_PTR("ipc_entry.ie_object") ie_object;
+		struct ipc_object *XNU_PTRAUTH_SIGNED_PTR("ipc_entry.ie_object") volatile ie_volatile_object;
+	};
 	ipc_entry_bits_t    ie_bits;
 	uint32_t            ie_dist  : IPC_ENTRY_DIST_BITS;
 	mach_port_index_t   ie_index : IPC_ENTRY_INDEX_BITS;
 	union {
-		mach_port_index_t next;         /* next in freelist, or...  */
-		ipc_table_index_t request;      /* dead name request notify */
-	} index;
+		mach_port_index_t ie_next;         /* next in freelist, or...  */
+		ipc_table_index_t ie_request;      /* dead name request notify */
+	};
 };
 
-#define ie_request      index.request
-#define ie_next         index.next
+#define IPC_ENTRY_TABLE_MIN     32
+#define IPC_ENTRY_TABLE_PERIOD  16
+KALLOC_ARRAY_TYPE_DECL(ipc_entry_table, struct ipc_entry);
 
 #define IE_REQ_NONE             0               /* no request */
 
@@ -219,6 +223,8 @@ ipc_entry_gen_rolled(
  * Exported interfaces
  */
 
+extern unsigned int ipc_entry_table_count_max(void) __pure2;
+
 /* Search for entry in a space by name */
 extern ipc_entry_t ipc_entry_lookup(
 	ipc_space_t             space,
@@ -232,12 +238,14 @@ extern kern_return_t ipc_entries_hold(
 /* claim and initialize a held entry in a locked space */
 extern kern_return_t ipc_entry_claim(
 	ipc_space_t             space,
+	ipc_object_t            object,
 	mach_port_name_t        *namep,
 	ipc_entry_t             *entryp);
 
 /* Allocate an entry in a space, growing the space if necessary */
 extern kern_return_t ipc_entry_alloc(
 	ipc_space_t             space,
+	ipc_object_t            object,
 	mach_port_name_t        *namep,
 	ipc_entry_t             *entryp);
 
@@ -250,6 +258,7 @@ extern kern_return_t ipc_entry_alloc_name(
 /* Deallocate an entry from a space */
 extern void ipc_entry_dealloc(
 	ipc_space_t             space,
+	ipc_object_t            object,
 	mach_port_name_t        name,
 	ipc_entry_t             entry);
 

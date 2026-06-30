@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2004-2020 Apple Inc. All rights reserved.
+ * Copyright (c) 2004-2022 Apple Inc. All rights reserved.
  *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
  *
@@ -79,6 +79,10 @@
 #include <security/mac_framework.h>
 #endif
 
+#if SKYWALK
+#include <skywalk/os_skywalk_private.h>
+#include <skywalk/nexus/netif/nx_netif.h>
+#endif /* SKYWALK */
 
 #undef ifnet_allocate
 errno_t ifnet_allocate(const struct ifnet_init_params *init,
@@ -113,10 +117,13 @@ static errno_t ifnet_awdl_check_eflags(ifnet_t, u_int32_t *, u_int32_t *);
 static void
 ifnet_kpi_free(ifnet_t ifp)
 {
-	ifnet_detached_func detach_func = ifp->if_kpi_storage;
+	if ((ifp->if_refflags & IFRF_EMBRYONIC) == 0) {
+		ifnet_detached_func detach_func;
 
-	if (detach_func != NULL) {
-		detach_func(ifp);
+		detach_func = ifp->if_detach;
+		if (detach_func != NULL) {
+			(*detach_func)(ifp);
+		}
 	}
 
 	ifnet_dispose(ifp);
@@ -171,10 +178,35 @@ ifnet_allocate(const struct ifnet_init_params *init, ifnet_t *ifp)
 	return ifnet_allocate_common(init, ifp, false);
 }
 
+static void
+ifnet_set_broadcast_addr(ifnet_t ifp, const void * broadcast_addr,
+    u_int32_t broadcast_len)
+{
+	if (broadcast_len == 0 || broadcast_addr == NULL) {
+		/* no broadcast address */
+		bzero(&ifp->if_broadcast, sizeof(ifp->if_broadcast));
+	} else if (broadcast_len > sizeof(ifp->if_broadcast.u.buffer)) {
+		ifp->if_broadcast.u.ptr
+		        = (u_char *)kalloc_data(broadcast_len,
+		    Z_WAITOK | Z_NOFAIL);
+		bcopy(broadcast_addr,
+		    ifp->if_broadcast.u.ptr,
+		    broadcast_len);
+	} else {
+		bcopy(broadcast_addr,
+		    ifp->if_broadcast.u.buffer,
+		    broadcast_len);
+	}
+	ifp->if_broadcast.length = broadcast_len;
+}
+
 errno_t
 ifnet_allocate_extended(const struct ifnet_init_eparams *einit0,
     ifnet_t *interface)
 {
+#if SKYWALK
+	ifnet_start_func ostart = NULL;
+#endif /* SKYWALK */
 	struct ifnet_init_eparams einit;
 	struct ifnet *ifp = NULL;
 	char if_xname[IFXNAMSIZ] = {0};
@@ -193,8 +225,28 @@ ifnet_allocate_extended(const struct ifnet_init_eparams *einit0,
 		return EINVAL;
 	}
 
+#if SKYWALK
+	/* headroom must be a multiple of 8 bytes */
+	if ((einit.tx_headroom & 0x7) != 0) {
+		return EINVAL;
+	}
+	if ((einit.flags & IFNET_INIT_SKYWALK_NATIVE) == 0) {
+		/*
+		 * Currently Interface advisory reporting is supported only
+		 * for skywalk interface.
+		 */
+		if ((einit.flags & IFNET_INIT_IF_ADV) != 0) {
+			return EINVAL;
+		}
+	}
+#endif /* SKYWALK */
 
 	if (einit.flags & IFNET_INIT_LEGACY) {
+#if SKYWALK
+		if (einit.flags & IFNET_INIT_SKYWALK_NATIVE) {
+			return EINVAL;
+		}
+#endif /* SKYWALK */
 		if (einit.output == NULL ||
 		    (einit.flags & IFNET_INIT_INPUT_POLL)) {
 			return EINVAL;
@@ -206,6 +258,23 @@ ifnet_allocate_extended(const struct ifnet_init_eparams *einit0,
 		einit.input_poll = NULL;
 		einit.input_ctl = NULL;
 	} else {
+#if SKYWALK
+		/*
+		 * For native Skywalk drivers, steer all start requests
+		 * to ifp_if_start() until the netif device adapter is
+		 * fully activated, at which point we will point it to
+		 * nx_netif_doorbell().
+		 */
+		if (einit.flags & IFNET_INIT_SKYWALK_NATIVE) {
+			if (einit.start != NULL) {
+				return EINVAL;
+			}
+			/* override output start callback */
+			ostart = einit.start = ifp_if_start;
+		} else {
+			ostart = einit.start;
+		}
+#endif /* SKYWALK */
 		if (einit.start == NULL) {
 			return EINVAL;
 		}
@@ -284,7 +353,7 @@ ifnet_allocate_extended(const struct ifnet_init_eparams *einit0,
 		ifp->if_set_bpf_tap     = einit.set_bpf_tap;
 		ifp->if_free            = (einit.free != NULL) ? einit.free : ifnet_kpi_free;
 		ifp->if_event           = einit.event;
-		ifp->if_kpi_storage     = einit.detach;
+		ifp->if_detach          = einit.detach;
 
 		/* Initialize Network ID */
 		ifp->network_id_len     = 0;
@@ -393,44 +462,82 @@ ifnet_allocate_extended(const struct ifnet_init_eparams *einit0,
 		VERIFY(!(einit.flags & IFNET_INIT_INPUT_POLL) ||
 		    (ifp->if_input_poll != NULL && ifp->if_input_ctl != NULL));
 
-		if (einit.broadcast_len && einit.broadcast_addr) {
-			if (einit.broadcast_len >
-			    sizeof(ifp->if_broadcast.u.buffer)) {
-				MALLOC(ifp->if_broadcast.u.ptr, u_char *,
-				    einit.broadcast_len, M_IFADDR, M_NOWAIT);
-				if (ifp->if_broadcast.u.ptr == NULL) {
-					error = ENOMEM;
-				} else {
-					bcopy(einit.broadcast_addr,
-					    ifp->if_broadcast.u.ptr,
-					    einit.broadcast_len);
-				}
-			} else {
-				bcopy(einit.broadcast_addr,
-				    ifp->if_broadcast.u.buffer,
-				    einit.broadcast_len);
-			}
-			ifp->if_broadcast.length = einit.broadcast_len;
-		} else {
-			bzero(&ifp->if_broadcast, sizeof(ifp->if_broadcast));
-		}
+		ifnet_set_broadcast_addr(ifp, einit.broadcast_addr,
+		    einit.broadcast_len);
 
 		if_clear_xflags(ifp, -1);
+#if SKYWALK
+		ifp->if_tx_headroom = 0;
+		ifp->if_tx_trailer = 0;
+		ifp->if_rx_mit_ival = 0;
+		ifp->if_save_start = ostart;
+		if (einit.flags & IFNET_INIT_SKYWALK_NATIVE) {
+			VERIFY(ifp->if_eflags & IFEF_TXSTART);
+			VERIFY(!(einit.flags & IFNET_INIT_LEGACY));
+			if_set_eflags(ifp, IFEF_SKYWALK_NATIVE);
+			ifp->if_tx_headroom = einit.tx_headroom;
+			ifp->if_tx_trailer = einit.tx_trailer;
+			ifp->if_rx_mit_ival = einit.rx_mit_ival;
+			/*
+			 * For native Skywalk drivers, make sure packets
+			 * emitted by the BSD stack get dropped until the
+			 * interface is in service.  When the netif host
+			 * adapter is fully activated, we'll point it to
+			 * nx_netif_output().
+			 */
+			ifp->if_output = ifp_if_output;
+			/*
+			 * Override driver-supplied parameters
+			 * and force IFEF_ENQUEUE_MULTI?
+			 */
+			if (sk_netif_native_txmodel ==
+			    NETIF_NATIVE_TXMODEL_ENQUEUE_MULTI) {
+				einit.start_delay_qlen = sk_tx_delay_qlen;
+				einit.start_delay_timeout = sk_tx_delay_timeout;
+			}
+			/* netif comes with native interfaces */
+			VERIFY((ifp->if_xflags & IFXF_LEGACY) == 0);
+		} else if (!ifnet_needs_compat(ifp)) {
+			/*
+			 * If we're told not to plumb in netif compat
+			 * for this interface, set IFXF_NX_NOAUTO to
+			 * prevent DLIL from auto-attaching the nexus.
+			 */
+			einit.flags |= IFNET_INIT_NX_NOAUTO;
+			/* legacy (non-netif) interface */
+			if_set_xflags(ifp, IFXF_LEGACY);
+		}
+
+		ifp->if_save_output = ifp->if_output;
+		if ((einit.flags & IFNET_INIT_NX_NOAUTO) != 0) {
+			if_set_xflags(ifp, IFXF_NX_NOAUTO);
+		}
+		if ((einit.flags & IFNET_INIT_IF_ADV) != 0) {
+			if_set_eflags(ifp, IFEF_ADV_REPORT);
+		}
+#else /* !SKYWALK */
 		/* legacy interface */
 		if_set_xflags(ifp, IFXF_LEGACY);
+#endif /* !SKYWALK */
+
+		if ((ifp->if_snd = ifclassq_alloc()) == NULL) {
+			panic_plain("%s: ifp=%p couldn't allocate class queues",
+			    __func__, ifp);
+			/* NOTREACHED */
+		}
 
 		/*
 		 * output target queue delay is specified in millisecond
 		 * convert it to nanoseconds
 		 */
-		IFCQ_TARGET_QDELAY(&ifp->if_snd) =
+		IFCQ_TARGET_QDELAY(ifp->if_snd) =
 		    einit.output_target_qdelay * 1000 * 1000;
-		IFCQ_MAXLEN(&ifp->if_snd) = einit.sndq_maxlen;
+		IFCQ_MAXLEN(ifp->if_snd) = einit.sndq_maxlen;
 
 		ifnet_enqueue_multi_setup(ifp, einit.start_delay_qlen,
 		    einit.start_delay_timeout);
 
-		IFCQ_PKT_DROP_LIMIT(&ifp->if_snd) = IFCQ_DEFAULT_PKT_DROP_LIMIT;
+		IFCQ_PKT_DROP_LIMIT(ifp->if_snd) = IFCQ_DEFAULT_PKT_DROP_LIMIT;
 
 		/*
 		 * Set embryonic flag; this will be cleared
@@ -452,14 +559,12 @@ ifnet_allocate_extended(const struct ifnet_init_eparams *einit0,
 				net_api_stats.nas_ifnet_alloc_os_total);
 		}
 
-		if (error == 0) {
-			*interface = ifp;
-			// temporary - this should be done in dlil_if_acquire
-			ifnet_reference(ifp);
-		} else {
-			dlil_if_release(ifp);
-			*interface = NULL;
+		if (ifp->if_subfamily == IFNET_SUBFAMILY_MANAGEMENT) {
+			if_set_xflags(ifp, IFXF_MANAGEMENT);
+			if_management_interface_check_needed = true;
 		}
+
+		*interface = ifp;
 	}
 	return error;
 }
@@ -473,11 +578,6 @@ ifnet_reference(ifnet_t ifp)
 void
 ifnet_dispose(ifnet_t ifp)
 {
-	if (ifp->if_broadcast.length > sizeof(ifp->if_broadcast.u.buffer)) {
-		FREE(ifp->if_broadcast.u.ptr, M_IFADDR);
-		ifp->if_broadcast.u.ptr = NULL;
-	}
-
 	dlil_if_release(ifp);
 }
 
@@ -540,17 +640,30 @@ ifnet_index(ifnet_t interface)
 errno_t
 ifnet_set_flags(ifnet_t interface, u_int16_t new_flags, u_int16_t mask)
 {
+	bool set_IFF_UP;
+	bool change_IFF_UP;
 	uint16_t old_flags;
 
 	if (interface == NULL) {
 		return EINVAL;
 	}
+	set_IFF_UP = (new_flags & IFF_UP) != 0;
+	change_IFF_UP = (mask & IFF_UP) != 0;
+#if SKYWALK
+	if (set_IFF_UP && change_IFF_UP) {
+		/*
+		 * When a native skywalk interface is marked IFF_UP, ensure
+		 * the flowswitch is attached.
+		 */
+		ifnet_attach_native_flowswitch(interface);
+	}
+#endif /* SKYWALK */
 
 	ifnet_lock_exclusive(interface);
 
 	/* If we are modifying the up/down state, call if_updown */
-	if ((mask & IFF_UP) != 0) {
-		if_updown(interface, (new_flags & IFF_UP) == IFF_UP);
+	if (change_IFF_UP) {
+		if_updown(interface, set_IFF_UP);
 	}
 
 	old_flags = interface->if_flags;
@@ -703,13 +816,9 @@ ifnet_eflags(ifnet_t interface)
 errno_t
 ifnet_set_idle_flags_locked(ifnet_t ifp, u_int32_t new_flags, u_int32_t mask)
 {
-	int before, after;
-
 	if (ifp == NULL) {
 		return EINVAL;
 	}
-
-	LCK_MTX_ASSERT(rnh_lock, LCK_MTX_ASSERT_OWNED);
 	ifnet_lock_assert(ifp, IFNET_LCK_ASSERT_EXCLUSIVE);
 
 	/*
@@ -725,17 +834,7 @@ ifnet_set_idle_flags_locked(ifnet_t ifp, u_int32_t new_flags, u_int32_t mask)
 		ifp->if_idle_new_flags = ifp->if_idle_new_flags_mask = 0;
 	}
 
-	before = ifp->if_idle_flags;
 	ifp->if_idle_flags = (new_flags & mask) | (ifp->if_idle_flags & ~mask);
-	after = ifp->if_idle_flags;
-
-	if ((after - before) < 0 && ifp->if_idle_flags == 0 &&
-	    ifp->if_want_aggressive_drain != 0) {
-		ifp->if_want_aggressive_drain = 0;
-	} else if ((after - before) > 0 && ifp->if_want_aggressive_drain == 0) {
-		ifp->if_want_aggressive_drain++;
-	}
-
 	return 0;
 }
 
@@ -744,11 +843,9 @@ ifnet_set_idle_flags(ifnet_t ifp, u_int32_t new_flags, u_int32_t mask)
 {
 	errno_t err;
 
-	lck_mtx_lock(rnh_lock);
 	ifnet_lock_exclusive(ifp);
 	err = ifnet_set_idle_flags_locked(ifp, new_flags, mask);
 	ifnet_lock_done(ifp);
-	lck_mtx_unlock(rnh_lock);
 
 	return err;
 }
@@ -965,6 +1062,12 @@ ifnet_set_offload(ifnet_t interface, ifnet_offload_t offload)
 	ifnet_lock_exclusive(interface);
 	interface->if_hwassist = (offload & offload_mask);
 
+#if SKYWALK
+	/* preserve skywalk capability */
+	if ((interface->if_capabilities & IFCAP_SKYWALK) != 0) {
+		ifcaps |= IFCAP_SKYWALK;
+	}
+#endif /* SKYWALK */
 	/*
 	 * Hardware capable of partial checksum offload is
 	 * flexible enough to handle any transports utilizing
@@ -990,6 +1093,9 @@ ifnet_set_offload(ifnet_t interface, ifnet_offload_t offload)
 	}
 	if ((offload & IFNET_TSO_IPV6)) {
 		ifcaps |= IFCAP_TSO6;
+	}
+	if ((offload & IFNET_LRO)) {
+		ifcaps |= IFCAP_LRO;
 	}
 	if ((offload & IFNET_VLAN_MTU)) {
 		ifcaps |= IFCAP_VLAN_MTU;
@@ -1037,6 +1143,9 @@ ifnet_set_tso_mtu(ifnet_t interface, sa_family_t family, u_int32_t mtuLen)
 	if (interface == NULL || mtuLen < interface->if_mtu) {
 		return EINVAL;
 	}
+	if (mtuLen > IP_MAXPACKET) {
+		return EINVAL;
+	}
 
 	switch (family) {
 	case AF_INET:
@@ -1058,6 +1167,15 @@ ifnet_set_tso_mtu(ifnet_t interface, sa_family_t family, u_int32_t mtuLen)
 	default:
 		error = EPROTONOSUPPORT;
 		break;
+	}
+
+	if (error == 0) {
+		struct ifclassq *ifq = interface->if_snd;
+		ASSERT(ifq != NULL);
+		/* Inform all transmit queues about the new TSO MTU */
+		IFCQ_LOCK(ifq);
+		ifnet_update_sndq(ifq, CLASSQ_EV_LINK_MTU);
+		IFCQ_UNLOCK(ifq);
 	}
 
 	return error;
@@ -1381,7 +1499,7 @@ ifnet_set_output_bandwidths(struct ifnet *ifp, struct if_bandwidths *bw,
 
 	VERIFY(ifp != NULL && bw != NULL);
 
-	ifq = &ifp->if_snd;
+	ifq = ifp->if_snd;
 	if (!locked) {
 		IFCQ_LOCK(ifq);
 	}
@@ -1489,16 +1607,16 @@ ifnet_set_input_bandwidths(struct ifnet *ifp, struct if_bandwidths *bw)
 u_int64_t
 ifnet_output_linkrate(struct ifnet *ifp)
 {
-	struct ifclassq *ifq = &ifp->if_snd;
+	struct ifclassq *ifq = ifp->if_snd;
 	u_int64_t rate;
 
 	IFCQ_LOCK_ASSERT_HELD(ifq);
 
 	rate = ifp->if_output_bw.eff_bw;
 	if (IFCQ_TBR_IS_ENABLED(ifq)) {
-		u_int64_t tbr_rate = ifp->if_snd.ifcq_tbr.tbr_rate_raw;
+		u_int64_t tbr_rate = ifq->ifcq_tbr.tbr_rate_raw;
 		VERIFY(tbr_rate > 0);
-		rate = MIN(rate, ifp->if_snd.ifcq_tbr.tbr_rate_raw);
+		rate = MIN(rate, ifq->ifcq_tbr.tbr_rate_raw);
 	}
 
 	return rate;
@@ -1556,7 +1674,7 @@ ifnet_set_output_latencies(struct ifnet *ifp, struct if_latencies *lt,
 
 	VERIFY(ifp != NULL && lt != NULL);
 
-	ifq = &ifp->if_snd;
+	ifq = ifp->if_snd;
 	if (!locked) {
 		IFCQ_LOCK(ifq);
 	}
@@ -1645,6 +1763,13 @@ ifnet_set_poll_params(struct ifnet *ifp, struct ifnet_poll_params *p)
 		return ENXIO;
 	}
 
+#if SKYWALK
+	if (SKYWALK_CAPABLE(ifp)) {
+		err = netif_rxpoll_set_params(ifp, p, FALSE);
+		ifnet_decr_iorefcnt(ifp);
+		return err;
+	}
+#endif /* SKYWALK */
 	err = dlil_rxpoll_set_params(ifp, p, FALSE);
 
 	/* Release the io ref count */
@@ -1879,6 +2004,8 @@ ifnet_updown_delta(ifnet_t interface, struct timeval *updown_delta)
 	updown_delta->tv_sec = (time_t)net_uptime();
 	if (updown_delta->tv_sec > interface->if_data.ifi_lastupdown.tv_sec) {
 		updown_delta->tv_sec -= interface->if_data.ifi_lastupdown.tv_sec;
+	} else {
+		updown_delta->tv_sec = 0;
 	}
 	updown_delta->tv_usec = 0;
 
@@ -1902,7 +2029,7 @@ ifnet_get_address_list_family(ifnet_t interface, ifaddr_t **addresses,
     sa_family_t family)
 {
 	return ifnet_get_address_list_family_internal(interface, addresses,
-	           family, 0, M_NOWAIT, 0);
+	           family, 0, Z_WAITOK, 0);
 }
 
 errno_t
@@ -1910,7 +2037,7 @@ ifnet_get_inuse_address_list(ifnet_t interface, ifaddr_t **addresses)
 {
 	return addresses == NULL ? EINVAL :
 	       ifnet_get_address_list_family_internal(interface, addresses,
-	           0, 0, M_NOWAIT, 1);
+	           0, 0, Z_WAITOK, 1);
 }
 
 extern uint32_t tcp_find_anypcb_byaddr(struct ifaddr *ifa);
@@ -1966,8 +2093,7 @@ one:
 					IFA_UNLOCK(ifa);
 					continue;
 				}
-				MALLOC(ifal, struct ifnet_addr_list *,
-				    sizeof(*ifal), M_TEMP, how);
+				ifal = kalloc_type(struct ifnet_addr_list, how);
 				if (ifal == NULL) {
 					IFA_UNLOCK(ifa);
 					ifnet_lock_done(ifp);
@@ -1997,13 +2123,12 @@ one:
 		err = ENXIO;
 		goto done;
 	}
-	MALLOC(*addresses, ifaddr_t *, sizeof(ifaddr_t) * (count + 1),
-	    M_TEMP, how);
+
+	*addresses = kalloc_type(ifaddr_t, count + 1, how | Z_ZERO);
 	if (*addresses == NULL) {
 		err = ENOMEM;
 		goto done;
 	}
-	bzero(*addresses, sizeof(ifaddr_t) * (count + 1));
 
 done:
 	SLIST_FOREACH_SAFE(ifal, &ifal_head, ifal_le, ifal_tmp) {
@@ -2024,13 +2149,13 @@ done:
 		} else {
 			IFA_REMREF(ifal->ifal_ifa);
 		}
-		FREE(ifal, M_TEMP);
+		kfree_type(struct ifnet_addr_list, ifal);
 	}
 
 	VERIFY(err == 0 || *addresses == NULL);
 	if ((err == 0) && (count) && ((*addresses)[0] == NULL)) {
 		VERIFY(return_inuse_addrs == 1);
-		FREE(*addresses, M_TEMP);
+		kfree_type(ifaddr_t, count + 1, *addresses);
 		err = ENXIO;
 	}
 	return err;
@@ -2049,7 +2174,7 @@ ifnet_free_address_list(ifaddr_t *addresses)
 		IFA_REMREF(addresses[i]);
 	}
 
-	FREE(addresses, M_TEMP);
+	kfree_type(ifaddr_t, i + 1, addresses);
 }
 
 void *
@@ -2226,7 +2351,7 @@ ifnet_set_lladdr_internal(ifnet_t interface, const void *lladdr,
 		intf_event_enqueue_nwk_wq_entry(interface, NULL,
 		    INTF_EVENT_CODE_LLADDR_UPDATE);
 		dlil_post_msg(interface, KEV_DL_SUBCLASS,
-		    KEV_DL_LINK_ADDRESS_CHANGED, NULL, 0);
+		    KEV_DL_LINK_ADDRESS_CHANGED, NULL, 0, FALSE);
 	}
 
 	return error;
@@ -2313,8 +2438,7 @@ ifnet_get_multicast_list(ifnet_t ifp, ifmultiaddr_t **addresses)
 		cmax++;
 	}
 
-	MALLOC(*addresses, ifmultiaddr_t *, sizeof(ifmultiaddr_t) * (cmax + 1),
-	    M_TEMP, M_WAITOK);
+	*addresses = kalloc_type(ifmultiaddr_t, cmax + 1, Z_WAITOK);
 	if (*addresses == NULL) {
 		ifnet_lock_done(ifp);
 		return ENOMEM;
@@ -2347,7 +2471,7 @@ ifnet_free_multicast_list(ifmultiaddr_t *addresses)
 		ifmaddr_release(addresses[i]);
 	}
 
-	FREE(addresses, M_TEMP);
+	kfree_type(ifmultiaddr_t, i + 1, addresses);
 }
 
 errno_t
@@ -2431,8 +2555,7 @@ ifnet_list_get_common(ifnet_family_t family, boolean_t get_all, ifnet_t **list,
 	ifnet_head_lock_shared();
 	TAILQ_FOREACH(ifp, &ifnet_head, if_link) {
 		if (family == IFNET_FAMILY_ANY || ifp->if_family == family) {
-			MALLOC(ifl, struct ifnet_list *, sizeof(*ifl),
-			    M_TEMP, M_NOWAIT);
+			ifl = kalloc_type(struct ifnet_list, Z_NOWAIT);
 			if (ifl == NULL) {
 				ifnet_head_done();
 				err = ENOMEM;
@@ -2451,13 +2574,11 @@ ifnet_list_get_common(ifnet_family_t family, boolean_t get_all, ifnet_t **list,
 		goto done;
 	}
 
-	MALLOC(*list, ifnet_t *, sizeof(ifnet_t) * (cnt + 1),
-	    M_TEMP, M_NOWAIT);
+	*list = kalloc_type(ifnet_t, cnt + 1, Z_WAITOK | Z_ZERO);
 	if (*list == NULL) {
 		err = ENOMEM;
 		goto done;
 	}
-	bzero(*list, sizeof(ifnet_t) * (cnt + 1));
 	*count = cnt;
 
 done:
@@ -2468,7 +2589,7 @@ done:
 		} else {
 			ifnet_release(ifl->ifl_ifp);
 		}
-		FREE(ifl, M_TEMP);
+		kfree_type(struct ifnet_list, ifl);
 	}
 
 	return err;
@@ -2487,7 +2608,7 @@ ifnet_list_free(ifnet_t *interfaces)
 		ifnet_release(interfaces[i]);
 	}
 
-	FREE(interfaces, M_TEMP);
+	kfree_type(ifnet_t, i + 1, interfaces);
 }
 
 /*************************************************************************/
@@ -2781,17 +2902,9 @@ ifnet_clone_attach(struct ifnet_clone_params *cloner_params,
 		goto fail;
 	}
 
-	/* Make room for name string */
-	ifc = _MALLOC(sizeof(struct if_clone) + IFNAMSIZ + 1, M_CLONE,
-	    M_WAITOK | M_ZERO);
-	if (ifc == NULL) {
-		printf("%s: _MALLOC failed\n", __func__);
-		error = ENOBUFS;
-		goto fail;
-	}
-	strlcpy((char *)(ifc + 1), cloner_params->ifc_name, IFNAMSIZ + 1);
-	ifc->ifc_name = (char *)(ifc + 1);
-	ifc->ifc_namelen = namelen;
+	ifc = kalloc_type(struct if_clone, Z_WAITOK | Z_ZERO | Z_NOFAIL);
+	strlcpy(ifc->ifc_name, cloner_params->ifc_name, IFNAMSIZ + 1);
+	ifc->ifc_namelen = (uint8_t)namelen;
 	ifc->ifc_maxunit = IF_MAXUNIT;
 	ifc->ifc_create = cloner_params->ifc_create;
 	ifc->ifc_destroy = cloner_params->ifc_destroy;
@@ -2806,7 +2919,7 @@ ifnet_clone_attach(struct ifnet_clone_params *cloner_params,
 	return 0;
 fail:
 	if (ifc != NULL) {
-		FREE(ifc, M_CLONE);
+		kfree_type(struct if_clone, ifc);
 	}
 	return error;
 }
@@ -2817,7 +2930,7 @@ ifnet_clone_detach(if_clone_t ifcloner)
 	errno_t error = 0;
 	struct if_clone *ifc = ifcloner;
 
-	if (ifc == NULL || ifc->ifc_name == NULL) {
+	if (ifc == NULL) {
 		return EINVAL;
 	}
 
@@ -2829,7 +2942,7 @@ ifnet_clone_detach(if_clone_t ifcloner)
 
 	if_clone_detach(ifc);
 
-	FREE(ifc, M_CLONE);
+	kfree_type(struct if_clone, ifc);
 
 fail:
 	return error;
@@ -2861,18 +2974,28 @@ ifnet_get_local_ports_extended(ifnet_t ifp, protocol_family_t protocol,
 	/* bit string is long enough to hold 16-bit port values */
 	bzero(bitfield, bitstr_size(IP_PORTRANGE_SIZE));
 
+	/* no point in continuing if no address is assigned */
+	if (ifp != NULL && TAILQ_EMPTY(&ifp->if_addrhead)) {
+		return 0;
+	}
+
 	if_ports_used_update_wakeuuid(ifp);
 
+#if SKYWALK
+	if (netns_is_enabled()) {
+		netns_get_local_ports(ifp, protocol, flags, bitfield);
+	}
+#endif /* SKYWALK */
 
 	ifindex = (ifp != NULL) ? ifp->if_index : 0;
 
 	if (!(flags & IFNET_GET_LOCAL_PORTS_TCPONLY)) {
-		udp_get_ports_used(ifindex, protocol, flags,
+		udp_get_ports_used(ifp, protocol, flags,
 		    bitfield);
 	}
 
 	if (!(flags & IFNET_GET_LOCAL_PORTS_UDPONLY)) {
-		tcp_get_ports_used(ifindex, protocol, flags,
+		tcp_get_ports_used(ifp, protocol, flags,
 		    bitfield);
 	}
 
@@ -2949,13 +3072,13 @@ ifnet_notice_node_absence(ifnet_t ifp, struct sockaddr *sa)
 }
 
 errno_t
-ifnet_notice_master_elected(ifnet_t ifp)
+ifnet_notice_primary_elected(ifnet_t ifp)
 {
 	if (ifp == NULL) {
 		return EINVAL;
 	}
 
-	dlil_post_msg(ifp, KEV_DL_SUBCLASS, KEV_DL_MASTER_ELECTED, NULL, 0);
+	dlil_post_msg(ifp, KEV_DL_SUBCLASS, KEV_DL_PRIMARY_ELECTED, NULL, 0, FALSE);
 	return 0;
 }
 
@@ -3056,7 +3179,7 @@ ifnet_set_delegate(ifnet_t ifp, ifnet_t delegated_ifp)
 	}
 
 	/* Generate a kernel event */
-	dlil_post_msg(ifp, KEV_DL_SUBCLASS, KEV_DL_IFDELEGATE_CHANGED, NULL, 0);
+	dlil_post_msg(ifp, KEV_DL_SUBCLASS, KEV_DL_IFDELEGATE_CHANGED, NULL, 0, FALSE);
 
 done:
 	/* Release the io ref count */
@@ -3200,8 +3323,7 @@ ifnet_link_status_report(ifnet_t ifp, const void *buffer,
 	 * to store it.
 	 */
 	if (ifp->if_link_status == NULL) {
-		MALLOC(ifp->if_link_status, struct if_link_status *,
-		    sizeof(struct if_link_status), M_TEMP, M_ZERO);
+		ifp->if_link_status = kalloc_type(struct if_link_status, Z_ZERO);
 		if (ifp->if_link_status == NULL) {
 			err = ENOMEM;
 			goto done;
@@ -3373,7 +3495,7 @@ ifnet_get_unsent_bytes(ifnet_t interface, int64_t *unsent_bytes)
 	bytes = interface->if_sndbyte_unsent;
 
 	if (interface->if_eflags & IFEF_TXSTART) {
-		bytes += IFCQ_BYTES(&interface->if_snd);
+		bytes += IFCQ_BYTES(interface->if_snd);
 	}
 	*unsent_bytes = bytes;
 
@@ -3394,7 +3516,7 @@ ifnet_get_buffer_status(const ifnet_t ifp, ifnet_buffer_status_t *buf_status)
 	}
 
 	if (ifp->if_eflags & IFEF_TXSTART) {
-		buf_status->buf_interface = IFCQ_BYTES(&ifp->if_snd);
+		buf_status->buf_interface = IFCQ_BYTES(ifp->if_snd);
 	}
 
 	buf_status->buf_sndbuf = ((buf_status->buf_interface != 0) ||
@@ -3421,7 +3543,7 @@ ifnet_normalise_unsent_data(void)
 		}
 
 		if (ifp->if_sndbyte_total > 0 ||
-		    IFCQ_BYTES(&ifp->if_snd) > 0) {
+		    IFCQ_BYTES(ifp->if_snd) > 0) {
 			ifp->if_unsent_data_cnt++;
 		}
 
@@ -3449,18 +3571,4 @@ ifnet_get_low_power_mode(ifnet_t ifp, boolean_t *on)
 
 	*on = ((ifp->if_xflags & IFXF_LOW_POWER) != 0);
 	return 0;
-}
-
-/*************************************************************************/
-/* Interface advisory notifications                                      */
-/*************************************************************************/
-errno_t
-ifnet_interface_advisory_report(ifnet_t ifp,
-    const struct ifnet_interface_advisory *advisory)
-{
-
-#pragma unused(ifp)
-#pragma unused(advisory)
-	return ENOTSUP;
-
 }

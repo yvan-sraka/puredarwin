@@ -58,6 +58,7 @@ enum {
 	kIOPMRequestTypeSetIdleTimerPeriod          = 0x0F,
 	kIOPMRequestTypeIgnoreIdleTimer             = 0x10,
 	kIOPMRequestTypeQuiescePowerTree            = 0x11,
+	kIOPMRequestTypeDeferredActivityTickle      = 0x12,
 
 	/* Reply Types */
 	kIOPMRequestTypeReplyStart                  = 0x80,
@@ -329,6 +330,9 @@ private:
 	IOPMPowerStateIndex     OverrideMaxPowerState;
 	IOPMPowerStateIndex     DeviceUsablePowerState;
 
+// Thread to be run alongside DriverCallEntry to provide logging.
+	thread_call_t           DriverCallTimer;
+
 // Protected by ActivityLock - BEGIN
 	IOPMPowerStateIndex     ActivityTicklePowerState;
 	IOPMPowerStateIndex     AdvisoryTicklePowerState;
@@ -447,6 +451,7 @@ private:
 #define fTempClampCount             pwrMgt->TempClampCount
 #define fOverrideMaxPowerState      pwrMgt->OverrideMaxPowerState
 #define fDeviceUsablePowerState     pwrMgt->DeviceUsablePowerState
+#define fDriverCallTimer            pwrMgt->DriverCallTimer
 #define fActivityTicklePowerState   pwrMgt->ActivityTicklePowerState
 #define fAdvisoryTicklePowerState   pwrMgt->AdvisoryTicklePowerState
 #define fActivityTickleCount        pwrMgt->ActivityTickleCount
@@ -561,7 +566,6 @@ struct IOPMInterestContext {
 	IOPMPowerStateIndex     stateNumber;
 	IOPMPowerFlags          stateFlags;
 	IOPMPowerChangeFlags    changeFlags;
-	const char *            errorLog;
 	IOPMMessageFilter       messageFilter;
 };
 

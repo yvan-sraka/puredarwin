@@ -88,15 +88,21 @@
 #include <atm/atm_internal.h>
 #endif
 
-extern int psem_cache_purge_all(proc_t p);
-extern int pshm_cache_purge_all(proc_t p);
+#include <kern/kalloc.h>
+
+/* Max panic string length */
+#define kPanicStringMaxLen 1024
+
+extern int psem_cache_purge_all(void);
+extern int pshm_cache_purge_all(void);
+extern int pshm_cache_purge_uid(uid_t uid);
 extern void reset_osvariant_status(void);
 extern void reset_osreleasetype(void);
 
 int
 reboot(struct proc *p, struct reboot_args *uap, __unused int32_t *retval)
 {
-	char message[256];
+	char *message = NULL;
 	int error = 0;
 	size_t dummy = 0;
 #if CONFIG_MACF
@@ -104,8 +110,6 @@ reboot(struct proc *p, struct reboot_args *uap, __unused int32_t *retval)
 #endif
 
 	AUDIT_ARG(cmd, uap->opt);
-
-	message[0] = '\0';
 
 	if ((error = suser(kauth_cred_get(), &p->p_acflag))) {
 #if (DEVELOPMENT || DEBUG)
@@ -121,11 +125,15 @@ reboot(struct proc *p, struct reboot_args *uap, __unused int32_t *retval)
 	}
 
 	if (uap->opt & RB_PANIC && uap->msg != USER_ADDR_NULL) {
-		int copy_error = copyinstr(uap->msg, (void *)message, sizeof(message), (size_t *)&dummy);
+		message = (char *)kalloc_data(kPanicStringMaxLen, Z_WAITOK | Z_ZERO);
+		if (!message) {
+			return ENOMEM;
+		}
+		int copy_error = copyinstr(uap->msg, (void *)message, kPanicStringMaxLen, (size_t *)&dummy);
 		if (copy_error != 0 && copy_error != ENAMETOOLONG) {
-			strncpy(message, "user space RB_PANIC message copyin failed", sizeof(message) - 1);
+			strncpy(message, "user space RB_PANIC message copyin failed", kPanicStringMaxLen - 1);
 		} else {
-			message[sizeof(message) - 1] = '\0';
+			message[kPanicStringMaxLen - 1] = '\0';
 		}
 	}
 
@@ -136,9 +144,7 @@ reboot(struct proc *p, struct reboot_args *uap, __unused int32_t *retval)
 		goto skip_cred_check;
 	}
 #endif
-	if (error) {
-		return error;
-	}
+
 	my_cred = kauth_cred_proc_ref(p);
 	error = mac_system_check_reboot(my_cred, uap->opt);
 	kauth_cred_unref(&my_cred);
@@ -150,19 +156,18 @@ skip_cred_check:
 		OSBitOrAtomic(P_REBOOT, &p->p_flag);  /* No more signals for this proc */
 		error = reboot_kernel(uap->opt, message);
 	}
+
+	kfree_data(message, kPanicStringMaxLen);
 	return error;
 }
 
 extern void OSKextResetAfterUserspaceReboot(void);
 extern void zone_gc_drain(void);
+extern uint64_t pmap_release_pages_fast(void);
 
-int
-usrctl(struct proc *p, __unused struct usrctl_args *uap, __unused int32_t *retval)
+static int
+usrctl_full(void)
 {
-	if (p != initproc) {
-		return EPERM;
-	}
-
 	reset_osvariant_status();
 	reset_osreleasetype();
 
@@ -181,10 +186,44 @@ usrctl(struct proc *p, __unused struct usrctl_args *uap, __unused int32_t *retva
 #endif /* CONFIG_EXT_RESOLVER */
 
 	OSKextResetAfterUserspaceReboot();
-	int shm_error = pshm_cache_purge_all(p);
-	int sem_error = psem_cache_purge_all(p);
+	int shm_error = pshm_cache_purge_all();
+	int sem_error = psem_cache_purge_all();
 
 	zone_gc_drain();
+	pmap_release_pages_fast();
 
 	return shm_error != 0 ? shm_error : sem_error;
+}
+
+static int
+usrctl_logout(uid_t uid)
+{
+	int shm_error = pshm_cache_purge_uid(uid);
+	/*
+	 * Currently there is a requirement to purge some root-owned semaphores,
+	 * and no use-case for preserving any. Just purge all of them.
+	 */
+	int sem_error = psem_cache_purge_all();
+
+	/*
+	 * Until rdar://78965143, kern.willuserspacereboot is set when logout begins
+	 * so its effects need to be reset here, when logout completes.
+	 */
+	OSKextResetAfterUserspaceReboot();
+
+	return shm_error != 0 ? shm_error : sem_error;
+}
+
+int
+usrctl(struct proc *p, struct usrctl_args *uap, __unused int32_t *retval)
+{
+	if (p != initproc) {
+		return EPERM;
+	}
+
+	if (uap->flags == 0) {
+		return usrctl_full();
+	} else {
+		return usrctl_logout((uid_t)uap->flags);
+	}
 }

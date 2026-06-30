@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 1998-2020 Apple Inc. All rights reserved.
+ * Copyright (c) 1998-2021 Apple Inc. All rights reserved.
  *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
  *
@@ -39,6 +39,7 @@
 
 #include <IOKit/IOSubMemoryDescriptor.h>
 #include <IOKit/IOMultiMemoryDescriptor.h>
+#include <IOKit/IOBufferMemoryDescriptor.h>
 
 #include <IOKit/IOKitDebug.h>
 #include <IOKit/IOTimeStamp.h>
@@ -47,6 +48,7 @@
 
 #include "IOKitKernelInternal.h"
 
+#include <libkern/c++/OSAllocation.h>
 #include <libkern/c++/OSContainers.h>
 #include <libkern/c++/OSDictionary.h>
 #include <libkern/c++/OSArray.h>
@@ -73,6 +75,13 @@ __BEGIN_DECLS
 extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
 extern void ipc_port_release_send(ipc_port_t port);
 
+extern kern_return_t
+mach_memory_entry_ownership(
+	ipc_port_t      entry_port,
+	task_t          owner,
+	int             ledger_tag,
+	int             ledger_flags);
+
 __END_DECLS
 
 #define kIOMapperWaitSystem     ((IOMapper *) 1)
@@ -80,6 +89,10 @@ __END_DECLS
 static IOMapper * gIOSystemMapper = NULL;
 
 ppnum_t           gIOLastPage;
+
+enum {
+	kIOMapGuardSizeLarge = 65536
+};
 
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
 
@@ -158,7 +171,34 @@ struct ioGMDData {
 	//ioPLBlock fBlocks[1];
 };
 
-#define getDataP(osd)   ((ioGMDData *) (osd)->getBytesNoCopy())
+#pragma GCC visibility push(hidden)
+
+class _IOMemoryDescriptorMixedData : public OSObject
+{
+	OSDeclareDefaultStructors(_IOMemoryDescriptorMixedData);
+
+public:
+	static OSPtr<_IOMemoryDescriptorMixedData> withCapacity(size_t capacity);
+	bool initWithCapacity(size_t capacity);
+	virtual void free() APPLE_KEXT_OVERRIDE;
+
+	bool appendBytes(const void * bytes, size_t length);
+	bool setLength(size_t length);
+
+	const void * getBytes() const;
+	size_t getLength() const;
+
+private:
+	void freeMemory();
+
+	void *  _data = nullptr;
+	size_t  _length = 0;
+	size_t  _capacity = 0;
+};
+
+#pragma GCC visibility pop
+
+#define getDataP(osd)   ((ioGMDData *) (osd)->getBytes())
 #define getIOPLList(d)  ((ioPLBlock *) (void *)&(d->fPageList[d->fPageCnt]))
 #define getNumIOPL(osd, d)      \
     ((UInt)(((osd)->getLength() - ((char *) getIOPLList(d) - (char *) d)) / sizeof(ioPLBlock)))
@@ -202,7 +242,7 @@ device_close(
 {
 	IOMemoryDescriptorReserved * ref = (IOMemoryDescriptorReserved *) device_handle;
 
-	IODelete( ref, IOMemoryDescriptorReserved, 1 );
+	IOFreeType( ref, IOMemoryDescriptorReserved );
 
 	return kIOReturnSuccess;
 }
@@ -214,8 +254,13 @@ device_close(
 // This means that pointers are not passed and NULLs don't have to be
 // checked for as a NULL reference is illegal.
 static inline void
-getAddrLenForInd(mach_vm_address_t &addr, mach_vm_size_t &len, // Output variables
-    UInt32 type, IOGeneralMemoryDescriptor::Ranges r, UInt32 ind)
+getAddrLenForInd(
+	mach_vm_address_t                &addr,
+	mach_vm_size_t                   &len, // Output variables
+	UInt32                            type,
+	IOGeneralMemoryDescriptor::Ranges r,
+	UInt32                            ind,
+	task_t                            task __unused)
 {
 	assert(kIOMemoryTypeUIO == type
 	    || kIOMemoryTypeVirtual == type || kIOMemoryTypeVirtual64 == type
@@ -237,6 +282,11 @@ getAddrLenForInd(mach_vm_address_t &addr, mach_vm_size_t &len, // Output variabl
 		addr = cur.address;
 		len  = cur.length;
 	}
+#if CONFIG_PROB_GZALLOC
+	if (task == kernel_task) {
+		addr = pgz_decode(addr, len);
+	}
+#endif /* CONFIG_PROB_GZALLOC */
 }
 
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
@@ -324,6 +374,9 @@ static vm_prot_t
 vmProtForCacheMode(IOOptionBits cacheMode)
 {
 	assert(cacheMode < (sizeof(iomd_mem_types) / sizeof(iomd_mem_types[0])));
+	if (cacheMode >= (sizeof(iomd_mem_types) / sizeof(iomd_mem_types[0]))) {
+		cacheMode = kIODefaultCache;
+	}
 	vm_prot_t prot = 0;
 	SET_MAP_MEM(iomd_mem_types[cacheMode].object_type, prot);
 	return prot;
@@ -333,6 +386,9 @@ static unsigned int
 pagerFlagsForCacheMode(IOOptionBits cacheMode)
 {
 	assert(cacheMode < (sizeof(iomd_mem_types) / sizeof(iomd_mem_types[0])));
+	if (cacheMode >= (sizeof(iomd_mem_types) / sizeof(iomd_mem_types[0]))) {
+		cacheMode = kIODefaultCache;
+	}
 	if (cacheMode == kIODefaultCache) {
 		return -1U;
 	}
@@ -384,33 +440,24 @@ IOMemoryReference *
 IOGeneralMemoryDescriptor::memoryReferenceAlloc(uint32_t capacity, IOMemoryReference * realloc)
 {
 	IOMemoryReference * ref;
-	size_t              newSize, oldSize, copySize;
+	size_t              oldCapacity;
 
-	newSize = (sizeof(IOMemoryReference)
-	    - sizeof(ref->entries)
-	    + capacity * sizeof(ref->entries[0]));
-	ref = (typeof(ref))IOMalloc(newSize);
 	if (realloc) {
-		oldSize = (sizeof(IOMemoryReference)
-		    - sizeof(realloc->entries)
-		    + realloc->capacity * sizeof(realloc->entries[0]));
-		copySize = oldSize;
-		if (copySize > newSize) {
-			copySize = newSize;
-		}
-		if (ref) {
-			bcopy(realloc, ref, copySize);
-		}
-		IOFree(realloc, oldSize);
-	} else if (ref) {
-		bzero(ref, sizeof(*ref));
-		ref->refCount = 1;
-		OSIncrementAtomic(&gIOMemoryReferenceCount);
+		oldCapacity = realloc->capacity;
+	} else {
+		oldCapacity = 0;
 	}
-	if (!ref) {
-		return NULL;
+
+	// Use the kalloc API instead of manually handling the reallocation
+	ref = krealloc_type(IOMemoryReference, IOMemoryEntry,
+	    oldCapacity, capacity, realloc, Z_WAITOK_ZERO);
+	if (ref) {
+		if (oldCapacity == 0) {
+			ref->refCount = 1;
+			OSIncrementAtomic(&gIOMemoryReferenceCount);
+		}
+		ref->capacity = capacity;
 	}
-	ref->capacity = capacity;
 	return ref;
 }
 
@@ -418,7 +465,6 @@ void
 IOGeneralMemoryDescriptor::memoryReferenceFree(IOMemoryReference * ref)
 {
 	IOMemoryEntry * entries;
-	size_t          size;
 
 	if (ref->mapRef) {
 		memoryReferenceFree(ref->mapRef);
@@ -430,10 +476,7 @@ IOGeneralMemoryDescriptor::memoryReferenceFree(IOMemoryReference * ref)
 		entries--;
 		ipc_port_release_send(entries->entry);
 	}
-	size = (sizeof(IOMemoryReference)
-	    - sizeof(ref->entries)
-	    + ref->capacity * sizeof(ref->entries[0]));
-	IOFree(ref, size);
+	kfree_type(IOMemoryReference, IOMemoryEntry, ref->capacity, ref);
 
 	OSDecrementAtomic(&gIOMemoryReferenceCount);
 }
@@ -457,7 +500,7 @@ IOGeneralMemoryDescriptor::memoryReferenceCreate(
 	kern_return_t        err;
 	IOMemoryReference *  ref;
 	IOMemoryEntry *      entries;
-	IOMemoryEntry *      cloneEntries;
+	IOMemoryEntry *      cloneEntries = NULL;
 	vm_map_t             map;
 	ipc_port_t           entry, cloneEntry;
 	vm_prot_t            prot;
@@ -490,8 +533,16 @@ IOGeneralMemoryDescriptor::memoryReferenceCreate(
 
 	offset = 0;
 	rangeIdx = 0;
+	remain = _length;
 	if (_task) {
-		getAddrLenForInd(nextAddr, nextLen, type, _ranges, rangeIdx);
+		getAddrLenForInd(nextAddr, nextLen, type, _ranges, rangeIdx, _task);
+
+		// account for IOBMD setLength(), use its capacity as length
+		IOBufferMemoryDescriptor * bmd;
+		if ((bmd = OSDynamicCast(IOBufferMemoryDescriptor, this))) {
+			nextLen = bmd->getCapacity();
+			remain  = nextLen;
+		}
 	} else {
 		nextAddr = getPhysicalSegment(offset, &physLen, kIOMemoryMapperNone);
 		nextLen = physLen;
@@ -576,7 +627,6 @@ IOGeneralMemoryDescriptor::memoryReferenceCreate(
 		}
 		DEBUG4K_IOKIT("map %p _length 0x%llx prot 0x%x\n", map, (uint64_t)_length, prot);
 
-		remain = _length;
 		while (remain) {
 			srcAddr  = nextAddr;
 			srcLen   = nextLen;
@@ -584,7 +634,7 @@ IOGeneralMemoryDescriptor::memoryReferenceCreate(
 			nextLen  = 0;
 			// coalesce addr range
 			for (++rangeIdx; rangeIdx < _rangesCount; rangeIdx++) {
-				getAddrLenForInd(nextAddr, nextLen, type, _ranges, rangeIdx);
+				getAddrLenForInd(nextAddr, nextLen, type, _ranges, rangeIdx, _task);
 				if ((srcAddr + srcLen) != nextAddr) {
 					break;
 				}
@@ -761,27 +811,85 @@ IOGeneralMemoryDescriptor::memoryReferenceCreate(
 	return err;
 }
 
+static mach_vm_size_t
+IOMemoryDescriptorMapGuardSize(vm_map_t map, IOOptionBits options)
+{
+	switch (kIOMapGuardedMask & options) {
+	default:
+	case kIOMapGuardedSmall:
+		return vm_map_page_size(map);
+	case kIOMapGuardedLarge:
+		assert(0 == (kIOMapGuardSizeLarge & vm_map_page_mask(map)));
+		return kIOMapGuardSizeLarge;
+	}
+	;
+}
+
+static kern_return_t
+IOMemoryDescriptorMapDealloc(IOOptionBits options, vm_map_t map,
+    vm_map_offset_t addr, mach_vm_size_t size)
+{
+	kern_return_t   kr;
+	vm_map_offset_t actualAddr;
+	mach_vm_size_t  actualSize;
+
+	actualAddr = vm_map_trunc_page(addr, vm_map_page_mask(map));
+	actualSize = vm_map_round_page(addr + size, vm_map_page_mask(map)) - actualAddr;
+
+	if (kIOMapGuardedMask & options) {
+		mach_vm_size_t guardSize = IOMemoryDescriptorMapGuardSize(map, options);
+		actualAddr -= guardSize;
+		actualSize += 2 * guardSize;
+	}
+	kr = mach_vm_deallocate(map, actualAddr, actualSize);
+
+	return kr;
+}
+
 kern_return_t
 IOMemoryDescriptorMapAlloc(vm_map_t map, void * _ref)
 {
 	IOMemoryDescriptorMapAllocRef * ref = (typeof(ref))_ref;
 	IOReturn                        err;
 	vm_map_offset_t                 addr;
+	mach_vm_size_t                  size;
+	mach_vm_size_t                  guardSize;
+	vm_map_kernel_flags_t           vmk_flags;
 
 	addr = ref->mapped;
+	size = ref->size;
+	guardSize = 0;
 
-	err = vm_map_enter_mem_object(map, &addr, ref->size,
+	if (kIOMapGuardedMask & ref->options) {
+		if (!(kIOMapAnywhere & ref->options)) {
+			return kIOReturnBadArgument;
+		}
+		guardSize = IOMemoryDescriptorMapGuardSize(map, ref->options);
+		size += 2 * guardSize;
+	}
+	if (kIOMapAnywhere & ref->options) {
+		vmk_flags = VM_MAP_KERNEL_FLAGS_ANYWHERE();
+	} else {
+		vmk_flags = VM_MAP_KERNEL_FLAGS_FIXED();
+	}
+	vmk_flags.vm_tag = ref->tag;
+
+	/*
+	 * Mapping memory into the kernel_map using IOMDs use the data range.
+	 * Memory being mapped should not contain kernel pointers.
+	 */
+	if (map == kernel_map) {
+		vmk_flags.vmkf_range_id = KMEM_RANGE_ID_DATA;
+	}
+
+	err = vm_map_enter_mem_object(map, &addr, size,
 #if __ARM_MIXED_PAGE_SIZE__
 	    // TODO4K this should not be necessary...
 	    (vm_map_offset_t)((ref->options & kIOMapAnywhere) ? max(PAGE_MASK, vm_map_page_mask(map)) : 0),
 #else /* __ARM_MIXED_PAGE_SIZE__ */
 	    (vm_map_offset_t) 0,
 #endif /* __ARM_MIXED_PAGE_SIZE__ */
-	    (((ref->options & kIOMapAnywhere)
-	    ? VM_FLAGS_ANYWHERE
-	    : VM_FLAGS_FIXED)),
-	    VM_MAP_KERNEL_FLAGS_NONE,
-	    ref->tag,
+	    vmk_flags,
 	    IPC_PORT_NULL,
 	    (memory_object_offset_t) 0,
 	    false,                       /* copy */
@@ -791,6 +899,15 @@ IOMemoryDescriptorMapAlloc(vm_map_t map, void * _ref)
 	if (KERN_SUCCESS == err) {
 		ref->mapped = (mach_vm_address_t) addr;
 		ref->map = map;
+		if (kIOMapGuardedMask & ref->options) {
+			vm_map_offset_t lastpage = vm_map_trunc_page(addr + size - guardSize, vm_map_page_mask(map));
+
+			err = vm_map_protect(map, addr, addr + guardSize, VM_PROT_NONE, false /*set_max*/);
+			assert(KERN_SUCCESS == err);
+			err = vm_map_protect(map, lastpage, lastpage + guardSize, VM_PROT_NONE, false /*set_max*/);
+			assert(KERN_SUCCESS == err);
+			ref->mapped += guardSize;
+		}
 	}
 
 	return err;
@@ -858,7 +975,7 @@ IOGeneralMemoryDescriptor::memoryReferenceMap(
 			return kIOReturnBadArgument;
 		}
 		for (remain = offset, rangeIdx = 0; rangeIdx < _rangesCount; rangeIdx++) {
-			getAddrLenForInd(nextAddr, nextLen, type, _ranges, rangeIdx);
+			getAddrLenForInd(nextAddr, nextLen, type, _ranges, rangeIdx, _task);
 			if (remain < nextLen) {
 				break;
 			}
@@ -904,7 +1021,11 @@ IOGeneralMemoryDescriptor::memoryReferenceMap(
 	entry = &ref->entries[entryIdx];
 
 	// allocate VM
+#if __ARM_MIXED_PAGE_SIZE__
+	size = round_page_mask_64(size + pageOffset, vm_map_page_mask(map));
+#else
 	size = round_page_64(size + pageOffset);
+#endif
 	if (kIOMapOverwrite & options) {
 		if ((map == kernel_map) && (kIOMemoryBufferPageable & _flags)) {
 			map = IOPageableMapForAddress(addr);
@@ -1027,10 +1148,12 @@ IOGeneralMemoryDescriptor::memoryReferenceMap(
 		}
 		chunk = entry->size - entryOffset;
 		if (chunk) {
-			vm_map_kernel_flags_t vmk_flags;
-
-			vmk_flags = VM_MAP_KERNEL_FLAGS_NONE;
-			vmk_flags.vmkf_iokit_acct = TRUE; /* iokit accounting */
+			vm_map_kernel_flags_t vmk_flags = {
+				.vmf_fixed = true,
+				.vmf_overwrite = true,
+				.vm_tag = tag,
+				.vmkf_iokit_acct = true,
+			};
 
 			if (chunk > remain) {
 				chunk = remain;
@@ -1041,10 +1164,7 @@ IOGeneralMemoryDescriptor::memoryReferenceMap(
 				err = vm_map_enter_mem_object_prefault(map,
 				    &mapAddr,
 				    chunk, 0 /* mask */,
-				    (VM_FLAGS_FIXED
-				    | VM_FLAGS_OVERWRITE),
 				    vmk_flags,
-				    tag,
 				    entry->entry,
 				    entryOffset,
 				    prot,                        // cur
@@ -1062,10 +1182,7 @@ IOGeneralMemoryDescriptor::memoryReferenceMap(
 				err = vm_map_enter_mem_object(map,
 				    &mapAddr,
 				    chunk, 0 /* mask */,
-				    (VM_FLAGS_FIXED
-				    | VM_FLAGS_OVERWRITE),
 				    vmk_flags,
-				    tag,
 				    entry->entry,
 				    entryOffset,
 				    false,               // copy
@@ -1095,7 +1212,7 @@ IOGeneralMemoryDescriptor::memoryReferenceMap(
 	}
 
 	if ((KERN_SUCCESS != err) && didAlloc) {
-		(void) mach_vm_deallocate(map, trunc_page_64(addr), size);
+		(void) IOMemoryDescriptorMapDealloc(options, map, trunc_page_64(addr), size);
 		addr = 0;
 	}
 	*inaddr = addr;
@@ -1341,10 +1458,13 @@ IOGeneralMemoryDescriptor::memoryReferenceMapNew(
 		printf("entryIdx %d, chunk %qx\n", entryIdx, chunk);
 #endif
 		if (chunk) {
-			vm_map_kernel_flags_t vmk_flags;
-
-			vmk_flags = VM_MAP_KERNEL_FLAGS_NONE;
-			vmk_flags.vmkf_iokit_acct = TRUE; /* iokit accounting */
+			vm_map_kernel_flags_t vmk_flags = {
+				.vmf_fixed = true,
+				.vmf_overwrite = true,
+				.vmf_return_data_addr = true,
+				.vm_tag = tag,
+				.vmkf_iokit_acct = true,
+			};
 
 			if (chunk > remain) {
 				chunk = remain;
@@ -1356,11 +1476,7 @@ IOGeneralMemoryDescriptor::memoryReferenceMapNew(
 				err = vm_map_enter_mem_object_prefault(map,
 				    &mapAddrOut,
 				    chunk, 0 /* mask */,
-				    (VM_FLAGS_FIXED
-				    | VM_FLAGS_OVERWRITE
-				    | VM_FLAGS_RETURN_DATA_ADDR),
 				    vmk_flags,
-				    tag,
 				    entry->entry,
 				    entryOffset,
 				    prot,                        // cur
@@ -1378,11 +1494,7 @@ IOGeneralMemoryDescriptor::memoryReferenceMapNew(
 				err = vm_map_enter_mem_object(map,
 				    &mapAddrOut,
 				    chunk, 0 /* mask */,
-				    (VM_FLAGS_FIXED
-				    | VM_FLAGS_OVERWRITE
-				    | VM_FLAGS_RETURN_DATA_ADDR),
 				    vmk_flags,
-				    tag,
 				    entry->entry,
 				    entryOffset,
 				    false,               // copy
@@ -1424,7 +1536,7 @@ IOGeneralMemoryDescriptor::memoryReferenceMapNew(
 	}
 
 	if ((KERN_SUCCESS != err) && didAlloc) {
-		(void) mach_vm_deallocate(map, trunc_page_64(addr), size);
+		(void) IOMemoryDescriptorMapDealloc(options, map, trunc_page_64(addr), size);
 		addr = 0;
 	}
 	*inaddr = addr;
@@ -2035,7 +2147,7 @@ IOGeneralMemoryDescriptor::initWithOptions(void *       buffers,
 		case kIODirectionNone:
 		case kIODirectionOutIn:
 		default:
-			panic("bad dir for upl 0x%x\n", (int) options);
+			panic("bad dir for upl 0x%x", (int) options);
 			break;
 		}
 		//       _wireCount++;	// UPLs start out life wired
@@ -2148,7 +2260,7 @@ IOGeneralMemoryDescriptor::initWithOptions(void *       buffers,
 			mach_vm_size_t    len;
 
 			// addr & len are returned by this function
-			getAddrLenForInd(addr, len, type, vec, ind);
+			getAddrLenForInd(addr, len, type, vec, ind, _task);
 			if (_task) {
 				mach_vm_size_t phys_size;
 				kern_return_t kret;
@@ -2289,7 +2401,7 @@ IOGeneralMemoryDescriptor::free()
 			// (IOMemoryDescriptorReserved) so no reserved access after this point
 			device_pager_deallocate((memory_object_t) reserved->dp.devicePager );
 		} else {
-			IODelete(reserved, IOMemoryDescriptorReserved, 1);
+			IOFreeType(reserved, IOMemoryDescriptorReserved);
 		}
 		reserved = NULL;
 	}
@@ -2361,6 +2473,41 @@ uint64_t
 IOMemoryDescriptor::getFlags(void)
 {
 	return _flags;
+}
+
+OSObject *
+IOMemoryDescriptor::copyContext(void) const
+{
+	if (reserved) {
+		OSObject * context = reserved->contextObject;
+		if (context) {
+			context->retain();
+		}
+		return context;
+	} else {
+		return NULL;
+	}
+}
+
+void
+IOMemoryDescriptor::setContext(OSObject * obj)
+{
+	if (this->reserved == NULL && obj == NULL) {
+		// No existing object, and no object to set
+		return;
+	}
+
+	IOMemoryDescriptorReserved * reserved = getKernelReserved();
+	if (reserved) {
+		OSObject * oldObject = reserved->contextObject;
+		if (oldObject && OSCompareAndSwapPtr(oldObject, NULL, &reserved->contextObject)) {
+			oldObject->release();
+		}
+		if (obj != NULL) {
+			obj->retain();
+			reserved->contextObject = obj;
+		}
+	}
 }
 
 #ifndef __LP64__
@@ -2573,13 +2720,18 @@ IOMemoryDescriptor::cleanKernelReserved( IOMemoryDescriptorReserved * reserved )
 		task_deallocate(reserved->creator);
 		reserved->creator = NULL;
 	}
+
+	if (reserved->contextObject) {
+		reserved->contextObject->release();
+		reserved->contextObject = NULL;
+	}
 }
 
 IOMemoryDescriptorReserved *
 IOMemoryDescriptor::getKernelReserved( void )
 {
 	if (!reserved) {
-		reserved = IONewZero(IOMemoryDescriptorReserved, 1);
+		reserved = IOMallocType(IOMemoryDescriptorReserved);
 	}
 	return reserved;
 }
@@ -2627,7 +2779,7 @@ IOMemoryDescriptor::getDescriptorID( void )
 IOReturn
 IOMemoryDescriptor::ktraceEmitPhysicalSegments( void )
 {
-	if (!kdebug_debugid_explicitly_enabled(IODBG_IOMDPA(IOMDPA_MAPPED))) {
+	if (!kdebug_debugid_enabled(IODBG_IOMDPA(IOMDPA_MAPPED))) {
 		return kIOReturnSuccess;
 	}
 
@@ -3220,7 +3372,7 @@ IOGeneralMemoryDescriptor::getPhysicalSegment(IOByteCount offset, IOByteCount *l
 
 		// Find starting address within the vector of ranges
 		for (;;) {
-			getAddrLenForInd(addr, length, type, vec, rangesIndex);
+			getAddrLenForInd(addr, length, type, vec, rangesIndex, _task);
 			if (offset < length) {
 				break;
 			}
@@ -3237,7 +3389,7 @@ IOGeneralMemoryDescriptor::getPhysicalSegment(IOByteCount offset, IOByteCount *l
 			mach_vm_address_t newAddr;
 			mach_vm_size_t    newLen;
 
-			getAddrLenForInd(newAddr, newLen, type, vec, rangesIndex);
+			getAddrLenForInd(newAddr, newLen, type, vec, rangesIndex, _task);
 			if (addr + length != newAddr) {
 				break;
 			}
@@ -3445,7 +3597,7 @@ IOMemoryDescriptor::dmaCommandOperation(DMACommandOps op, void *vData, UInt data
 		addr64_t         addr, nextAddr;
 
 		if (data->fMapped) {
-			panic("fMapped %p %s %qx\n", this, getMetaClass()->getClassName(), (uint64_t) getLength());
+			panic("fMapped %p %s %qx", this, getMetaClass()->getClassName(), (uint64_t) getLength());
 		}
 		addr = md->getPhysicalSegment(offset, &length, kIOMemoryMapperNone);
 		offset += length;
@@ -3528,7 +3680,7 @@ IOGeneralMemoryDescriptor::setPurgeable( IOOptionBits newState,
 			IOOptionBits type = _flags & kIOMemoryTypeMask;
 			mach_vm_address_t addr;
 			mach_vm_size_t    len;
-			getAddrLenForInd(addr, len, type, vec, 0);
+			getAddrLenForInd(addr, len, type, vec, 0, _task);
 
 			err = purgeableControlBits(newState, &control, &state);
 			if (kIOReturnSuccess != err) {
@@ -3656,6 +3808,12 @@ IOMemoryDescriptor::getDMAMapLength(uint64_t * offset)
 			length += round_page(sourceAddr + segLen) - trunc_page(sourceAddr);
 			iterate += segLen;
 		}
+		if (!iterate) {
+			length = getLength();
+			if (offset) {
+				*offset = 0;
+			}
+		}
 		if (kIOMemoryThreadSafe & _flags) {
 			UNLOCK;
 		}
@@ -3698,13 +3856,13 @@ IOMemoryDescriptor::getPageCounts( IOByteCount * residentPageCount,
 }
 
 
-#if defined(__arm__) || defined(__arm64__)
+#if defined(__arm64__)
 extern "C" void dcache_incoherent_io_flush64(addr64_t pa, unsigned int count, unsigned int remaining, unsigned int *res);
 extern "C" void dcache_incoherent_io_store64(addr64_t pa, unsigned int count, unsigned int remaining, unsigned int *res);
-#else /* defined(__arm__) || defined(__arm64__) */
+#else /* defined(__arm64__) */
 extern "C" void dcache_incoherent_io_flush64(addr64_t pa, unsigned int count);
 extern "C" void dcache_incoherent_io_store64(addr64_t pa, unsigned int count);
-#endif /* defined(__arm__) || defined(__arm64__) */
+#endif /* defined(__arm64__) */
 
 static void
 SetEncryptOp(addr64_t pa, unsigned int count)
@@ -3737,7 +3895,7 @@ IOMemoryDescriptor::performOperation( IOOptionBits options,
 	IOByteCount remaining;
 	unsigned int res;
 	void (*func)(addr64_t pa, unsigned int count) = NULL;
-#if defined(__arm__) || defined(__arm64__)
+#if defined(__arm64__)
 	void (*func_ext)(addr64_t pa, unsigned int count, unsigned int remaining, unsigned int *result) = NULL;
 #endif
 
@@ -3748,7 +3906,7 @@ IOMemoryDescriptor::performOperation( IOOptionBits options,
 
 	switch (options) {
 	case kIOMemoryIncoherentIOFlush:
-#if defined(__arm__) || defined(__arm64__)
+#if defined(__arm64__)
 		func_ext = &dcache_incoherent_io_flush64;
 #if __ARM_COHERENT_IO__
 		func_ext(0, 0, 0, &res);
@@ -3756,12 +3914,12 @@ IOMemoryDescriptor::performOperation( IOOptionBits options,
 #else /* __ARM_COHERENT_IO__ */
 		break;
 #endif /* __ARM_COHERENT_IO__ */
-#else /* defined(__arm__) || defined(__arm64__) */
+#else /* defined(__arm64__) */
 		func = &dcache_incoherent_io_flush64;
 		break;
-#endif /* defined(__arm__) || defined(__arm64__) */
+#endif /* defined(__arm64__) */
 	case kIOMemoryIncoherentIOStore:
-#if defined(__arm__) || defined(__arm64__)
+#if defined(__arm64__)
 		func_ext = &dcache_incoherent_io_store64;
 #if __ARM_COHERENT_IO__
 		func_ext(0, 0, 0, &res);
@@ -3769,10 +3927,10 @@ IOMemoryDescriptor::performOperation( IOOptionBits options,
 #else /* __ARM_COHERENT_IO__ */
 		break;
 #endif /* __ARM_COHERENT_IO__ */
-#else /* defined(__arm__) || defined(__arm64__) */
+#else /* defined(__arm64__) */
 		func = &dcache_incoherent_io_store64;
 		break;
-#endif /* defined(__arm__) || defined(__arm64__) */
+#endif /* defined(__arm64__) */
 
 	case kIOMemorySetEncrypted:
 		func = &SetEncryptOp;
@@ -3782,15 +3940,15 @@ IOMemoryDescriptor::performOperation( IOOptionBits options,
 		break;
 	}
 
-#if defined(__arm__) || defined(__arm64__)
+#if defined(__arm64__)
 	if ((func == NULL) && (func_ext == NULL)) {
 		return kIOReturnUnsupported;
 	}
-#else /* defined(__arm__) || defined(__arm64__) */
+#else /* defined(__arm64__) */
 	if (!func) {
 		return kIOReturnUnsupported;
 	}
-#endif /* defined(__arm__) || defined(__arm64__) */
+#endif /* defined(__arm64__) */
 
 	if (kIOMemoryThreadSafe & _flags) {
 		LOCK;
@@ -3819,7 +3977,7 @@ IOMemoryDescriptor::performOperation( IOOptionBits options,
 			remaining = UINT_MAX;
 		}
 
-#if defined(__arm__) || defined(__arm64__)
+#if defined(__arm64__)
 		if (func) {
 			(*func)(dstAddr64, (unsigned int) dstLen);
 		}
@@ -3830,9 +3988,9 @@ IOMemoryDescriptor::performOperation( IOOptionBits options,
 				break;
 			}
 		}
-#else /* defined(__arm__) || defined(__arm64__) */
+#else /* defined(__arm64__) */
 		(*func)(dstAddr64, (unsigned int) dstLen);
-#endif /* defined(__arm__) || defined(__arm64__) */
+#endif /* defined(__arm64__) */
 
 		offset    += dstLen;
 		remaining -= dstLen;
@@ -3860,7 +4018,7 @@ extern vm_offset_t kc_highest_nonlinkedit_vmaddr;
 #define io_kernel_static_start  vm_kernel_stext
 #define io_kernel_static_end    (kc_highest_nonlinkedit_vmaddr ? kc_highest_nonlinkedit_vmaddr : vm_kernel_etext)
 
-#elif defined(__arm__) || defined(__arm64__)
+#elif defined(__arm64__)
 
 extern vm_offset_t              static_memory_end;
 
@@ -3960,7 +4118,8 @@ IOGeneralMemoryDescriptor::wireVirtual(IODirection forDirection)
 
 	if (_wireCount) {
 		if ((kIOMemoryPreparedReadOnly & _flags) && !(UPL_COPYOUT_FROM & uplFlags)) {
-			OSReportWithBacktrace("IOMemoryDescriptor 0x%lx prepared read only", VM_KERNEL_ADDRPERM(this));
+			OSReportWithBacktrace("IOMemoryDescriptor 0x%zx prepared read only",
+			    (size_t)VM_KERNEL_ADDRPERM(this));
 			error = kIOReturnNotWritable;
 		}
 	} else {
@@ -3997,14 +4156,13 @@ IOGeneralMemoryDescriptor::wireVirtual(IODirection forDirection)
 		mapBase = 0;
 
 		// Note that appendBytes(NULL) zeros the data up to the desired length
-		//           and the length parameter is an unsigned int
 		size_t uplPageSize = dataP->fPageCnt * sizeof(upl_page_info_t);
 		if (uplPageSize > ((unsigned int)uplPageSize)) {
 			error = kIOReturnNoMemory;
 			traceInterval.setEndArg2(error);
 			return error;
 		}
-		if (!_memoryEntries->appendBytes(NULL, (unsigned int) uplPageSize)) {
+		if (!_memoryEntries->appendBytes(NULL, uplPageSize)) {
 			error = kIOReturnNoMemory;
 			traceInterval.setEndArg2(error);
 			return error;
@@ -4054,7 +4212,7 @@ IOGeneralMemoryDescriptor::wireVirtual(IODirection forDirection)
 				}
 			} else {
 				// Get the startPage address and length of vec[range]
-				getAddrLenForInd(startPage, numBytes, type, vec, range);
+				getAddrLenForInd(startPage, numBytes, type, vec, range, _task);
 				if (byteAlignUPL) {
 					startPageOffset = 0;
 				} else {
@@ -4268,7 +4426,7 @@ abortExit:
 				upl_deallocate(ioplList[ioplIdx].fIOPL);
 			}
 		}
-		(void) _memoryEntries->initWithBytes(dataP, computeDataSize(0, 0)); // == setLength()
+		_memoryEntries->setLength(computeDataSize(0, 0));
 	}
 
 	if (error == KERN_FAILURE) {
@@ -4284,18 +4442,16 @@ bool
 IOGeneralMemoryDescriptor::initMemoryEntries(size_t size, IOMapper * mapper)
 {
 	ioGMDData * dataP;
-	unsigned    dataSize;
 
 	if (size > UINT_MAX) {
 		return false;
 	}
-	dataSize = (unsigned int) size;
 	if (!_memoryEntries) {
-		_memoryEntries = OSData::withCapacity(dataSize);
+		_memoryEntries = _IOMemoryDescriptorMixedData::withCapacity(size);
 		if (!_memoryEntries) {
 			return false;
 		}
-	} else if (!_memoryEntries->initWithCapacity(dataSize)) {
+	} else if (!_memoryEntries->initWithCapacity(size)) {
 		return false;
 	}
 
@@ -4649,7 +4805,7 @@ IOGeneralMemoryDescriptor::complete(IODirection forDirection)
 					upl_set_referenced(ioplList[0].fIOPL, false);
 				}
 
-				(void) _memoryEntries->initWithBytes(dataP, computeDataSize(0, 0)); // == setLength()
+				_memoryEntries->setLength(computeDataSize(0, 0));
 
 				dataP->fPreparationID = kIOPreparationIDUnprepared;
 				_flags &= ~kIOMemoryPreparedReadOnly;
@@ -4710,7 +4866,7 @@ IOGeneralMemoryDescriptor::doMap(
 	}
 
 	if (vec.v) {
-		getAddrLenForInd(range0Addr, range0Len, type, vec, 0);
+		getAddrLenForInd(range0Addr, range0Len, type, vec, 0, _task);
 	}
 
 	// mapping source == dest? (could be much better)
@@ -4719,6 +4875,7 @@ IOGeneralMemoryDescriptor::doMap(
 	    && (mapping->fAddressMap == get_task_map(_task))
 	    && (options & kIOMapAnywhere)
 	    && (!(kIOMapUnique & options))
+	    && (!(kIOMapGuardedMask & options))
 	    && (1 == _rangesCount)
 	    && (0 == offset)
 	    && range0Addr
@@ -5037,7 +5194,8 @@ IOMemoryDescriptor::populateDevicePager(
 #if DEBUG || DEVELOPMENT
 		if ((kIOMemoryTypeUPL != type)
 		    && pmap_has_managed_page((ppnum_t) atop_64(physAddr), (ppnum_t) atop_64(physAddr + segLen - 1))) {
-			OSReportWithBacktrace("IOMemoryDescriptor physical with managed page 0x%qx:0x%qx", physAddr, segLen);
+			OSReportWithBacktrace("IOMemoryDescriptor physical with managed page 0x%qx:0x%qx",
+			    physAddr, (uint64_t)segLen);
 		}
 #endif /* DEBUG || DEVELOPMENT */
 
@@ -5116,7 +5274,7 @@ IOMemoryDescriptor::doUnmap(
 			    addressMap, address, length );
 		}
 #endif
-		err = mach_vm_deallocate( addressMap, address, length );
+		err = IOMemoryDescriptorMapDealloc(mapping->fOptions, addressMap, address, length );
 		if (vm_map_page_mask(addressMap) < PAGE_MASK) {
 			DEBUG4K_IOKIT("map %p address 0x%llx length 0x%llx err 0x%x\n", addressMap, address, length, err);
 		}
@@ -5394,6 +5552,9 @@ IOMemoryMap::copyCompatible(
 	if ((fOptions ^ _options) & kIOMapReadOnly) {
 		return NULL;
 	}
+	if ((fOptions ^ _options) & kIOMapGuardedMask) {
+		return NULL;
+	}
 	if ((kIOMapDefaultCache != (_options & kIOMapCacheMask))
 	    && ((fOptions ^ _options) & kIOMapCacheMask)) {
 		return NULL;
@@ -5493,7 +5654,7 @@ IOMemoryDescriptor::free( void )
 
 	if (reserved) {
 		cleanKernelReserved(reserved);
-		IODelete(reserved, IOMemoryDescriptorReserved, 1);
+		IOFreeType(reserved, IOMemoryDescriptorReserved);
 		reserved = NULL;
 	}
 	super::free();
@@ -5773,6 +5934,18 @@ IOMemoryDescriptor::removeMapping(
 	}
 }
 
+void
+IOMemoryDescriptor::setMapperOptions( uint16_t options)
+{
+	_iomapperOptions = options;
+}
+
+uint16_t
+IOMemoryDescriptor::getMapperOptions( void )
+{
+	return _iomapperOptions;
+}
+
 #ifndef __LP64__
 // obsolete initializers
 // - initWithOptions is the designated initializer
@@ -5839,15 +6012,12 @@ IOGeneralMemoryDescriptor::serialize(OSSerialize * s) const
 	OSSharedPtr<OSObject>           values[2] = {NULL};
 	OSSharedPtr<OSArray>            array;
 
-	vm_size_t vcopy_size;
-
 	struct SerData {
 		user_addr_t address;
 		user_size_t length;
-	} *vcopy = NULL;
+	};
 
-	unsigned int index, nRanges;
-	bool result = false;
+	unsigned int index;
 
 	IOOptionBits type = _flags & kIOMemoryTypeMask;
 
@@ -5860,15 +6030,9 @@ IOGeneralMemoryDescriptor::serialize(OSSerialize * s) const
 		return false;
 	}
 
-	nRanges = _rangesCount;
-	if (os_mul_overflow(sizeof(SerData), nRanges, &vcopy_size)) {
-		result = false;
-		goto bail;
-	}
-	vcopy = (SerData *) IOMalloc(vcopy_size);
-	if (vcopy == NULL) {
-		result = false;
-		goto bail;
+	OSDataAllocation<struct SerData> vcopy(_rangesCount, OSAllocateMemory);
+	if (!vcopy) {
+		return false;
 	}
 
 	keys[0] = OSSymbol::withCString("address");
@@ -5877,39 +6041,35 @@ IOGeneralMemoryDescriptor::serialize(OSSerialize * s) const
 	// Copy the volatile data so we don't have to allocate memory
 	// while the lock is held.
 	LOCK;
-	if (nRanges == _rangesCount) {
+	if (vcopy.size() == _rangesCount) {
 		Ranges vec = _ranges;
-		for (index = 0; index < nRanges; index++) {
+		for (index = 0; index < vcopy.size(); index++) {
 			mach_vm_address_t addr; mach_vm_size_t len;
-			getAddrLenForInd(addr, len, type, vec, index);
+			getAddrLenForInd(addr, len, type, vec, index, _task);
 			vcopy[index].address = addr;
 			vcopy[index].length  = len;
 		}
 	} else {
 		// The descriptor changed out from under us.  Give up.
 		UNLOCK;
-		result = false;
-		goto bail;
+		return false;
 	}
 	UNLOCK;
 
-	for (index = 0; index < nRanges; index++) {
+	for (index = 0; index < vcopy.size(); index++) {
 		user_addr_t addr = vcopy[index].address;
 		IOByteCount len = (IOByteCount) vcopy[index].length;
 		values[0] = OSNumber::withNumber(addr, sizeof(addr) * 8);
 		if (values[0] == NULL) {
-			result = false;
-			goto bail;
+			return false;
 		}
 		values[1] = OSNumber::withNumber(len, sizeof(len) * 8);
 		if (values[1] == NULL) {
-			result = false;
-			goto bail;
+			return false;
 		}
 		OSSharedPtr<OSDictionary> dict = OSDictionary::withObjects((const OSObject **)values, (const OSSymbol **)keys, 2);
 		if (dict == NULL) {
-			result = false;
-			goto bail;
+			return false;
 		}
 		array->setObject(dict.get());
 		dict.reset();
@@ -5917,14 +6077,7 @@ IOGeneralMemoryDescriptor::serialize(OSSerialize * s) const
 		values[1].reset();
 	}
 
-	result = array->serialize(s);
-
-bail:
-	if (vcopy) {
-		IOFree(vcopy, vcopy_size);
-	}
-
-	return result;
+	return array->serialize(s);
 }
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
 
@@ -5955,9 +6108,119 @@ OSMetaClassDefineReservedUnused(IOMemoryDescriptor, 13);
 OSMetaClassDefineReservedUnused(IOMemoryDescriptor, 14);
 OSMetaClassDefineReservedUnused(IOMemoryDescriptor, 15);
 
+/* for real this is a ioGMDData + upl_page_info_t + ioPLBlock */
+KALLOC_TYPE_VAR_DEFINE(KT_IOMD_MIXED_DATA,
+    struct ioGMDData, struct ioPLBlock, KT_DEFAULT);
+
 /* ex-inline function implementation */
 IOPhysicalAddress
 IOMemoryDescriptor::getPhysicalAddress()
 {
 	return getPhysicalSegment( 0, NULL );
+}
+
+OSDefineMetaClassAndStructors(_IOMemoryDescriptorMixedData, OSObject)
+
+OSPtr<_IOMemoryDescriptorMixedData>
+_IOMemoryDescriptorMixedData::withCapacity(size_t capacity)
+{
+	OSSharedPtr<_IOMemoryDescriptorMixedData> me = OSMakeShared<_IOMemoryDescriptorMixedData>();
+	if (me && !me->initWithCapacity(capacity)) {
+		return nullptr;
+	}
+	return me;
+}
+
+bool
+_IOMemoryDescriptorMixedData::initWithCapacity(size_t capacity)
+{
+	if (_data && (!capacity || (_capacity < capacity))) {
+		freeMemory();
+	}
+
+	if (!OSObject::init()) {
+		return false;
+	}
+
+	if (!_data && capacity) {
+		_data = kalloc_type_var_impl(KT_IOMD_MIXED_DATA, capacity,
+		    Z_VM_TAG_BT(Z_WAITOK_ZERO, VM_KERN_MEMORY_IOKIT), NULL);
+		if (!_data) {
+			return false;
+		}
+		_capacity = capacity;
+	}
+
+	_length = 0;
+
+	return true;
+}
+
+void
+_IOMemoryDescriptorMixedData::free()
+{
+	freeMemory();
+	OSObject::free();
+}
+
+void
+_IOMemoryDescriptorMixedData::freeMemory()
+{
+	kfree_type_var_impl(KT_IOMD_MIXED_DATA, _data, _capacity);
+	_data = nullptr;
+	_capacity = _length = 0;
+}
+
+bool
+_IOMemoryDescriptorMixedData::appendBytes(const void * bytes, size_t length)
+{
+	const auto oldLength = getLength();
+	size_t newLength;
+	if (os_add_overflow(oldLength, length, &newLength)) {
+		return false;
+	}
+
+	if (!setLength(newLength)) {
+		return false;
+	}
+
+	unsigned char * const dest = &(((unsigned char *)_data)[oldLength]);
+	if (bytes) {
+		bcopy(bytes, dest, length);
+	}
+
+	return true;
+}
+
+bool
+_IOMemoryDescriptorMixedData::setLength(size_t length)
+{
+	if (!_data || (length > _capacity)) {
+		void *newData;
+
+		newData = __krealloc_type(KT_IOMD_MIXED_DATA, _data, _capacity,
+		    length, Z_VM_TAG_BT(Z_WAITOK_ZERO, VM_KERN_MEMORY_IOKIT),
+		    NULL);
+		if (!newData) {
+			return false;
+		}
+
+		_data = newData;
+		_capacity = length;
+	}
+
+	_length = length;
+	return true;
+}
+
+const void *
+_IOMemoryDescriptorMixedData::getBytes() const
+{
+	return _length ? _data : nullptr;
+}
+
+size_t
+_IOMemoryDescriptorMixedData::getLength() const
+{
+	return _data ? _length : 0;
 }

@@ -104,6 +104,8 @@
 #include <netinet/mptcp_var.h>
 #endif
 
+extern uint32_t net_wake_pkt_debug;
+
 #define DBG_FNC_SBDROP          NETDBG_CODE(DBG_NETSOCK, 4)
 #define DBG_FNC_SBAPPEND        NETDBG_CODE(DBG_NETSOCK, 5)
 
@@ -478,7 +480,7 @@ sonewconn_internal(struct socket *head, int connstatus)
 	sflt_initsock(so);
 
 	if (connstatus) {
-		so->so_state |= connstatus;
+		so->so_state |= (short)connstatus;
 		sorwakeup(head);
 		wakeup((caddr_t)&head->so_timeo);
 	}
@@ -539,7 +541,7 @@ sbwait(struct sockbuf *sb)
 	int error = 0;
 
 	if (so == NULL) {
-		panic("%s: null so, sb=%p sb_flags=0x%x lr=%p\n",
+		panic("%s: null so, sb=%p sb_flags=0x%x lr=%p",
 		    __func__, sb, sb->sb_flags, lr_saved);
 		/* NOTREACHED */
 	} else if (so->so_usecount < 1) {
@@ -552,10 +554,10 @@ sbwait(struct sockbuf *sb)
 	if ((so->so_state & SS_DRAINING) || (so->so_flags & SOF_DEFUNCT)) {
 		error = EBADF;
 		if (so->so_flags & SOF_DEFUNCT) {
-			SODEFUNCTLOG("%s[%d, %s]: defunct so 0x%llx [%d,%d] "
+			SODEFUNCTLOG("%s[%d, %s]: defunct so 0x%llu [%d,%d] "
 			    "(%d)\n", __func__, proc_selfpid(),
 			    proc_best_name(current_proc()),
-			    (uint64_t)VM_KERNEL_ADDRPERM(so),
+			    so->so_gencnt,
 			    SOCK_DOM(so), SOCK_TYPE(so), error);
 		}
 		return error;
@@ -592,10 +594,10 @@ sbwait(struct sockbuf *sb)
 	if ((so->so_state & SS_DRAINING) || (so->so_flags & SOF_DEFUNCT)) {
 		error = EBADF;
 		if (so->so_flags & SOF_DEFUNCT) {
-			SODEFUNCTLOG("%s[%d, %s]: defunct so 0x%llx [%d,%d] "
+			SODEFUNCTLOG("%s[%d, %s]: defunct so 0x%llu [%d,%d] "
 			    "(%d)\n", __func__, proc_selfpid(),
 			    proc_best_name(current_proc()),
-			    (uint64_t)VM_KERNEL_ADDRPERM(so),
+			    so->so_gencnt,
 			    SOCK_DOM(so), SOCK_TYPE(so), error);
 		}
 	}
@@ -620,10 +622,10 @@ void
 sowakeup(struct socket *so, struct sockbuf *sb, struct socket *so2)
 {
 	if (so->so_flags & SOF_DEFUNCT) {
-		SODEFUNCTLOG("%s[%d, %s]: defunct so 0x%llx [%d,%d] si 0x%x, "
+		SODEFUNCTLOG("%s[%d, %s]: defunct so 0x%llu [%d,%d] si 0x%x, "
 		    "fl 0x%x [%s]\n", __func__, proc_selfpid(),
 		    proc_best_name(current_proc()),
-		    (uint64_t)VM_KERNEL_ADDRPERM(so), SOCK_DOM(so),
+		    so->so_gencnt, SOCK_DOM(so),
 		    SOCK_TYPE(so), (uint32_t)sb->sb_sel.si_flags, sb->sb_flags,
 		    (sb->sb_flags & SB_RECV) ? "rcv" : "snd");
 	}
@@ -873,6 +875,7 @@ static int
 sbappend_common(struct sockbuf *sb, struct mbuf *m, boolean_t nodrop)
 {
 	struct socket *so = sb->sb_so;
+	struct soflow_hash_entry *dgram_flow_entry = NULL;
 
 	if (m == NULL || (sb->sb_flags & SB_DROP)) {
 		if (m != NULL && !nodrop) {
@@ -889,13 +892,18 @@ sbappend_common(struct sockbuf *sb, struct mbuf *m, boolean_t nodrop)
 
 	if (SOCK_DOM(sb->sb_so) == PF_INET || SOCK_DOM(sb->sb_so) == PF_INET6) {
 		ASSERT(nodrop == FALSE);
+
+		if (NEED_DGRAM_FLOW_TRACKING(so)) {
+			dgram_flow_entry = soflow_get_flow(so, NULL, NULL, NULL, m != NULL ? m_length(m) : 0, false, (m != NULL && m->m_pkthdr.rcvif) ? m->m_pkthdr.rcvif->if_index : 0);
+		}
+
 		if (sb->sb_flags & SB_RECV && !(m && m->m_flags & M_SKIPCFIL)) {
 			int error = sflt_data_in(so, NULL, &m, NULL, 0);
 			SBLASTRECORDCHK(sb, "sbappend 2");
 
 #if CONTENT_FILTER
 			if (error == 0) {
-				error = cfil_sock_data_in(so, NULL, m, NULL, 0);
+				error = cfil_sock_data_in(so, NULL, m, NULL, 0, dgram_flow_entry);
 			}
 #endif /* CONTENT_FILTER */
 
@@ -903,10 +911,17 @@ sbappend_common(struct sockbuf *sb, struct mbuf *m, boolean_t nodrop)
 				if (error != EJUSTRETURN) {
 					m_freem(m);
 				}
+				if (dgram_flow_entry != NULL) {
+					soflow_free_flow(dgram_flow_entry);
+				}
 				return 0;
 			}
 		} else if (m) {
 			m->m_flags &= ~M_SKIPCFIL;
+		}
+
+		if (dgram_flow_entry != NULL) {
+			soflow_free_flow(dgram_flow_entry);
 		}
 	}
 
@@ -938,6 +953,7 @@ sbappend_nodrop(struct sockbuf *sb, struct mbuf *m)
 int
 sbappendstream(struct sockbuf *sb, struct mbuf *m)
 {
+	struct soflow_hash_entry *dgram_flow_entry = NULL;
 	struct socket *so = sb->sb_so;
 
 	if (m == NULL || (sb->sb_flags & SB_DROP)) {
@@ -948,7 +964,7 @@ sbappendstream(struct sockbuf *sb, struct mbuf *m)
 	}
 
 	if (m->m_nextpkt != NULL || (sb->sb_mb != sb->sb_lastrecord)) {
-		panic("sbappendstream: nexpkt %p || mb %p != lastrecord %p\n",
+		panic("sbappendstream: nexpkt %p || mb %p != lastrecord %p",
 		    m->m_nextpkt, sb->sb_mb, sb->sb_lastrecord);
 		/* NOTREACHED */
 	}
@@ -956,13 +972,17 @@ sbappendstream(struct sockbuf *sb, struct mbuf *m)
 	SBLASTMBUFCHK(sb, __func__);
 
 	if (SOCK_DOM(sb->sb_so) == PF_INET || SOCK_DOM(sb->sb_so) == PF_INET6) {
+		if (NEED_DGRAM_FLOW_TRACKING(so)) {
+			dgram_flow_entry = soflow_get_flow(so, NULL, NULL, NULL, m != NULL ? m_length(m) : 0, false, (m != NULL && m->m_pkthdr.rcvif) ? m->m_pkthdr.rcvif->if_index : 0);
+		}
+
 		if (sb->sb_flags & SB_RECV && !(m && m->m_flags & M_SKIPCFIL)) {
 			int error = sflt_data_in(so, NULL, &m, NULL, 0);
 			SBLASTRECORDCHK(sb, "sbappendstream 1");
 
 #if CONTENT_FILTER
 			if (error == 0) {
-				error = cfil_sock_data_in(so, NULL, m, NULL, 0);
+				error = cfil_sock_data_in(so, NULL, m, NULL, 0, dgram_flow_entry);
 			}
 #endif /* CONTENT_FILTER */
 
@@ -970,10 +990,17 @@ sbappendstream(struct sockbuf *sb, struct mbuf *m)
 				if (error != EJUSTRETURN) {
 					m_freem(m);
 				}
+				if (dgram_flow_entry != NULL) {
+					soflow_free_flow(dgram_flow_entry);
+				}
 				return 0;
 			}
 		} else if (m) {
 			m->m_flags &= ~M_SKIPCFIL;
+		}
+
+		if (dgram_flow_entry != NULL) {
+			soflow_free_flow(dgram_flow_entry);
 		}
 	}
 
@@ -1016,7 +1043,7 @@ sbcheck(struct sockbuf *sb)
 		}
 	}
 	if (len != sb->sb_cc || mbcnt != sb->sb_mbcnt) {
-		panic("cc %ld != %ld || mbcnt %ld != %ld\n", len, sb->sb_cc,
+		panic("cc %ld != %ld || mbcnt %ld != %ld", len, sb->sb_cc,
 		    mbcnt, sb->sb_mbcnt);
 	}
 }
@@ -1083,6 +1110,8 @@ sblastmbufchk(struct sockbuf *sb, const char *where)
 static int
 sbappendrecord_common(struct sockbuf *sb, struct mbuf *m0, boolean_t nodrop)
 {
+	struct soflow_hash_entry *dgram_flow_entry = NULL;
+	struct socket *so = sb->sb_so;
 	struct mbuf *m;
 	int space = 0;
 
@@ -1106,13 +1135,18 @@ sbappendrecord_common(struct sockbuf *sb, struct mbuf *m0, boolean_t nodrop)
 
 	if (SOCK_DOM(sb->sb_so) == PF_INET || SOCK_DOM(sb->sb_so) == PF_INET6) {
 		ASSERT(nodrop == FALSE);
+
+		if (NEED_DGRAM_FLOW_TRACKING(so)) {
+			dgram_flow_entry = soflow_get_flow(so, NULL, NULL, NULL, m0 != NULL ? m_length(m0) : 0, false, (m0 != NULL && m0->m_pkthdr.rcvif) ? m0->m_pkthdr.rcvif->if_index : 0);
+		}
+
 		if (sb->sb_flags & SB_RECV && !(m0 && m0->m_flags & M_SKIPCFIL)) {
 			int error = sflt_data_in(sb->sb_so, NULL, &m0, NULL,
 			    sock_data_filt_flag_record);
 
 #if CONTENT_FILTER
 			if (error == 0) {
-				error = cfil_sock_data_in(sb->sb_so, NULL, m0, NULL, 0);
+				error = cfil_sock_data_in(sb->sb_so, NULL, m0, NULL, 0, dgram_flow_entry);
 			}
 #endif /* CONTENT_FILTER */
 
@@ -1121,10 +1155,17 @@ sbappendrecord_common(struct sockbuf *sb, struct mbuf *m0, boolean_t nodrop)
 				if (error != EJUSTRETURN) {
 					m_freem(m0);
 				}
+				if (dgram_flow_entry != NULL) {
+					soflow_free_flow(dgram_flow_entry);
+				}
 				return 0;
 			}
 		} else if (m0) {
 			m0->m_flags &= ~M_SKIPCFIL;
+		}
+
+		if (dgram_flow_entry != NULL) {
+			soflow_free_flow(dgram_flow_entry);
 		}
 	}
 
@@ -1283,6 +1324,8 @@ sbappendaddr(struct sockbuf *sb, struct sockaddr *asa, struct mbuf *m0,
 	int result = 0;
 	boolean_t sb_unix = (sb->sb_flags & SB_UNIX);
 	struct mbuf *mbuf_chain = NULL;
+	struct soflow_hash_entry *dgram_flow_entry = NULL;
+	struct socket *so = sb->sb_so;
 
 	if (error_out) {
 		*error_out = 0;
@@ -1307,6 +1350,11 @@ sbappendaddr(struct sockbuf *sb, struct sockaddr *asa, struct mbuf *m0,
 
 	if (SOCK_DOM(sb->sb_so) == PF_INET || SOCK_DOM(sb->sb_so) == PF_INET6) {
 		/* Call socket data in filters */
+
+		if (NEED_DGRAM_FLOW_TRACKING(so)) {
+			dgram_flow_entry = soflow_get_flow(so, NULL, asa, control, m0 != NULL ? m_length(m0) : 0, false, (m0 != NULL && m0->m_pkthdr.rcvif) ? m0->m_pkthdr.rcvif->if_index : 0);
+		}
+
 		if (sb->sb_flags & SB_RECV && !(m0 && m0->m_flags & M_SKIPCFIL)) {
 			int error;
 			error = sflt_data_in(sb->sb_so, asa, &m0, &control, 0);
@@ -1315,7 +1363,7 @@ sbappendaddr(struct sockbuf *sb, struct sockaddr *asa, struct mbuf *m0,
 #if CONTENT_FILTER
 			if (error == 0) {
 				error = cfil_sock_data_in(sb->sb_so, asa, m0, control,
-				    0);
+				    0, dgram_flow_entry);
 			}
 #endif /* CONTENT_FILTER */
 
@@ -1331,10 +1379,17 @@ sbappendaddr(struct sockbuf *sb, struct sockaddr *asa, struct mbuf *m0,
 						*error_out = error;
 					}
 				}
+				if (dgram_flow_entry != NULL) {
+					soflow_free_flow(dgram_flow_entry);
+				}
 				return 0;
 			}
 		} else if (m0) {
 			m0->m_flags &= ~M_SKIPCFIL;
+		}
+
+		if (dgram_flow_entry != NULL) {
+			soflow_free_flow(dgram_flow_entry);
 		}
 	}
 
@@ -1429,6 +1484,8 @@ int
 sbappendcontrol(struct sockbuf *sb, struct mbuf *m0, struct mbuf *control,
     int *error_out)
 {
+	struct soflow_hash_entry *dgram_flow_entry = NULL;
+	struct socket *so = sb->sb_so;
 	int result = 0;
 	boolean_t sb_unix = (sb->sb_flags & SB_UNIX);
 
@@ -1450,6 +1507,10 @@ sbappendcontrol(struct sockbuf *sb, struct mbuf *m0, struct mbuf *control,
 	}
 
 	if (SOCK_DOM(sb->sb_so) == PF_INET || SOCK_DOM(sb->sb_so) == PF_INET6) {
+		if (NEED_DGRAM_FLOW_TRACKING(so)) {
+			dgram_flow_entry = soflow_get_flow(so, NULL, NULL, control, m0 != NULL ? m_length(m0) : 0, false, (m0 != NULL && m0->m_pkthdr.rcvif) ? m0->m_pkthdr.rcvif->if_index : 0);
+		}
+
 		if (sb->sb_flags & SB_RECV && !(m0 && m0->m_flags & M_SKIPCFIL)) {
 			int error;
 
@@ -1459,7 +1520,7 @@ sbappendcontrol(struct sockbuf *sb, struct mbuf *m0, struct mbuf *control,
 #if CONTENT_FILTER
 			if (error == 0) {
 				error = cfil_sock_data_in(sb->sb_so, NULL, m0, control,
-				    0);
+				    0, dgram_flow_entry);
 			}
 #endif /* CONTENT_FILTER */
 
@@ -1475,10 +1536,17 @@ sbappendcontrol(struct sockbuf *sb, struct mbuf *m0, struct mbuf *control,
 						*error_out = error;
 					}
 				}
+				if (dgram_flow_entry != NULL) {
+					soflow_free_flow(dgram_flow_entry);
+				}
 				return 0;
 			}
 		} else if (m0) {
 			m0->m_flags &= ~M_SKIPCFIL;
+		}
+
+		if (dgram_flow_entry != NULL) {
+			soflow_free_flow(dgram_flow_entry);
 		}
 	}
 
@@ -1552,7 +1620,7 @@ sbappendmptcpstream_rcv(struct sockbuf *sb, struct mbuf *m)
 	VERIFY(so->so_flags & SOF_MP_SUBFLOW);
 
 	if (m->m_nextpkt != NULL || (sb->sb_mb != sb->sb_lastrecord)) {
-		panic("%s: nexpkt %p || mb %p != lastrecord %p\n", __func__,
+		panic("%s: nexpkt %p || mb %p != lastrecord %p", __func__,
 		    m->m_nextpkt, sb->sb_mb, sb->sb_lastrecord);
 		/* NOTREACHED */
 	}
@@ -1639,7 +1707,7 @@ sbcompress(struct sockbuf *sb, struct mbuf *m, struct mbuf *n)
 	}
 	if (eor != 0) {
 		if (n != NULL) {
-			n->m_flags |= eor;
+			n->m_flags |= M_EOR;
 		} else {
 			printf("semi-panic: sbcompress\n");
 		}
@@ -1673,7 +1741,7 @@ sbflush(struct sockbuf *sb)
 
 	/* so_usecount may be 0 if we get here from sofreelastref() */
 	if (so == NULL) {
-		panic("%s: null so, sb=%p sb_flags=0x%x lr=%p\n",
+		panic("%s: null so, sb=%p sb_flags=0x%x lr=%p",
 		    __func__, sb, sb->sb_flags, lr_saved);
 		/* NOTREACHED */
 	} else if (so->so_usecount < 0) {
@@ -2132,6 +2200,14 @@ pru_preconnect_null(struct socket *so)
 	return 0;
 }
 
+static int
+pru_defunct_null(struct socket *so)
+{
+#pragma unused(so)
+	return 0;
+}
+
+
 void
 pru_sanitize(struct pr_usrreqs *pru)
 {
@@ -2163,6 +2239,7 @@ pru_sanitize(struct pr_usrreqs *pru)
 	DEFAULT(pru->pru_sosend_list, pru_sosend_list_notsupp);
 	DEFAULT(pru->pru_socheckopt, pru_socheckopt_null);
 	DEFAULT(pru->pru_preconnect, pru_preconnect_null);
+	DEFAULT(pru->pru_defunct, pru_defunct_null);
 #undef DEFAULT
 }
 
@@ -2251,7 +2328,47 @@ sowriteable(struct socket *so)
 		return 1;
 	}
 
-	if (sbspace(&(so)->so_snd) >= (so)->so_snd.sb_lowat) {
+	int64_t data = sbspace(&so->so_snd);
+	int64_t lowat = so->so_snd.sb_lowat;
+	/*
+	 * Deal with connected UNIX domain sockets which
+	 * rely on the fact that the sender's socket buffer is
+	 * actually the receiver's socket buffer.
+	 */
+	if (SOCK_DOM(so) == PF_LOCAL) {
+		struct unpcb *unp = sotounpcb(so);
+		if (unp != NULL && unp->unp_conn != NULL &&
+		    unp->unp_conn->unp_socket != NULL) {
+			struct socket *so2 = unp->unp_conn->unp_socket;
+			/*
+			 * At this point we know that `so' is locked
+			 * and that `unp_conn` isn't going to change.
+			 * However, we don't lock `so2` because doing so
+			 * may require unlocking `so'
+			 * (see unp_get_locks_in_order()).
+			 *
+			 * Two cases can happen:
+			 *
+			 * 1) we return 1 and tell the application that
+			 *    it can write.  Meanwhile, another thread
+			 *    fills up the socket buffer.  This will either
+			 *    lead to a blocking send or EWOULDBLOCK
+			 *    which the application should deal with.
+			 * 2) we return 0 and tell the application that
+			 *    the socket is not writable.  Meanwhile,
+			 *    another thread depletes the receive socket
+			 *    buffer. In this case the application will
+			 *    be woken up by sb_notify().
+			 *
+			 * MIN() is required because otherwise sosendcheck()
+			 * may return EWOULDBLOCK since it only considers
+			 * so->so_snd.
+			 */
+			data = MIN(data, sbspace(&so2->so_rcv));
+		}
+	}
+
+	if (data >= lowat) {
 		if (so->so_flags & SOF_NOTSENT_LOWAT) {
 			if ((SOCK_DOM(so) == PF_INET6 ||
 			    SOCK_DOM(so) == PF_INET) &&
@@ -2357,7 +2474,7 @@ sblock(struct sockbuf *sb, uint32_t flags)
 
 	/* so_usecount may be 0 if we get here from sofreelastref() */
 	if (so == NULL) {
-		panic("%s: null so, sb=%p sb_flags=0x%x lr=%p\n",
+		panic("%s: null so, sb=%p sb_flags=0x%x lr=%p",
 		    __func__, sb, sb->sb_flags, lr_saved);
 		/* NOTREACHED */
 	} else if (so->so_usecount < 0) {
@@ -2376,7 +2493,7 @@ sblock(struct sockbuf *sb, uint32_t flags)
 		 * been cleared by sodefunct()
 		 */
 		if (!(so->so_flags & SOF_DEFUNCT) && !(sb->sb_flags & SB_LOCK)) {
-			panic("%s: SB_LOCK not held for %p\n",
+			panic("%s: SB_LOCK not held for %p",
 			    __func__, sb);
 		}
 
@@ -2431,10 +2548,10 @@ sblock(struct sockbuf *sb, uint32_t flags)
 		if (error == 0 && (so->so_flags & SOF_DEFUNCT) &&
 		    !(flags & SBL_IGNDEFUNCT)) {
 			error = EBADF;
-			SODEFUNCTLOG("%s[%d, %s]: defunct so 0x%llx [%d,%d] "
+			SODEFUNCTLOG("%s[%d, %s]: defunct so 0x%llu [%d,%d] "
 			    "(%d)\n", __func__, proc_selfpid(),
 			    proc_best_name(current_proc()),
-			    (uint64_t)VM_KERNEL_ADDRPERM(so),
+			    so->so_gencnt,
 			    SOCK_DOM(so), SOCK_TYPE(so), error);
 		}
 
@@ -2458,7 +2575,7 @@ sbunlock(struct sockbuf *sb, boolean_t keeplocked)
 
 	/* so_usecount may be 0 if we get here from sofreelastref() */
 	if (so == NULL) {
-		panic("%s: null so, sb=%p sb_flags=0x%x lr=%p\n",
+		panic("%s: null so, sb=%p sb_flags=0x%x lr=%p",
 		    __func__, sb, sb->sb_flags, lr_saved);
 		/* NOTREACHED */
 	} else if (so->so_usecount < 0) {
@@ -2480,7 +2597,7 @@ sbunlock(struct sockbuf *sb, boolean_t keeplocked)
 		    !(sb->sb_flags & SB_LOCK) &&
 		    !(so->so_state & SS_DEFUNCT) &&
 		    !(so->so_flags1 & SOF1_DEFUNCTINPROG)) {
-			panic("%s: SB_LOCK not held for %p\n",
+			panic("%s: SB_LOCK not held for %p",
 			    __func__, sb);
 		}
 		/* Keep the sockbuf locked and proceed */
@@ -2541,9 +2658,27 @@ sowwakeup(struct socket *so)
 	}
 }
 
-void
-soevent(struct socket *so, long hint)
+static void
+soevupcall(struct socket *so, uint32_t hint)
 {
+	if (so->so_event != NULL) {
+		caddr_t so_eventarg = so->so_eventarg;
+
+		hint &= so->so_eventmask;
+		if (hint != 0) {
+			so->so_event(so, so_eventarg, hint);
+		}
+	}
+}
+
+void
+soevent(struct socket *so, uint32_t hint)
+{
+	if (net_wake_pkt_debug > 0 && (hint & SO_FILT_HINT_WAKE_PKT)) {
+		os_log(OS_LOG_DEFAULT, "%s: SO_FILT_HINT_WAKE_PKT so %p",
+		    __func__, so);
+	}
+
 	if (so->so_flags & SOF_KNOTE) {
 		KNOTE(&so->so_klist, hint);
 	}
@@ -2560,19 +2695,6 @@ soevent(struct socket *so, long hint)
 	    !(so->so_restrictions & SO_RESTRICT_DENY_EXPENSIVE) &&
 	    !(so->so_restrictions & SO_RESTRICT_DENY_CONSTRAINED)) {
 		soevent_ifdenied(so);
-	}
-}
-
-void
-soevupcall(struct socket *so, long hint)
-{
-	if (so->so_event != NULL) {
-		caddr_t so_eventarg = so->so_eventarg;
-
-		hint &= so->so_eventmask;
-		if (hint != 0) {
-			so->so_event(so, so_eventarg, hint);
-		}
 	}
 }
 
@@ -2635,19 +2757,33 @@ soevent_ifdenied(struct socket *so)
 }
 
 /*
- * Make a copy of a sockaddr in a malloced buffer of type M_SONAME.
+ * Make a copy of a sockaddr in a malloced buffer of type SONAME.
  */
 struct sockaddr *
 dup_sockaddr(struct sockaddr *sa, int canwait)
 {
 	struct sockaddr *sa2;
 
-	MALLOC(sa2, struct sockaddr *, sa->sa_len, M_SONAME,
-	    canwait ? M_WAITOK : M_NOWAIT);
-	if (sa2) {
+	sa2 = (struct sockaddr *)alloc_sockaddr(sa->sa_len, canwait ? Z_WAITOK : Z_NOWAIT);
+	if (sa2 != NULL) {
 		bcopy(sa, sa2, sa->sa_len);
 	}
 	return sa2;
+}
+
+void *
+alloc_sockaddr(size_t size, zalloc_flags_t flags)
+{
+	VERIFY((size) <= UINT8_MAX);
+
+	__typed_allocators_ignore_push
+	struct sockaddr *sa = kheap_alloc(KHEAP_SONAME, size, flags | Z_ZERO);
+	__typed_allocators_ignore_pop
+	if (sa != NULL) {
+		sa->sa_len = (uint8_t)size;
+	}
+
+	return sa;
 }
 
 /*
@@ -2792,7 +2928,7 @@ soclearfastopen(struct socket *so)
 }
 
 void
-sonullevent(struct socket *so, void *arg, long hint)
+sonullevent(struct socket *so, void *arg, uint32_t hint)
 {
 #pragma unused(so, arg, hint)
 }

@@ -90,23 +90,17 @@
 #include <IOKit/IOReturn.h>     /* for kIOReturnNotPrivileged */
 #include <IOKit/IOBSD.h>        /* for IOVnodeHasEntitlement */
 
+#include <os/log.h>
 #include <os/overflow.h>
 
-/*
- * XXX vm/pmap.h should not treat these prototypes as MACH_KERNEL_PRIVATE
- * when KERNEL is defined.
- */
-extern pmap_t   pmap_create_options(ledger_t ledger, vm_map_size_t size,
-    unsigned int flags);
-#if __has_feature(ptrauth_calls) && XNU_TARGET_OS_OSX
-extern void pmap_disable_user_jop(pmap_t pmap);
-#endif /* __has_feature(ptrauth_calls) && XNU_TARGET_OS_OSX */
+#include "kern_exec_internal.h"
 
 /* XXX should have prototypes in a shared header file */
 extern int      get_map_nentries(vm_map_t);
 
 extern kern_return_t    memory_object_signed(memory_object_control_t control,
     boolean_t is_signed);
+
 
 /* An empty load_result_t */
 static const load_result_t load_result_null = {
@@ -135,7 +129,7 @@ static const load_result_t load_result_null = {
 	.cs_end_offset = 0,
 	.threadstate = NULL,
 	.threadstate_sz = 0,
-	.is_cambria = 0,
+	.is_rosetta = 0,
 	.dynlinker_mach_header = MACH_VM_MIN_ADDRESS,
 	.dynlinker_fd = -1,
 };
@@ -184,7 +178,7 @@ static load_return_t
 load_version(
 	struct version_min_command     *vmc,
 	boolean_t               *found_version_cmd,
-	int                     ip_flags,
+	struct image_params             *imgp,
 	load_result_t           *result
 	);
 
@@ -277,6 +271,16 @@ load_dylinker(
 	struct image_params     *imgp
 	);
 
+
+#if CONFIG_ROSETTA
+static load_return_t
+load_rosetta(
+	vm_map_t                        map,
+	thread_t                        thread,
+	load_result_t           *result,
+	struct image_params     *imgp
+	);
+#endif
 
 #if __x86_64__
 extern int bootarg_no32exec;
@@ -383,7 +387,13 @@ arm64e_plugin_host(struct image_params *imgp, load_result_t *result)
 
 	/* Check if override host plugin entitlement is present and posix spawn attribute to disable A keys is passed */
 	if (IOVnodeHasEntitlement(imgp->ip_vp, (int64_t)imgp->ip_arch_offset, OVERRIDE_PLUGIN_HOST_ENTITLEMENT)) {
-		return imgp->ip_flags & IMGPF_PLUGIN_HOST_DISABLE_A_KEYS;
+		bool ret = imgp->ip_flags & IMGPF_PLUGIN_HOST_DISABLE_A_KEYS;
+		if (ret) {
+			proc_t p = vfs_context_proc(imgp->ip_vfs_context);
+			set_proc_name(imgp, p);
+			os_log(OS_LOG_DEFAULT, "%s: running binary \"%s\" in keys-off mode due to posix_spawnattr_disable_ptr_auth_a_keys_np", __func__, p->p_name);
+		}
+		return ret;
 	}
 
 	/* Disabling library validation is a good signal that this process plans to host plugins */
@@ -393,7 +403,11 @@ arm64e_plugin_host(struct image_params *imgp, load_result_t *result)
 		CLEAR_LV_ENTITLEMENT,
 	};
 	for (size_t i = 0; i < ARRAY_COUNT(disable_lv_entitlements); i++) {
-		if (IOVnodeHasEntitlement(imgp->ip_vp, (int64_t)imgp->ip_arch_offset, disable_lv_entitlements[i])) {
+		const char *entitlement = disable_lv_entitlements[i];
+		if (IOVnodeHasEntitlement(imgp->ip_vp, (int64_t)imgp->ip_arch_offset, entitlement)) {
+			proc_t p = vfs_context_proc(imgp->ip_vfs_context);
+			set_proc_name(imgp, p);
+			os_log(OS_LOG_DEFAULT, "%s: running binary \"%s\" in keys-off mode due to entitlement: %s", __func__, p->p_name, entitlement);
 			return true;
 		}
 	}
@@ -413,6 +427,9 @@ arm64e_plugin_host(struct image_params *imgp, load_result_t *result)
 	};
 	for (size_t i = 0; i < ARRAY_COUNT(hardening_exceptions); i++) {
 		if (strncmp(hardening_exceptions[i], identity, strlen(hardening_exceptions[i])) == 0) {
+			proc_t p = vfs_context_proc(imgp->ip_vfs_context);
+			set_proc_name(imgp, p);
+			os_log(OS_LOG_DEFAULT, "%s: running binary \"%s\" in keys-off mode due to identity: %s", __func__, p->p_name, identity);
 			return true;
 		}
 	}
@@ -459,6 +476,9 @@ load_machfile(
 #if defined(HAS_APPLE_PAC)
 	pmap_flags |= (imgp->ip_flags & IMGPF_NOJOP) ? PMAP_CREATE_DISABLE_JOP : 0;
 #endif /* defined(HAS_APPLE_PAC) */
+#if CONFIG_ROSETTA
+	pmap_flags |= (imgp->ip_flags & IMGPF_ROSETTA) ? PMAP_CREATE_ROSETTA : 0;
+#endif
 	pmap_flags |= result->is_64bit_addr ? PMAP_CREATE_64BIT : 0;
 
 	task_t ledger_task;
@@ -483,10 +503,9 @@ load_machfile(
 	if (pmap == NULL) {
 		return LOAD_RESOURCE;
 	}
-	map = vm_map_create(pmap,
-	    0,
+	map = vm_map_create_options(pmap, 0,
 	    vm_compute_max_offset(result->is_64bit_addr),
-	    TRUE);
+	    VM_MAP_CREATE_PAGEABLE);
 
 #if defined(__arm64__)
 	if (result->is_64bit_addr) {
@@ -495,9 +514,6 @@ load_machfile(
 	} else {
 		vm_map_set_page_shift(map, page_shift_user32);
 	}
-#elif (__ARM_ARCH_7K__ >= 2) && defined(PLATFORM_WatchOS)
-	/* enforce 16KB alignment for watch targets with new ABI */
-	vm_map_set_page_shift(map, SIXTEENK_PAGE_SHIFT);
 #endif /* __arm64__ */
 
 #if PMAP_CREATE_FORCE_4K_PAGES
@@ -533,11 +549,12 @@ load_machfile(
 		aslr_section_offset = (random() % aslr_section_offset) * aslr_section_size;
 
 		aslr_page_offset = random();
-		aslr_page_offset %= vm_map_get_max_aslr_slide_pages(map);
+		aslr_page_offset = (aslr_page_offset % (vm_map_get_max_aslr_slide_pages(map) - 1)) + 1;
 		aslr_page_offset <<= vm_map_page_shift(map);
 
 		dyld_aslr_page_offset = random();
-		dyld_aslr_page_offset %= vm_map_get_max_loader_aslr_slide_pages(map);
+		dyld_aslr_page_offset = (dyld_aslr_page_offset %
+		    (vm_map_get_max_loader_aslr_slide_pages(map) - 1)) + 1;
 		dyld_aslr_page_offset <<= vm_map_page_shift(map);
 
 		aslr_page_offset += aslr_section_offset;
@@ -637,7 +654,7 @@ load_machfile(
 	 * task is not yet running, and it makes no sense.
 	 */
 	if (in_exec) {
-		proc_t p = vfs_context_proc(imgp->ip_vfs_context);
+		proc_t p = current_proc();
 		/*
 		 * Mark the task as halting and start the other
 		 * threads towards terminating themselves.  Then
@@ -685,19 +702,15 @@ load_machfile(
 		imgp->ip_flags |= IMGPF_NOJOP;
 		pmap_disable_user_jop(pmap);
 	}
+
+#if CONFIG_ROSETTA
+	/* Disable JOP keys if the Rosetta runtime being used isn't arm64e */
+	if (result->is_rosetta && (imgp->ip_flags & IMGPF_NOJOP)) {
+		pmap_disable_user_jop(pmap);
+	}
+#endif /* CONFIG_ROSETTA */
 #endif /* __has_feature(ptrauth_calls) && defined(XNU_TARGET_OS_OSX) */
 
-#ifdef CONFIG_32BIT_TELEMETRY
-	if (!result->is_64bit_data) {
-		/*
-		 * This may not need to be an AST; we merely need to ensure that
-		 * we gather telemetry at the point where all of the information
-		 * that we want has been added to the process.
-		 */
-		task_set_32bit_log_flag(get_threadtask(thread));
-		act_set_astbsd(thread);
-	}
-#endif /* CONFIG_32BIT_TELEMETRY */
 
 	return LOAD_SUCCESS;
 }
@@ -773,7 +786,6 @@ parse_machfile(
 	int                     error;
 	int                     resid = 0;
 	int                     spawn = (imgp->ip_flags & IMGPF_SPAWN);
-	int                     vfexec = (imgp->ip_flags & IMGPF_VFORK_EXEC);
 	size_t                  mach_header_sz = sizeof(struct mach_header);
 	boolean_t               abi64;
 	boolean_t               got_code_signatures = FALSE;
@@ -809,6 +821,14 @@ parse_machfile(
 	depth++;
 
 	/*
+	 * Set CS_NO_UNTRUSTED_HELPERS by default; load_dylinker and load_rosetta
+	 * will unset it if necessary.
+	 */
+	if (depth == 1) {
+		result->csflags |= CS_NO_UNTRUSTED_HELPERS;
+	}
+
+	/*
 	 *	Check to see if right machine type.
 	 */
 	if (((cpu_type_t)(header->cputype & ~CPU_ARCH_MASK) != (cpu_type() & ~CPU_ARCH_MASK))
@@ -837,6 +857,10 @@ parse_machfile(
 			result->needs_dynlinker = TRUE;
 		} else if (header->cputype == CPU_TYPE_X86_64) {
 			/* x86_64 static binaries allowed */
+#if CONFIG_ROSETTA
+		} else if (imgp->ip_flags & IMGPF_ROSETTA) {
+			/* Rosetta runtime allowed */
+#endif /* CONFIG_X86_64_COMPAT */
 		} else {
 			/* Check properties of static executables (disallowed except for development) */
 #if !(DEVELOPMENT || DEBUG)
@@ -878,7 +902,7 @@ parse_machfile(
 	/*
 	 * Map the load commands into kernel memory.
 	 */
-	addr = kalloc(alloc_size);
+	addr = kalloc_data(alloc_size, Z_WAITOK);
 	if (addr == NULL) {
 		return LOAD_NOSPACE;
 	}
@@ -886,14 +910,14 @@ parse_machfile(
 	error = vn_rdwr(UIO_READ, vp, addr, (int)alloc_size, file_offset,
 	    UIO_SYSSPACE, 0, vfs_context_ucred(imgp->ip_vfs_context), &resid, p);
 	if (error) {
-		kfree(addr, alloc_size);
+		kfree_data(addr, alloc_size);
 		return LOAD_IOERROR;
 	}
 
 	if (resid) {
 		{
 			/* We must be able to read in as much as the mach_header indicated */
-			kfree(addr, alloc_size);
+			kfree_data(addr, alloc_size);
 			return LOAD_BADMACHO;
 		}
 	}
@@ -1031,7 +1055,7 @@ parse_machfile(
 			/*
 			 *	Get a pointer to the command.
 			 */
-			lcp = (struct load_command *)(addr + offset);
+			lcp = (struct load_command *)((uintptr_t)addr + offset);
 			oldoffset = offset;
 
 			/*
@@ -1200,6 +1224,14 @@ parse_machfile(
 				if (pass != 1) {
 					break;
 				}
+#if CONFIG_ROSETTA
+				if (depth == 2 && (imgp->ip_flags & IMGPF_ROSETTA)) {
+					// Ignore dyld, Rosetta will parse it's load commands to get the
+					// entry point.
+					result->validentry = 1;
+					break;
+				}
+#endif
 				ret = load_unixthread(
 					(struct thread_command *) lcp,
 					thread,
@@ -1260,7 +1292,7 @@ parse_machfile(
 				if (ret != LOAD_SUCCESS) {
 					printf("proc %d: load code signature error %d "
 					    "for file \"%s\"\n",
-					    p->p_pid, ret, vp->v_name);
+					    proc_getpid(p), ret, vp->v_name);
 					/*
 					 * Allow injections to be ignored on devices w/o enforcement enabled
 					 */
@@ -1287,13 +1319,13 @@ parse_machfile(
 						valid = cs_validate_range(vp,
 						    NULL,
 						    file_offset + off,
-						    addr + off,
+						    (const void *)((uintptr_t)addr + off),
 						    MIN(PAGE_SIZE, cmds_size),
 						    &tainted);
 						if (!valid || (tainted & CS_VALIDATE_TAINTED)) {
 							if (cs_debug) {
 								printf("CODE SIGNING: %s[%d]: invalid initial page at offset %lld validated:%d tainted:%d csflags:0x%x\n",
-								    vp->v_name, p->p_pid, (long long)(file_offset + off), valid, tainted, result->csflags);
+								    vp->v_name, proc_getpid(p), (long long)(file_offset + off), valid, tainted, result->csflags);
 							}
 							if (cs_process_global_enforcement() ||
 							    (result->csflags & (CS_HARD | CS_KILL | CS_ENFORCEMENT))) {
@@ -1320,7 +1352,7 @@ parse_machfile(
 					os_reason_t load_failure_reason = OS_REASON_NULL;
 					printf("proc %d: set_code_unprotect() error %d "
 					    "for file \"%s\"\n",
-					    p->p_pid, ret, vp->v_name);
+					    proc_getpid(p), ret, vp->v_name);
 					/*
 					 * Don't let the app run if it's
 					 * encrypted but we failed to set up the
@@ -1334,11 +1366,11 @@ parse_machfile(
 						proc_unlock(p);
 
 						KERNEL_DEBUG_CONSTANT(BSDDBG_CODE(DBG_BSD_PROC, BSD_PROC_EXITREASON_CREATE) | DBG_FUNC_NONE,
-						    p->p_pid, OS_REASON_EXEC, EXEC_EXIT_REASON_FAIRPLAY_DECRYPT, 0, 0);
+						    proc_getpid(p), OS_REASON_EXEC, EXEC_EXIT_REASON_FAIRPLAY_DECRYPT, 0, 0);
 						load_failure_reason = os_reason_create(OS_REASON_EXEC, EXEC_EXIT_REASON_FAIRPLAY_DECRYPT);
 					} else {
 						KERNEL_DEBUG_CONSTANT(BSDDBG_CODE(DBG_BSD_PROC, BSD_PROC_EXITREASON_CREATE) | DBG_FUNC_NONE,
-						    p->p_pid, OS_REASON_EXEC, EXEC_EXIT_REASON_DECRYPT, 0, 0);
+						    proc_getpid(p), OS_REASON_EXEC, EXEC_EXIT_REASON_DECRYPT, 0, 0);
 						load_failure_reason = os_reason_create(OS_REASON_EXEC, EXEC_EXIT_REASON_DECRYPT);
 					}
 
@@ -1348,11 +1380,8 @@ parse_machfile(
 					 */
 					if (!spawn) {
 						assert(load_failure_reason != OS_REASON_NULL);
-						if (vfexec) {
-							psignal_vfork_with_reason(p, get_threadtask(imgp->ip_new_thread), imgp->ip_new_thread, SIGKILL, load_failure_reason);
-							load_failure_reason = OS_REASON_NULL;
-						} else {
-							psignal_with_reason(p, SIGKILL, load_failure_reason);
+						{
+							psignal_with_reason(current_proc(), SIGKILL, load_failure_reason);
 							load_failure_reason = OS_REASON_NULL;
 						}
 					} else {
@@ -1372,7 +1401,7 @@ parse_machfile(
 					break;
 				}
 				vmc = (struct version_min_command *) lcp;
-				ret = load_version(vmc, &found_version_cmd, imgp->ip_flags, result);
+				ret = load_version(vmc, &found_version_cmd, imgp, result);
 #if XNU_TARGET_OS_OSX
 				if (ret == LOAD_SUCCESS) {
 					if (result->ip_platform == PLATFORM_IOS) {
@@ -1443,13 +1472,36 @@ parse_machfile(
 			    dyld_aslr_offset, result, imgp);
 		}
 
+#if CONFIG_ROSETTA
+		if ((ret == LOAD_SUCCESS) && (depth == 1) && (imgp->ip_flags & IMGPF_ROSETTA)) {
+			ret = load_rosetta(map, thread, result, imgp);
+			if (ret == LOAD_SUCCESS) {
+				if (result->user_stack_alloc_size != 0) {
+					// If a stack allocation is required then add a 4gb gap after the main
+					// binary/dyld for the worst case static translation size.
+					mach_vm_size_t reserved_aot_size = 0x100000000;
+					vm_map_offset_t mask = vm_map_page_mask(map);
+
+					mach_vm_address_t vm_end;
+					if (dlp != 0) {
+						vm_end = vm_map_round_page(result->dynlinker_max_vm_addr, mask);
+					} else {
+						vm_end = vm_map_round_page(result->max_vm_addr, mask);
+					}
+
+					mach_vm_size_t user_stack_size = vm_map_round_page(result->user_stack_alloc_size, mask);
+					result->user_stack = vm_map_round_page(vm_end + user_stack_size + reserved_aot_size + slide, mask);
+				}
+			}
+		}
+#endif
 
 		if ((ret == LOAD_SUCCESS) && (depth == 1)) {
 			if (result->thread_count == 0) {
 				ret = LOAD_FAILURE;
 			}
 #if CONFIG_ENFORCE_SIGNED_CODE
-			if (result->needs_dynlinker && !(result->csflags & CS_DYLD_PLATFORM)) {
+			if (!(result->csflags & CS_NO_UNTRUSTED_HELPERS)) {
 				ret = LOAD_FAILURE;
 			}
 #endif
@@ -1460,7 +1512,7 @@ parse_machfile(
 		ret = LOAD_BADMACHO_UPX;
 	}
 
-	kfree(addr, alloc_size);
+	kfree_data(addr, alloc_size);
 
 	return ret;
 }
@@ -1513,8 +1565,7 @@ check_if_simulator_binary(
 	cred =  kauth_cred_proc_ref(p);
 
 	/* Allocate page to copyin mach header */
-	ip_vdata = kalloc(PAGE_SIZE);
-	bzero(ip_vdata, PAGE_SIZE);
+	ip_vdata = kalloc_data(PAGE_SIZE, Z_WAITOK | Z_ZERO);
 	if (ip_vdata == NULL) {
 		goto bad;
 	}
@@ -1546,7 +1597,7 @@ check_if_simulator_binary(
 	/*
 	 * Map the load commands into kernel memory.
 	 */
-	addr = kalloc(alloc_size);
+	addr = kalloc_data(alloc_size, Z_WAITOK);
 	if (addr == NULL) {
 		goto bad;
 	}
@@ -1580,7 +1631,7 @@ check_if_simulator_binary(
 		/*
 		 *	Get a pointer to the command.
 		 */
-		lcp = (struct load_command *)(addr + offset);
+		lcp = (struct load_command *)((uintptr_t)addr + offset);
 
 		/*
 		 * Perform prevalidation of the struct load_command
@@ -1636,7 +1687,7 @@ check_if_simulator_binary(
 
 bad:
 	if (ip_vdata) {
-		kfree(ip_vdata, PAGE_SIZE);
+		kfree_data(ip_vdata, PAGE_SIZE);
 	}
 
 	if (cred) {
@@ -1644,7 +1695,7 @@ bad:
 	}
 
 	if (addr) {
-		kfree(addr, alloc_size);
+		kfree_data(addr, alloc_size);
 	}
 
 	return simulator_binary;
@@ -1714,7 +1765,7 @@ unprotect_dsmos_segment(
 			p = current_proc();
 			printf("APPLE_PROTECT: %d[%s] map %p "
 			    "[0x%llx:0x%llx] %s(%s)\n",
-			    p->p_pid, p->p_comm, map,
+			    proc_getpid(p), p->p_comm, map,
 			    (uint64_t) map_addr,
 			    (uint64_t) (map_addr + map_size),
 			    __FUNCTION__, vp->v_name);
@@ -1804,7 +1855,7 @@ map_segment(
 
 	effective_page_mask = vm_map_page_mask(map);
 
-	vmk_flags = VM_MAP_KERNEL_FLAGS_NONE;
+	vmk_flags = VM_MAP_KERNEL_FLAGS_FIXED();
 	if (vm_map_page_aligned(vm_start, effective_page_mask) &&
 	    vm_map_page_aligned(vm_end, effective_page_mask) &&
 	    vm_map_page_aligned(file_start, effective_page_mask) &&
@@ -1842,9 +1893,7 @@ map_segment(
 				&cur_start,
 				cur_end - cur_start,
 				(mach_vm_offset_t)0,
-				VM_FLAGS_FIXED,
 				vmk_flags,
-				VM_KERN_MEMORY_NONE,
 				control,
 				file_start + cur_offset,
 				TRUE, /* copy */
@@ -1856,9 +1905,7 @@ map_segment(
 				&cur_start,
 				cur_end - cur_start,
 				(mach_vm_offset_t)0,
-				VM_FLAGS_FIXED,
 				vmk_flags,
-				VM_KERN_MEMORY_NONE,
 				IPC_PORT_NULL,
 				0, /* offset */
 				TRUE, /* copy */
@@ -1887,7 +1934,7 @@ map_segment(
 			cur_vmk_flags = vmk_flags;
 		} else {
 			/* regular mapping for the middle */
-			cur_vmk_flags = VM_MAP_KERNEL_FLAGS_NONE;
+			cur_vmk_flags = VM_MAP_KERNEL_FLAGS_FIXED();
 		}
 
 #if !defined(XNU_TARGET_OS_OSX)
@@ -1906,7 +1953,7 @@ map_segment(
 		cur_vmk_flags.vmkf_cs_enforcement_override = TRUE;
 #endif /* !defined(XNU_TARGET_OS_OSX) */
 
-		if (result->is_cambria && (initprot & VM_PROT_EXECUTE) == VM_PROT_EXECUTE) {
+		if (result->is_rosetta && (initprot & VM_PROT_EXECUTE) == VM_PROT_EXECUTE) {
 			cur_vmk_flags.vmkf_translated_allow_execute = TRUE;
 		}
 
@@ -1921,9 +1968,7 @@ map_segment(
 				&cur_start,
 				cur_end - cur_start,
 				(mach_vm_offset_t)0,
-				VM_FLAGS_FIXED,
 				cur_vmk_flags,
-				VM_KERN_MEMORY_NONE,
 				control,
 				file_start + cur_offset,
 				TRUE, /* copy */
@@ -1935,9 +1980,7 @@ map_segment(
 				&cur_start,
 				cur_end - cur_start,
 				(mach_vm_offset_t)0,
-				VM_FLAGS_FIXED,
 				cur_vmk_flags,
-				VM_KERN_MEMORY_NONE,
 				IPC_PORT_NULL,
 				0, /* offset */
 				TRUE, /* copy */
@@ -1967,9 +2010,7 @@ map_segment(
 				&cur_start,
 				cur_end - cur_start,
 				(mach_vm_offset_t)0,
-				VM_FLAGS_FIXED,
 				vmk_flags,
-				VM_KERN_MEMORY_NONE,
 				control,
 				file_start + cur_offset,
 				TRUE, /* copy */
@@ -1981,9 +2022,7 @@ map_segment(
 				&cur_start,
 				cur_end - cur_start,
 				(mach_vm_offset_t)0,
-				VM_FLAGS_FIXED,
 				vmk_flags,
-				VM_KERN_MEMORY_NONE,
 				IPC_PORT_NULL,
 				0, /* offset */
 				TRUE, /* copy */
@@ -2032,7 +2071,6 @@ load_segment(
 	vm_map_size_t           effective_page_size;
 	vm_map_offset_t         effective_page_mask;
 #if __arm64__
-	vm_map_kernel_flags_t   vmk_flags;
 	boolean_t               fourk_align;
 #endif /* __arm64__ */
 
@@ -2231,16 +2269,12 @@ load_segment(
 		    vm_end > vm_end_aligned) {
 			/* use fourk_pager to map the rest of pagezero */
 			assert(fourk_align);
-			vmk_flags = VM_MAP_KERNEL_FLAGS_NONE;
-			vmk_flags.vmkf_fourk = TRUE;
 			ret = vm_map_enter_mem_object(
 				map,
 				&vm_end_aligned,
 				vm_end - vm_end_aligned,
 				(mach_vm_offset_t) 0,   /* mask */
-				VM_FLAGS_FIXED,
-				vmk_flags,
-				VM_KERN_MEMORY_NONE,
+				VM_MAP_KERNEL_FLAGS_FIXED(.vmkf_fourk = true),
 				IPC_PORT_NULL,
 				0,
 				FALSE,  /* copy */
@@ -2258,7 +2292,7 @@ load_segment(
 	} else {
 #if !defined(XNU_TARGET_OS_OSX)
 		/* not PAGEZERO: should not be mapped at address 0 */
-		if (filetype != MH_DYLINKER && scp->vmaddr == 0) {
+		if (filetype != MH_DYLINKER && (imgp->ip_flags & IMGPF_ROSETTA) == 0 && scp->vmaddr == 0) {
 			DEBUG4K_ERROR("LOAD_BADMACHO filetype %d vmaddr 0x%llx\n", filetype, scp->vmaddr);
 			return LOAD_BADMACHO;
 		}
@@ -2370,23 +2404,21 @@ load_segment(
 		 */
 		delta_size = map_size - scp->filesize;
 		if (delta_size > 0) {
-			mach_vm_offset_t        tmp;
+			void *tmp = kalloc_data(delta_size, Z_WAITOK | Z_ZERO);
+			int rc;
 
-			ret = mach_vm_allocate_kernel(kernel_map, &tmp, delta_size, VM_FLAGS_ANYWHERE, VM_KERN_MEMORY_BSD);
-			if (ret != KERN_SUCCESS) {
+			if (tmp == NULL) {
 				DEBUG4K_ERROR("LOAD_RESOURCE delta_size 0x%llx ret 0x%x\n", delta_size, ret);
 				return LOAD_RESOURCE;
 			}
 
-			if (copyout(tmp, map_addr + scp->filesize,
-			    delta_size)) {
-				(void) mach_vm_deallocate(
-					kernel_map, tmp, delta_size);
+			rc = copyout(tmp, map_addr + scp->filesize, delta_size);
+			kfree_data(tmp, delta_size);
+
+			if (rc) {
 				DEBUG4K_ERROR("LOAD_FAILURE copyout 0x%llx 0x%llx\n", map_addr + scp->filesize, delta_size);
 				return LOAD_FAILURE;
 			}
-
-			(void) mach_vm_deallocate(kernel_map, tmp, delta_size);
 		}
 #endif /* FIXME */
 	}
@@ -2513,7 +2545,7 @@ load_return_t
 load_version(
 	struct version_min_command     *vmc,
 	boolean_t               *found_version_cmd,
-	int                     ip_flags __unused,
+	struct image_params             *imgp __unused,
 	load_result_t           *result
 	)
 {
@@ -2547,7 +2579,6 @@ load_version(
 #else
 	case LC_VERSION_MIN_IPHONEOS: {
 #if __arm64__
-		extern int legacy_footprint_entitlement_mode;
 		if (vmc->sdk < (12 << 16)) {
 			/* app built with a pre-iOS12 SDK: apply legacy footprint mitigation */
 			result->legacy_footprint = TRUE;
@@ -2794,7 +2825,7 @@ load_threadstate(
 
 	if (total_size > 0) {
 		local_ts_size = total_size;
-		local_ts = kalloc(local_ts_size);
+		local_ts = (uint32_t *)kalloc_data(local_ts_size, Z_WAITOK);
 		if (local_ts == NULL) {
 			return LOAD_FAILURE;
 		}
@@ -2831,7 +2862,7 @@ load_threadstate(
 
 bad:
 	if (local_ts) {
-		kfree(local_ts, local_ts_size);
+		kfree_data(local_ts, local_ts_size);
 	}
 	return ret;
 }
@@ -2954,6 +2985,27 @@ struct macho_data {
 #if (DEVELOPMENT || DEBUG)
 extern char dyld_alt_path[];
 extern int use_alt_dyld;
+
+extern char dyld_suffix[];
+extern int use_dyld_suffix;
+
+typedef struct _dyld_suffix_map_entry {
+	const char *suffix;
+	const char *path;
+} dyld_suffix_map_entry_t;
+
+static const dyld_suffix_map_entry_t _dyld_suffix_map[] = {
+	[0] = {
+		.suffix = "",
+		.path = DEFAULT_DYLD_PATH,
+	}, {
+		.suffix = "release",
+		.path = DEFAULT_DYLD_PATH,
+	}, {
+		.suffix = "bringup",
+		.path = "/usr/appleinternal/lib/dyld.bringup",
+	},
+};
 #endif
 
 static load_return_t
@@ -3015,6 +3067,18 @@ load_dylinker(
 				name = dyld_alt_path;
 			}
 		}
+	} else if (use_dyld_suffix) {
+		size_t i = 0;
+
+#define countof(x) (sizeof(x) / sizeof(x[0]))
+		for (i = 0; i < countof(_dyld_suffix_map); i++) {
+			const dyld_suffix_map_entry_t *entry = &_dyld_suffix_map[i];
+
+			if (strcmp(entry->suffix, dyld_suffix) == 0) {
+				name = entry->path;
+				break;
+			}
+		}
 	}
 #endif
 
@@ -3026,7 +3090,7 @@ load_dylinker(
 
 	/* Allocate wad-of-data from heap to reduce excessively deep stacks */
 
-	dyld_data = kheap_alloc(KHEAP_TEMP, sizeof(*dyld_data), Z_WAITOK);
+	dyld_data = kalloc_type(typeof(*dyld_data), Z_WAITOK);
 	header = &dyld_data->__header;
 	myresult = &dyld_data->__myresult;
 	macho_data = &dyld_data->__macho_data;
@@ -3051,7 +3115,7 @@ load_dylinker(
 	if (ret == LOAD_SUCCESS) {
 		if (result->threadstate) {
 			/* don't use the app's threadstate if we have a dyld */
-			kfree(result->threadstate, result->threadstate_sz);
+			kfree_data(result->threadstate, result->threadstate_sz);
 		}
 		result->threadstate = myresult->threadstate;
 		result->threadstate_sz = myresult->threadstate_sz;
@@ -3061,14 +3125,50 @@ load_dylinker(
 		result->validentry = myresult->validentry;
 		result->all_image_info_addr = myresult->all_image_info_addr;
 		result->all_image_info_size = myresult->all_image_info_size;
-		if (myresult->platform_binary) {
-			result->csflags |= CS_DYLD_PLATFORM;
+		if (!myresult->platform_binary) {
+			result->csflags &= ~CS_NO_UNTRUSTED_HELPERS;
 		}
 
+#if CONFIG_ROSETTA
+		if (imgp->ip_flags & IMGPF_ROSETTA) {
+			extern const struct fileops vnops;
+			// Save the file descriptor and mach header address for dyld. These will
+			// be passed on the stack for the Rosetta runtime's use.
+			struct fileproc *fp;
+			int dyld_fd;
+			proc_t p = vfs_context_proc(imgp->ip_vfs_context);
+			int error = falloc(p, &fp, &dyld_fd, imgp->ip_vfs_context);
+			if (error == 0) {
+				error = VNOP_OPEN(vp, FREAD, imgp->ip_vfs_context);
+				if (error == 0) {
+					fp->fp_glob->fg_flag = FREAD;
+					fp->fp_glob->fg_ops = &vnops;
+					fp_set_data(fp, vp);
+
+					proc_fdlock(p);
+					procfdtbl_releasefd(p, dyld_fd, NULL);
+					fp_drop(p, dyld_fd, fp, 1);
+					proc_fdunlock(p);
+
+					vnode_ref(vp);
+
+					result->dynlinker_fd = dyld_fd;
+					result->dynlinker_fp = fp;
+					result->dynlinker_mach_header = myresult->mach_header;
+					result->dynlinker_max_vm_addr = myresult->max_vm_addr;
+				} else {
+					fp_free(p, dyld_fd, fp);
+					ret = LOAD_IOERROR;
+				}
+			} else {
+				ret = LOAD_IOERROR;
+			}
+		}
+#endif
 	}
 
 	struct vnode_attr *va;
-	va = kheap_alloc(KHEAP_TEMP, sizeof(*va), Z_WAITOK | Z_ZERO);
+	va = kalloc_type(struct vnode_attr, Z_WAITOK | Z_ZERO);
 	VATTR_INIT(va);
 	VATTR_WANTED(va, va_fsid64);
 	VATTR_WANTED(va, va_fsid);
@@ -3080,12 +3180,210 @@ load_dylinker(
 	}
 
 	vnode_put(vp);
-	kheap_free(KHEAP_TEMP, va, sizeof(*va));
+	kfree_type(struct vnode_attr, va);
 novp_out:
-	kheap_free(KHEAP_TEMP, dyld_data, sizeof(*dyld_data));
+	kfree_type(typeof(*dyld_data), dyld_data);
 	return ret;
 }
 
+#if CONFIG_ROSETTA
+#if defined(APPLEVORTEX)
+static const char* rosetta_runtime_path = "/usr/libexec/rosetta/runtime_t8027";
+#else
+static const char* rosetta_runtime_path = "/usr/libexec/rosetta/runtime";
+#endif
+
+#if (DEVELOPMENT || DEBUG)
+static const char* rosetta_runtime_path_alt_x86 = "/usr/local/libexec/rosetta/runtime_internal";
+static const char* rosetta_runtime_path_alt_arm = "/usr/local/libexec/rosetta/runtime_arm_internal";
+#endif
+
+static load_return_t
+load_rosetta(
+	vm_map_t                        map,
+	thread_t                        thread,
+	load_result_t           *result,
+	struct image_params     *imgp)
+{
+	struct vnode            *vp = NULLVP;   /* set by get_macho_vnode() */
+	struct mach_header      *header;
+	off_t                   file_offset = 0; /* set by get_macho_vnode() */
+	off_t                   macho_size = 0; /* set by get_macho_vnode() */
+	load_result_t           *myresult;
+	kern_return_t           ret;
+	struct macho_data       *macho_data;
+	const char              *rosetta_file_path;
+	struct {
+		struct mach_header      __header;
+		load_result_t           __myresult;
+		struct macho_data       __macho_data;
+	} *rosetta_data;
+	mach_vm_address_t rosetta_load_addr;
+	mach_vm_size_t    rosetta_size;
+	mach_vm_address_t shared_cache_base = SHARED_REGION_BASE_ARM64;
+	int64_t           slide = 0;
+
+	/* Allocate wad-of-data from heap to reduce excessively deep stacks */
+	rosetta_data = kalloc_type(typeof(*rosetta_data), Z_WAITOK | Z_NOFAIL);
+	header = &rosetta_data->__header;
+	myresult = &rosetta_data->__myresult;
+	macho_data = &rosetta_data->__macho_data;
+
+	rosetta_file_path = rosetta_runtime_path;
+
+#if (DEVELOPMENT || DEBUG)
+	bool use_alt_rosetta = false;
+	if (imgp->ip_flags & IMGPF_ALT_ROSETTA) {
+		use_alt_rosetta = true;
+	} else {
+		int policy_error;
+		uint32_t policy_flags = 0;
+		int32_t policy_gencount = 0;
+		policy_error = proc_uuid_policy_lookup(result->uuid, &policy_flags, &policy_gencount);
+		if (policy_error == 0 && (policy_flags & PROC_UUID_ALT_ROSETTA_POLICY) != 0) {
+			use_alt_rosetta = true;
+		}
+	}
+
+	if (use_alt_rosetta) {
+		if (imgp->ip_origcputype == CPU_TYPE_X86_64) {
+			rosetta_file_path = rosetta_runtime_path_alt_x86;
+		} else if (imgp->ip_origcputype == CPU_TYPE_ARM64) {
+			rosetta_file_path = rosetta_runtime_path_alt_arm;
+		} else {
+			ret = LOAD_BADARCH;
+			goto novp_out;
+		}
+	}
+#endif
+
+	ret = get_macho_vnode(rosetta_file_path, CPU_TYPE_ARM64, header,
+	    &file_offset, &macho_size, macho_data, &vp, imgp);
+	if (ret) {
+		goto novp_out;
+	}
+
+	*myresult = load_result_null;
+	myresult->is_64bit_addr = TRUE;
+	myresult->is_64bit_data = TRUE;
+
+	ret = parse_machfile(vp, NULL, NULL, header, file_offset, macho_size,
+	    2, 0, 0, myresult, NULL, imgp);
+	if (ret != LOAD_SUCCESS) {
+		goto out;
+	}
+
+	if (!(imgp->ip_flags & IMGPF_DISABLE_ASLR)) {
+		slide = random();
+		slide = (slide % (vm_map_get_max_loader_aslr_slide_pages(map) - 1)) + 1;
+		slide <<= vm_map_page_shift(map);
+	}
+
+	if (imgp->ip_origcputype == CPU_TYPE_X86_64) {
+		shared_cache_base = SHARED_REGION_BASE_X86_64;
+	}
+
+	rosetta_size = round_page(myresult->max_vm_addr - myresult->min_vm_addr);
+	rosetta_load_addr = shared_cache_base - rosetta_size - slide;
+
+	*myresult = load_result_null;
+	myresult->is_64bit_addr = TRUE;
+	myresult->is_64bit_data = TRUE;
+	myresult->is_rosetta = TRUE;
+
+	ret = parse_machfile(vp, map, thread, header, file_offset, macho_size,
+	    2, rosetta_load_addr, 0, myresult, result, imgp);
+	if (ret == LOAD_SUCCESS) {
+		if (result) {
+			if (result->threadstate) {
+				/* don't use the app's/dyld's threadstate */
+				kfree_data(result->threadstate, result->threadstate_sz);
+			}
+			assert(myresult->threadstate != NULL);
+
+			result->is_rosetta = TRUE;
+
+			result->threadstate = myresult->threadstate;
+			result->threadstate_sz = myresult->threadstate_sz;
+
+			result->entry_point = myresult->entry_point;
+			result->validentry = myresult->validentry;
+			if (!myresult->platform_binary) {
+				result->csflags &= ~CS_NO_UNTRUSTED_HELPERS;
+			}
+
+			if ((header->cpusubtype & ~CPU_SUBTYPE_MASK) != CPU_SUBTYPE_ARM64E) {
+				imgp->ip_flags |= IMGPF_NOJOP;
+			}
+		}
+	}
+
+out:
+	vnode_put(vp);
+novp_out:
+	kfree_type(typeof(*rosetta_data), rosetta_data);
+	return ret;
+}
+#endif
+
+static void
+set_signature_error(
+	struct vnode* vp,
+	struct image_params * imgp,
+	const char* fatal_failure_desc,
+	const size_t fatal_failure_desc_len)
+{
+	char *vn_path = NULL;
+	vm_size_t vn_pathlen = MAXPATHLEN;
+	char const *path = NULL;
+
+	vn_path = zalloc(ZV_NAMEI);
+	if (vn_getpath(vp, vn_path, (int*)&vn_pathlen) == 0) {
+		path = vn_path;
+	} else {
+		path = "(get vnode path failed)";
+	}
+	os_reason_t reason = os_reason_create(OS_REASON_CODESIGNING,
+	    CODESIGNING_EXIT_REASON_TASKGATED_INVALID_SIG);
+
+	if (reason == OS_REASON_NULL) {
+		printf("load_code_signature: %s: failure to allocate exit reason for validation failure: %s\n",
+		    path, fatal_failure_desc);
+		goto out;
+	}
+
+	imgp->ip_cs_error = reason;
+	reason->osr_flags = (OS_REASON_FLAG_GENERATE_CRASH_REPORT |
+	    OS_REASON_FLAG_CONSISTENT_FAILURE);
+
+	mach_vm_address_t data_addr = 0;
+
+	int reason_error = 0;
+	int kcdata_error = 0;
+
+	if ((reason_error = os_reason_alloc_buffer_noblock(reason, kcdata_estimate_required_buffer_size
+	    (1, (uint32_t)fatal_failure_desc_len))) == 0 &&
+	    (kcdata_error = kcdata_get_memory_addr(&reason->osr_kcd_descriptor,
+	    EXIT_REASON_USER_DESC, (uint32_t)fatal_failure_desc_len,
+	    &data_addr)) == KERN_SUCCESS) {
+		kern_return_t mc_error = kcdata_memcpy(&reason->osr_kcd_descriptor, (mach_vm_address_t)data_addr,
+		    fatal_failure_desc, (uint32_t)fatal_failure_desc_len);
+
+		if (mc_error != KERN_SUCCESS) {
+			printf("load_code_signature: %s: failed to copy reason string "
+			    "(kcdata_memcpy error: %d, length: %ld)\n",
+			    path, mc_error, fatal_failure_desc_len);
+		}
+	} else {
+		printf("load_code_signature: %s: failed to allocate space for reason string "
+		    "(os_reason_alloc_buffer error: %d, kcdata error: %d, length: %ld)\n",
+		    path, reason_error, kcdata_error, fatal_failure_desc_len);
+	}
+out:
+	if (vn_path) {
+		zfree(ZV_NAMEI, vn_path);
+	}
+}
 
 static load_return_t
 load_code_signature(
@@ -3113,17 +3411,6 @@ load_code_signature(
 
 	cpusubtype &= ~CPU_SUBTYPE_MASK;
 
-	if (lcp->cmdsize != sizeof(struct linkedit_data_command)) {
-		ret = LOAD_BADMACHO;
-		goto out;
-	}
-
-	sum = 0;
-	if (os_add_overflow(lcp->dataoff, lcp->datasize, &sum) || sum > macho_size) {
-		ret = LOAD_BADMACHO;
-		goto out;
-	}
-
 	blob = ubc_cs_blob_get(vp, cputype, cpusubtype, macho_offset);
 
 	if (blob != NULL) {
@@ -3131,9 +3418,15 @@ load_code_signature(
 		anyCPU = blob->csb_cpu_type == -1;
 		if ((blob->csb_cpu_type != cputype &&
 		    blob->csb_cpu_subtype != cpusubtype && !anyCPU) ||
-		    blob->csb_base_offset != macho_offset) {
+		    (blob->csb_base_offset != macho_offset) ||
+		    ((blob->csb_flags & CS_VALID) == 0)) {
 			/* the blob has changed for this vnode: fail ! */
 			ret = LOAD_BADMACHO;
+			const char* fatal_failure_desc = "embedded signature doesn't match attached signature";
+			const size_t fatal_failure_desc_len = strlen(fatal_failure_desc) + 1;
+
+			printf("load_code_signature: %s\n", fatal_failure_desc);
+			set_signature_error(vp, imgp, fatal_failure_desc, fatal_failure_desc_len);
 			goto out;
 		}
 
@@ -3151,8 +3444,11 @@ load_code_signature(
 			/* If we were revaliding a CS blob with any CPU arch we adjust it */
 			if (anyCPU) {
 				vnode_lock_spin(vp);
-				blob->csb_cpu_type = cputype;
-				blob->csb_cpu_subtype = cpusubtype;
+				struct cs_cpu_info cpu_info = {
+					.csb_cpu_type = cputype,
+					.csb_cpu_subtype = cpusubtype
+				};
+				zalloc_ro_update_field(ZONE_ID_CS_BLOB, blob, csb_cpu_info, &cpu_info);
 				vnode_unlock(vp);
 			}
 			ret = LOAD_SUCCESS;
@@ -3172,6 +3468,17 @@ load_code_signature(
 		 * rereading the signature, and ubc_cs_blob_add will do the right thing.
 		 */
 		blob = NULL;
+	}
+
+	if (lcp->cmdsize != sizeof(struct linkedit_data_command)) {
+		ret = LOAD_BADMACHO;
+		goto out;
+	}
+
+	sum = 0;
+	if (os_add_overflow(lcp->dataoff, lcp->datasize, &sum) || sum > macho_size) {
+		ret = LOAD_BADMACHO;
+		goto out;
 	}
 
 	blob_size = lcp->datasize;
@@ -3303,11 +3610,18 @@ set_code_unprotect(
 		return LOAD_FAILURE;
 	}
 
+	if (eip->cryptsize == 0) {
+		printf("%s:%d '%s': cryptoff 0x%llx cryptsize 0x%llx cryptid 0x%x ignored\n", __FUNCTION__, __LINE__, vpath, (uint64_t)eip->cryptoff, (uint64_t)eip->cryptsize, eip->cryptid);
+		zfree(ZV_NAMEI, vpath);
+		return LOAD_SUCCESS;
+	}
+
 	/* set up decrypter first */
 	crypt_file_data_t crypt_data = {
 		.filename = vpath,
 		.cputype = cputype,
-		.cpusubtype = cpusubtype
+		.cpusubtype = cpusubtype,
+		.origin = CRYPT_ORIGIN_APP_LAUNCH,
 	};
 	kr = text_crypter_create(&crypt_info, cryptname, (void*)&crypt_data);
 #if VM_MAP_DEBUG_APPLE_PROTECT
@@ -3315,7 +3629,7 @@ set_code_unprotect(
 		struct proc *p;
 		p  = current_proc();
 		printf("APPLE_PROTECT: %d[%s] map %p %s(%s) -> 0x%x\n",
-		    p->p_pid, p->p_comm, map, __FUNCTION__, vpath, kr);
+		    proc_getpid(p), p->p_comm, map, __FUNCTION__, vpath, kr);
 	}
 #endif /* VM_MAP_DEBUG_APPLE_PROTECT */
 	zfree(ZV_NAMEI, vpath);
@@ -3507,7 +3821,7 @@ get_macho_vnode(
 
 	if (is_fat) {
 		error = fatfile_validate_fatarches((vm_offset_t)(&header->fat_header),
-		    sizeof(*header));
+		    sizeof(*header), fsize);
 		if (error != LOAD_SUCCESS) {
 			goto bad2;
 		}

@@ -63,9 +63,9 @@
  */
 
 subsystem
-#if	KERNEL_SERVER
-	  KernelServer
-#endif	/* KERNEL_SERVER */
+#if	KERNEL_SERVER || KOBJECT_SERVER
+	KernelServer
+#endif	/* KERNEL_SERVER || KOBJECT_SERVER */
 	  task 3400;
 
 #include <mach/std_types.defs>
@@ -79,15 +79,30 @@ subsystem
 #endif
 
 /*
- *	Create a new task with an empty set of IPC rights,
- *	and having an address space constructed from the
- *	target task (or empty, if inherit_memory is FALSE).
+ * Sandbox builds task.defs with KERNEL_SERVER defined when generating the map
+ * of MIG routine names to message IDs.
+ * The MIG routine names need to be kept stable so as to not break Sandbox
+ * profiles.
  */
+#if	KERNEL_SERVER && !SANDBOX_COMPILER
+#define MIG_SERVER_SUFFIX(NAME) NAME ## _mig
+#else
+#define MIG_SERVER_SUFFIX(NAME) NAME
+#endif
+
+
+/*
+ * OBSOLETE interfaces, removed from kernel
+ */
+#if KERNEL_SERVER
+skip; /* task_create */
+#else
 routine task_create(
 		target_task	: task_t;
 		ledgers		: ledger_array_t;
 		inherit_memory	: boolean_t;
 	out	child_task	: task_t);
+#endif
 
 /*
  *	Destroy the target task, causing all of its threads
@@ -145,6 +160,7 @@ routine task_info(
         out     task_info_out   : task_info_t, CountInOut);
 
 #endif
+
 /*
  * Set task information.
  */
@@ -191,7 +207,12 @@ task_get_special_port(
  *	Set one of the special ports associated with the
  *	target task.
  */
-routine task_set_special_port(
+routine
+#if	KERNEL_SERVER && !SANDBOX_COMPILER
+task_set_special_port_from_user(
+#else
+task_set_special_port(
+#endif
 		task		: task_t;
 		which_port	: int;
 		special_port	: mach_port_t);
@@ -277,20 +298,22 @@ routine	task_swap_exception_ports(
 	  out	old_flavors	: exception_flavor_array_t, SameCount);
 
 /*
- * OBSOLETE interface.
+ * OBSOLETE interfaces, removed from kernel
  */
+#if KERNEL_SERVER
+skip;
+skip;
+#else
 routine lock_set_create(
 		task		: task_t;
 	out	new_lock_set	: lock_set_t;
 		n_ulocks	: int;
 		policy		: int);
 
-/*
- * OBSOLETE interface.
- */
 routine lock_set_destroy(
 		task		: task_t;
 		lock_set	: lock_set_t);
+#endif
 
 /*
  * Create and destroy semaphore synchronizers on a
@@ -324,22 +347,25 @@ out	policy_info		: task_policy_t, CountInOut;
 inout	get_default		: boolean_t);
 
 /*
- *	Removed from the kernel.
+ *	OBSOLETE interfaces, removed from kernel.
  */
 #if KERNEL_SERVER
-skip;
+skip; /* task_sample */
+skip; /* task_policy */
+skip; /* task_set_emulation */
+skip; /* task_get_emulation_vector */
+skip; /* task_set_emulation_vector */
+skip; /* task_set_ras_pc */
+skip; /* task_zone_info */
+skip; /* task_assign */
+skip; /* task_assign_default */
+skip; /* task_get_assignment */
+skip; /* task_set_policy */
 #else
 routine task_sample(
 		task		: task_t;
 		reply		: mach_port_make_send_t);
-#endif
 
-/*
- * JMM - Everything from here down is likely to go away soon
- */
-/*
- * OBSOLETE interface.
- */
 routine task_policy(
 	task			: task_t;
 	policy			: policy_t;
@@ -347,48 +373,27 @@ routine task_policy(
 	set_limit		: boolean_t;
 	change			: boolean_t);
 
-
-/*
- *	Establish a user-level handler for the specified
- *	system call.
- */
 routine task_set_emulation(
 		target_port	: task_t;
 		routine_entry_pt: vm_address_t;
 		routine_number  : int);	
 
-/*
- *	Get user-level handler entry points for all
- *	emulated system calls.
- */
 routine task_get_emulation_vector(
 		task		: task_t;
 	out	vector_start	: int;
 	out	emulation_vector: emulation_vector_t);
 
-/*
- *	Establish user-level handlers for the specified
- *	system calls. Non-emulated system calls are specified
- *	with emulation_vector[i] == EML_ROUTINE_NULL.
- */
 routine task_set_emulation_vector(
 		task		: task_t;
 		vector_start	: int;
 		emulation_vector: emulation_vector_t);
 
 
-/*
- *      Establish restart pc for interrupted atomic sequences.
- */
 routine task_set_ras_pc(
 		target_task     : task_t;
 		basepc          : vm_address_t;
 		boundspc        : vm_address_t);
 
-
-/*
- * Return zone info as seen/used by this task.
- */
 routine task_zone_info(
 		target_task	: task_inspect_t;
 	out	names		: mach_zone_name_array_t,
@@ -396,36 +401,19 @@ routine task_zone_info(
 	out	info		: task_zone_info_array_t,
 					Dealloc);
 
-
-/* 
- * JMM - Want to eliminate processor_set so keep them at the end.
- */
-
-/*
- *	Assign task to processor set.
- */
 routine task_assign(
 		task		: task_t;
 		new_set		: processor_set_t;
 		assign_threads	: boolean_t);
 
-/*
- *	Assign task to default set.
- */
 routine task_assign_default(
 		task		: task_t;
 		assign_threads	: boolean_t);
 
-/*
- *	Get current assignment for task.
- */
 routine task_get_assignment(
 		task		: task_inspect_t;
 	out	assigned_set	: processor_set_name_t);
 
-/*
- * OBSOLETE interface.
- */
 routine task_set_policy(
 	task			: task_t;
 	pset			: processor_set_t;
@@ -433,6 +421,7 @@ routine task_set_policy(
 	base			: policy_base_t;
 	limit			: policy_limit_t;
 	change			: boolean_t);
+#endif
 
 /*
  * Read the selected state which is to be installed on new 
@@ -460,11 +449,11 @@ routine task_set_phys_footprint_limit(
 		new_limit	: int;
 	out old_limit	: int);
 
-routine task_suspend2(
+routine MIG_SERVER_SUFFIX(task_suspend2)(
 		target_task : task_read_t;
 	out suspend_token : task_suspension_token_t);
 
-routine task_resume2(
+routine MIG_SERVER_SUFFIX(task_resume2)(
 		suspend_token : task_suspension_token_t);
 
 routine task_purgable_info(
@@ -539,12 +528,8 @@ routine task_get_exc_guard_behavior(
 routine task_set_exc_guard_behavior(
 		task	 : task_t;
 		behavior : task_exc_guard_behavior_t);
-		
-routine task_create_suid_cred(
-		task		: task_t;
-		path		: suid_cred_path_t;
-		uid		: suid_cred_uid_t;
-	out	delegation	: suid_cred_t);
+
+skip;
 
 #if KERNEL || (!KERNEL && !LIBSYSCALL_INTERFACE)
 routine PREFIX(mach_task_is_self)(
@@ -579,6 +564,26 @@ routine task_get_exception_ports_info(
 	out	old_handlers_info	: exception_handler_info_array_t, SameCount;
 	out	old_behaviors	: exception_behavior_array_t, SameCount;
 	out	old_flavors	: exception_flavor_array_t, SameCount);
-	
+
+routine task_test_sync_upcall(
+	task	: task_t;
+	port	: mach_port_t);
+
+routine task_set_corpse_forking_behavior(
+		task	 : task_t;
+		behavior : task_corpse_forking_behavior_t);
+
+routine task_test_async_upcall_propagation(
+	task	: task_t;
+	port	: mach_port_t;
+	qos	: int;
+	iotier	: int);
+
+routine task_map_kcdata_object_64(
+		task		:task_t;
+		kcdata_object	:kcdata_object_t;
+	out	kcd_addr_begin	:mach_vm_address_t;
+	out	kcd_size	:mach_vm_size_t);
+
 /* vim: set ft=c : */
 

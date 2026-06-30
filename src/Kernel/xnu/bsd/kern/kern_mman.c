@@ -123,6 +123,7 @@
 #include <kern/page_decrypt.h>
 
 #include <IOKit/IOReturn.h>
+#include <IOKit/IOBSD.h>
 
 #include <vm/vm_map.h>
 #include <vm/vm_kern.h>
@@ -136,31 +137,41 @@
 
 /*
  * this function implements the same logic as dyld's "dyld_fall_2020_os_versions"
- * from dyld_priv.h. this way we can consistently deny / allow allocations based
- * on SDK version at fall 2020 level. Compare output to proc_sdk(current_proc())
+ * from dyld_priv.h. Basically, we attempt to draw the line of: "was this code
+ * compiled with an SDK from fall of 2020 or later?""
  */
-static uint32_t
-proc_2020_fall_os_sdk(void)
+static bool
+proc_2020_fall_os_sdk_or_later(void)
 {
-	switch (current_proc()->p_platform) {
+	const uint32_t proc_sdk_ver = proc_sdk(current_proc());
+
+	switch (proc_platform(current_proc())) {
 	case PLATFORM_MACOS:
-		return 0x000a1000; // DYLD_MACOSX_VERSION_10_16
+		return proc_sdk_ver >= 0x000a1000; // DYLD_MACOSX_VERSION_10_16
 	case PLATFORM_IOS:
 	case PLATFORM_IOSSIMULATOR:
 	case PLATFORM_MACCATALYST:
-		return 0x000e0000; // DYLD_IOS_VERSION_14_0
+		return proc_sdk_ver >= 0x000e0000; // DYLD_IOS_VERSION_14_0
 	case PLATFORM_BRIDGEOS:
-		return 0x00050000; // DYLD_BRIDGEOS_VERSION_5_0
+		return proc_sdk_ver >= 0x00050000; // DYLD_BRIDGEOS_VERSION_5_0
 	case PLATFORM_TVOS:
 	case PLATFORM_TVOSSIMULATOR:
-		return 0x000e0000; // DYLD_TVOS_VERSION_14_0
+		return proc_sdk_ver >= 0x000e0000; // DYLD_TVOS_VERSION_14_0
 	case PLATFORM_WATCHOS:
 	case PLATFORM_WATCHOSSIMULATOR:
-		return 0x00070000; // DYLD_WATCHOS_VERSION_7_0
+		return proc_sdk_ver >= 0x00070000; // DYLD_WATCHOS_VERSION_7_0
 	default:
-		return 0;
+		/*
+		 * tough call, but let's give new platforms the benefit of the doubt
+		 * to avoid a re-occurence of rdar://89843927
+		 */
+		return true;
 	}
 }
+
+#if MACH_ASSERT
+vnode_t fbdp_vp = NULL;
+#endif /* MACH_ASSERT */
 
 /*
  * XXX Internally, we use VM_PROT_* somewhat interchangeably, but the correct
@@ -185,8 +196,6 @@ mmap(proc_t p, struct mmap_args *uap, user_addr_t *retval)
 	vm_map_size_t           user_size;
 	vm_object_offset_t      pageoff;
 	vm_object_offset_t      file_pos;
-	int                     alloc_flags = 0;
-	vm_tag_t                tag = VM_KERN_MEMORY_NONE;
 	vm_map_kernel_flags_t   vmk_flags = VM_MAP_KERNEL_FLAGS_NONE;
 	boolean_t               docow;
 	vm_prot_t               maxprot;
@@ -214,7 +223,7 @@ mmap(proc_t p, struct mmap_args *uap, user_addr_t *retval)
 	AUDIT_ARG(len, user_size);
 	AUDIT_ARG(fd, uap->fd);
 
-	if (vm_map_range_overflows(user_addr, user_size)) {
+	if (vm_map_range_overflows(user_map, user_addr, user_size)) {
 		return EINVAL;
 	}
 	prot = (uap->prot & VM_PROT_ALL);
@@ -236,7 +245,9 @@ mmap(proc_t p, struct mmap_args *uap, user_addr_t *retval)
 	/*
 	 * verify no unknown flags are passed in, and if any are,
 	 * fail out early to make sure the logic below never has to deal
-	 * with invalid flag values
+	 * with invalid flag values. only do so for processes compiled
+	 * with Fall 2020 or later SDK, which is where we drew this
+	 * line and documented it as such.
 	 */
 	if (flags & ~(MAP_SHARED |
 	    MAP_PRIVATE |
@@ -249,6 +260,7 @@ mmap(proc_t p, struct mmap_args *uap, user_addr_t *retval)
 	    MAP_HASSEMAPHORE |
 	    MAP_NOCACHE |
 	    MAP_JIT |
+	    MAP_TPRO |
 	    MAP_FILE |
 	    MAP_ANON |
 	    MAP_RESILIENT_CODESIGN |
@@ -258,7 +270,7 @@ mmap(proc_t p, struct mmap_args *uap, user_addr_t *retval)
 #endif
 	    MAP_TRANSLATED_ALLOW_EXECUTE |
 	    MAP_UNIX03)) {
-		if (proc_sdk(current_proc()) >= proc_2020_fall_os_sdk()) {
+		if (proc_2020_fall_os_sdk_or_later()) {
 			return EINVAL;
 		}
 	}
@@ -322,7 +334,8 @@ mmap(proc_t p, struct mmap_args *uap, user_addr_t *retval)
 		    (flags & MAP_SHARED) ||
 		    !(flags & MAP_ANON) ||
 		    (flags & MAP_RESILIENT_CODESIGN) ||
-		    (flags & MAP_RESILIENT_MEDIA)) {
+		    (flags & MAP_RESILIENT_MEDIA) ||
+		    (flags & MAP_TPRO)) {
 			return EINVAL;
 		}
 	}
@@ -330,7 +343,8 @@ mmap(proc_t p, struct mmap_args *uap, user_addr_t *retval)
 	if ((flags & MAP_RESILIENT_CODESIGN) ||
 	    (flags & MAP_RESILIENT_MEDIA)) {
 		if ((flags & MAP_ANON) ||
-		    (flags & MAP_JIT)) {
+		    (flags & MAP_JIT) ||
+		    (flags & MAP_TPRO)) {
 			return EINVAL;
 		}
 	}
@@ -361,6 +375,14 @@ mmap(proc_t p, struct mmap_args *uap, user_addr_t *retval)
 		if ((flags & MAP_ANON) ||
 		    (flags & MAP_SHARED)) {
 			return EINVAL;
+		}
+	}
+	if (flags & MAP_TPRO) {
+		if ((prot & VM_PROT_EXECUTE) ||
+		    !(prot & VM_PROT_WRITE) ||
+		    (flags & MAP_SHARED) ||
+		    !(flags & MAP_ANON)) {
+			return EPERM;
 		}
 	}
 
@@ -397,7 +419,10 @@ mmap(proc_t p, struct mmap_args *uap, user_addr_t *retval)
 
 #endif
 
-	alloc_flags = 0;
+#if CONFIG_MAP_RANGES
+	/* default to placing mappings in the heap range. */
+	vmk_flags.vmkf_range_id = UMEM_RANGE_ID_HEAP;
+#endif /* CONFIG_MAP_RANGES */
 
 	if (flags & MAP_ANON) {
 		maxprot = VM_PROT_ALL;
@@ -420,16 +445,38 @@ mmap(proc_t p, struct mmap_args *uap, user_addr_t *retval)
 			 * Use "fd" to pass (some) Mach VM allocation flags,
 			 * (see the VM_FLAGS_* definitions).
 			 */
-			alloc_flags = fd & (VM_FLAGS_ALIAS_MASK |
+			int vm_flags = fd & (VM_FLAGS_ALIAS_MASK |
 			    VM_FLAGS_SUPERPAGE_MASK |
 			    VM_FLAGS_PURGABLE |
 			    VM_FLAGS_4GB_CHUNK);
-			if (alloc_flags != fd) {
+
+			if (vm_flags != fd) {
 				/* reject if there are any extra flags */
 				return EINVAL;
 			}
-			VM_GET_FLAGS_ALIAS(alloc_flags, tag);
-			alloc_flags &= ~VM_FLAGS_ALIAS_MASK;
+
+			/*
+			 * vm_map_kernel_flags_set_vmflags() will assume that
+			 * the full set of VM flags are passed, which is
+			 * problematic for FIXED/ANYWHERE.
+			 *
+			 * The block handling MAP_FIXED below will do the same
+			 * thing again which is fine because it's idempotent.
+			 */
+			if (flags & MAP_FIXED) {
+				vm_flags |= VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE;
+			} else {
+				vm_flags |= VM_FLAGS_ANYWHERE;
+			}
+			vm_map_kernel_flags_set_vmflags(&vmk_flags, vm_flags);
+			if (vm_flags & VM_FLAGS_ALIAS_MASK) {
+				/*
+				 * if the client specified a tag,
+				 * let the system policy apply.
+				 */
+				vmk_flags.vmkf_range_id = UMEM_RANGE_ID_DEFAULT;
+				vm_map_kernel_flags_update_range_id(&vmk_flags, user_map);
+			}
 		}
 
 		handle = NULL;
@@ -468,7 +515,7 @@ mmap(proc_t p, struct mmap_args *uap, user_addr_t *retval)
 			error = EINVAL;
 			goto bad;
 		}
-		vp = (struct vnode *)fp->fp_glob->fg_data;
+		vp = (struct vnode *)fp_get_data(fp);
 		error = vnode_getwithref(vp);
 		if (error != 0) {
 			goto bad;
@@ -616,7 +663,6 @@ mmap(proc_t p, struct mmap_args *uap, user_addr_t *retval)
 	}
 
 	if ((flags & MAP_FIXED) == 0) {
-		alloc_flags |= VM_FLAGS_ANYWHERE;
 		user_addr = vm_map_round_page(user_addr,
 		    vm_map_page_mask(user_map));
 	} else {
@@ -639,23 +685,40 @@ mmap(proc_t p, struct mmap_args *uap, user_addr_t *retval)
 		 * has to deallocate the existing mappings and establish the
 		 * new ones atomically.
 		 */
-		alloc_flags |= VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE;
+		vmk_flags.vmf_fixed = true;
+		vmk_flags.vmf_overwrite = true;
 	}
 
 	if (flags & MAP_NOCACHE) {
-		alloc_flags |= VM_FLAGS_NO_CACHE;
+		vmk_flags.vmf_no_cache = true;
 	}
 
 	if (flags & MAP_JIT) {
 		vmk_flags.vmkf_map_jit = TRUE;
 	}
 
+	if (flags & MAP_TPRO) {
+		vmk_flags.vmf_tpro = true;
+	}
+
+#if CONFIG_ROSETTA
+	if (flags & MAP_TRANSLATED_ALLOW_EXECUTE) {
+		if (!proc_is_translated(p)) {
+			if (!mapanon) {
+				(void)vnode_put(vp);
+			}
+			error = EINVAL;
+			goto bad;
+		}
+		vmk_flags.vmkf_translated_allow_execute = TRUE;
+	}
+#endif
 
 	if (flags & MAP_RESILIENT_CODESIGN) {
-		alloc_flags |= VM_FLAGS_RESILIENT_CODESIGN;
+		vmk_flags.vmf_resilient_codesign = true;
 	}
 	if (flags & MAP_RESILIENT_MEDIA) {
-		alloc_flags |= VM_FLAGS_RESILIENT_MEDIA;
+		vmk_flags.vmf_resilient_media = true;
 	}
 
 #if XNU_TARGET_OS_OSX
@@ -694,8 +757,7 @@ map_anon_retry:
 
 		result = vm_map_enter_mem_object(user_map,
 		    &user_addr, user_size,
-		    0, alloc_flags, vmk_flags,
-		    tag,
+		    0, vmk_flags,
 		    IPC_PORT_NULL, 0, FALSE,
 		    prot, maxprot,
 		    (flags & MAP_SHARED) ?
@@ -731,6 +793,25 @@ map_anon_retry:
 			error = ENOMEM;
 			goto bad;
 		}
+
+#if MACH_ASSERT
+#define FBDP_PATH_NAME "/private/var/db/timezone/tz/2022a.1.1/icutz/"
+#define FBDP_FILE_NAME "icutz44l.dat"
+		if (fbdp_vp == NULL &&
+		    !strncmp(vp->v_name, FBDP_FILE_NAME, strlen(FBDP_FILE_NAME))) {
+			char *path;
+			int len;
+			len = MAXPATHLEN;
+			path = zalloc_flags(ZV_NAMEI, Z_WAITOK | Z_NOFAIL);
+			vn_getpath(vp, path, &len);
+			if (!strncmp(path, FBDP_PATH_NAME, strlen(FBDP_PATH_NAME))) {
+				fbdp_vp = vp;
+				memory_object_mark_for_fbdp(control);
+				printf("FBDP %s:%d marked vp %p \"%s\" moc %p as 'fbdp'\n", __FUNCTION__, __LINE__, vp, path, control);
+			}
+			zfree(ZV_NAMEI, path);
+		}
+#endif /* MACH_ASSERT */
 
 		/*
 		 *  Set credentials:
@@ -797,8 +878,7 @@ map_file_retry:
 
 		result = vm_map_enter_mem_object_control(user_map,
 		    &user_addr, user_size,
-		    0, alloc_flags, vmk_flags,
-		    tag,
+		    0, vmk_flags,
 		    control, file_pos,
 		    docow, prot, maxprot,
 		    (flags & MAP_SHARED) ?
@@ -880,7 +960,7 @@ msync_nocancel(__unused proc_t p, struct msync_nocancel_args *uap, __unused int3
 #if XNU_TARGET_OS_OSX
 	KERNEL_DEBUG_CONSTANT((BSDDBG_CODE(DBG_BSD_SC_EXTENDED_INFO, SYS_msync) | DBG_FUNC_NONE), (uint32_t)(addr >> 32), (uint32_t)(size >> 32), 0, 0, 0);
 #endif /* XNU_TARGET_OS_OSX */
-	if (mach_vm_range_overflows(addr, size)) {
+	if (vm_map_range_overflows(user_map, addr, size)) {
 		return EINVAL;
 	}
 	if (addr & vm_map_page_mask(user_map)) {
@@ -960,7 +1040,7 @@ munmap(__unused proc_t p, struct munmap_args *uap, __unused int32_t *retval)
 		return EINVAL;
 	}
 
-	if (mach_vm_range_overflows(user_addr, user_size)) {
+	if (vm_map_range_overflows(user_map, user_addr, user_size)) {
 		return EINVAL;
 	}
 
@@ -997,7 +1077,7 @@ mprotect(__unused proc_t p, struct mprotect_args *uap, __unused int32_t *retval)
 	user_size = (mach_vm_size_t) uap->len;
 	prot = (vm_prot_t)(uap->prot & (VM_PROT_ALL | VM_PROT_TRUSTED | VM_PROT_STRIP_READ));
 
-	if (mach_vm_range_overflows(user_addr, user_size)) {
+	if (vm_map_range_overflows(user_map, user_addr, user_size)) {
 		return EINVAL;
 	}
 	if (user_addr & vm_map_page_mask(user_map)) {
@@ -1019,12 +1099,6 @@ mprotect(__unused proc_t p, struct mprotect_args *uap, __unused int32_t *retval)
 		prot |= VM_PROT_READ;
 	}
 #endif  /* 3936456 */
-
-#if defined(__arm64__)
-	if (prot & VM_PROT_STRIP_READ) {
-		prot &= ~(VM_PROT_READ | VM_PROT_STRIP_READ);
-	}
-#endif
 
 #if CONFIG_MACF
 	/*
@@ -1102,13 +1176,13 @@ minherit(__unused proc_t p, struct minherit_args *uap, __unused int32_t *retval)
 	AUDIT_ARG(len, uap->len);
 	AUDIT_ARG(value32, uap->inherit);
 
+	user_map = current_map();
 	addr = (mach_vm_offset_t)uap->addr;
 	size = (mach_vm_size_t)uap->len;
 	inherit = uap->inherit;
-	if (mach_vm_range_overflows(addr, size)) {
+	if (vm_map_range_overflows(user_map, addr, size)) {
 		return EINVAL;
 	}
-	user_map = current_map();
 	result = mach_vm_inherit(user_map, addr, size,
 	    inherit);
 	switch (result) {
@@ -1175,9 +1249,10 @@ madvise(__unused proc_t p, struct madvise_args *uap, __unused int32_t *retval)
 		return EINVAL;
 	}
 
+	user_map = current_map();
 	start = (mach_vm_offset_t) uap->addr;
 	size = (mach_vm_size_t) uap->len;
-	if (mach_vm_range_overflows(start, size)) {
+	if (vm_map_range_overflows(user_map, start, size)) {
 		return EINVAL;
 	}
 #if __arm64__
@@ -1187,7 +1262,7 @@ madvise(__unused proc_t p, struct madvise_args *uap, __unused int32_t *retval)
 	    uap->behav == MADV_FREE_REUSABLE)) {
 		printf("** FOURK_COMPAT: %d[%s] "
 		    "failing madvise(0x%llx,0x%llx,%s)\n",
-		    p->p_pid, p->p_comm, start, size,
+		    proc_getpid(p), p->p_comm, start, size,
 		    ((uap->behav == MADV_FREE_REUSABLE)
 		    ? "MADV_FREE_REUSABLE"
 		    : "MADV_FREE"));
@@ -1198,8 +1273,6 @@ madvise(__unused proc_t p, struct madvise_args *uap, __unused int32_t *retval)
 		return EINVAL;
 	}
 #endif /* __arm64__ */
-
-	user_map = current_map();
 
 	result = mach_vm_behavior_set(user_map, start, size, new_behavior);
 	switch (result) {
@@ -1274,7 +1347,7 @@ mincore(__unused proc_t p, struct mincore_args *uap, __unused int32_t *retval)
 	cur_vec_size_pages = MIN(req_vec_size_pages, (MAX_PAGE_RANGE_QUERY >> effective_page_shift));
 	size_t kernel_vec_size = cur_vec_size_pages;
 
-	kernel_vec = kheap_alloc(KHEAP_TEMP, kernel_vec_size, Z_WAITOK | Z_ZERO);
+	kernel_vec = (char *)kalloc_data(kernel_vec_size, Z_WAITOK | Z_ZERO);
 
 	if (kernel_vec == NULL) {
 		return ENOMEM;
@@ -1287,10 +1360,10 @@ mincore(__unused proc_t p, struct mincore_args *uap, __unused int32_t *retval)
 
 	pqueryinfo_vec_size = cur_vec_size_pages * sizeof(struct vm_page_info_basic);
 
-	info = kheap_alloc(KHEAP_TEMP, pqueryinfo_vec_size, Z_WAITOK);
+	info = (struct vm_page_info_basic *)kalloc_data(pqueryinfo_vec_size, Z_WAITOK);
 
 	if (info == NULL) {
-		kheap_free(KHEAP_TEMP, kernel_vec, kernel_vec_size);
+		kfree_data(kernel_vec, kernel_vec_size);
 		return ENOMEM;
 	}
 
@@ -1368,8 +1441,8 @@ mincore(__unused proc_t p, struct mincore_args *uap, __unused int32_t *retval)
 		first_addr = addr;
 	}
 
-	kheap_free(KHEAP_TEMP, info, pqueryinfo_vec_size);
-	kheap_free(KHEAP_TEMP, kernel_vec, kernel_vec_size);
+	kfree_data(info, pqueryinfo_vec_size);
+	kfree_data(kernel_vec, kernel_vec_size);
 
 	if (error) {
 		return EFAULT;
@@ -1389,10 +1462,11 @@ mlock(__unused proc_t p, struct mlock_args *uap, __unused int32_t *retvalval)
 	AUDIT_ARG(addr, uap->addr);
 	AUDIT_ARG(len, uap->len);
 
+	user_map = current_map();
 	addr = (vm_map_offset_t) uap->addr;
 	size = (vm_map_size_t)uap->len;
 
-	if (vm_map_range_overflows(addr, size)) {
+	if (vm_map_range_overflows(user_map, addr, size)) {
 		return EINVAL;
 	}
 
@@ -1400,7 +1474,6 @@ mlock(__unused proc_t p, struct mlock_args *uap, __unused int32_t *retvalval)
 		return 0;
 	}
 
-	user_map = current_map();
 	pageoff = (addr & vm_map_page_mask(user_map));
 	addr -= pageoff;
 	size = vm_map_round_page(size + pageoff, vm_map_page_mask(user_map));
@@ -1433,11 +1506,11 @@ munlock(__unused proc_t p, struct munlock_args *uap, __unused int32_t *retval)
 	addr = (mach_vm_offset_t) uap->addr;
 	size = (mach_vm_size_t)uap->len;
 	user_map = current_map();
-	if (mach_vm_range_overflows(addr, size)) {
+	if (vm_map_range_overflows(user_map, addr, size)) {
 		return EINVAL;
 	}
 	/* JMM - need to remove all wirings by spec - this just removes one */
-	result = mach_vm_wire_kernel(host_priv_self(), user_map, addr, size, VM_PROT_NONE, VM_KERN_MEMORY_MLOCK);
+	result = mach_vm_wire_kernel(user_map, addr, size, VM_PROT_NONE, VM_KERN_MEMORY_MLOCK);
 	return result == KERN_SUCCESS ? 0 : ENOMEM;
 }
 
@@ -1485,7 +1558,7 @@ mremap_encrypted(__unused struct proc *p, struct mremap_encrypted_args *uap, __u
 	cputype = uap->cputype;
 	cpusubtype = uap->cpusubtype;
 
-	if (mach_vm_range_overflows(user_addr, user_size)) {
+	if (vm_map_range_overflows(user_map, user_addr, user_size)) {
 		return EINVAL;
 	}
 	if (user_addr & vm_map_page_mask(user_map)) {
@@ -1542,17 +1615,24 @@ mremap_encrypted(__unused struct proc *p, struct mremap_encrypted_args *uap, __u
 	    __FUNCTION__, vpath, cryptid, cputype, cpusubtype, (uint64_t)user_addr, (uint64_t)user_size);
 #endif
 
+	if (user_size == 0) {
+		printf("%s:%d '%s': user_addr 0x%llx user_size 0x%llx cryptid 0x%x ignored\n", __FUNCTION__, __LINE__, vpath, user_addr, user_size, cryptid);
+		zfree(ZV_NAMEI, vpath);
+		return 0;
+	}
+
 	/* set up decrypter first */
 	crypt_file_data_t crypt_data = {
 		.filename = vpath,
 		.cputype = cputype,
-		.cpusubtype = cpusubtype
+		.cpusubtype = cpusubtype,
+		.origin = CRYPT_ORIGIN_LIBRARY_LOAD,
 	};
 	result = text_crypter_create(&crypt_info, cryptname, (void*)&crypt_data);
 #if VM_MAP_DEBUG_APPLE_PROTECT
 	if (vm_map_debug_apple_protect) {
 		printf("APPLE_PROTECT: %d[%s] map %p [0x%llx:0x%llx] %s(%s) -> 0x%x\n",
-		    p->p_pid, p->p_comm,
+		    proc_getpid(p), p->p_comm,
 		    user_map,
 		    (uint64_t) user_addr,
 		    (uint64_t) (user_addr + user_size),

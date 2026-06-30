@@ -117,7 +117,7 @@ SYSCTL_INT(_net_inet_tcp, OID_AUTO, sack_globalholes, CTLFLAG_RD | CTLFLAG_LOCKE
     &tcp_sack_globalholes, 0,
     "Global number of TCP SACK holes currently allocated");
 
-extern struct zone *sack_hole_zone;
+static KALLOC_TYPE_DEFINE(sack_hole_zone, struct sackhole, NET_KT_DEFAULT);
 
 #define TCP_VALIDATE_SACK_SEQ_NUMBERS(_tp_, _sb_, _ack_) \
     (SEQ_GT((_sb_)->end, (_sb_)->start) && \
@@ -253,10 +253,7 @@ tcp_sackhole_alloc(struct tcpcb *tp, tcp_seq start, tcp_seq end)
 		return NULL;
 	}
 
-	hole = (struct sackhole *)zalloc(sack_hole_zone);
-	if (hole == NULL) {
-		return NULL;
-	}
+	hole = zalloc_flags(sack_hole_zone, Z_WAITOK | Z_NOFAIL);
 
 	hole->start = start;
 	hole->end = end;
@@ -885,7 +882,6 @@ tcp_sack_process_dsack(struct tcpcb *tp, struct tcpopt *to,
     struct tcphdr *th)
 {
 	struct sackblk first_sack, second_sack;
-	struct tcp_rxt_seg *rxseg;
 
 	bcopy(to->to_sacks, &first_sack, sizeof(first_sack));
 	first_sack.start = ntohl(first_sack.start);
@@ -952,14 +948,6 @@ tcp_sack_process_dsack(struct tcpcb *tp, struct tcpopt *to,
 	tcpstat.tcps_dsack_recvd++;
 	tp->t_dsack_recvd++;
 
-	/* If the DSACK is for TLP mark it as such */
-	if ((tp->t_flagsext & TF_SENT_TLPROBE) &&
-	    first_sack.end == tp->t_tlphighrxt) {
-		if ((rxseg = tcp_rxtseg_find(tp, first_sack.start,
-		    (first_sack.end - 1))) != NULL) {
-			rxseg->rx_flags |= TCP_RXT_DSACK_FOR_TLP;
-		}
-	}
 	/* Update the sender's retransmit segment state */
 	if (((tp->t_rxtshift == 1 && first_sack.start == tp->snd_una) ||
 	    ((tp->t_flagsext & TF_SENT_TLPROBE) &&

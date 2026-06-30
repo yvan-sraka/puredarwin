@@ -36,9 +36,10 @@
 #include <mach/machine/vm_types.h>
 
 #include <stdint.h>
+#include <sys/cdefs.h>
 
-typedef vm_offset_t             pointer_t;
-typedef vm_offset_t             vm_address_t;
+typedef vm_offset_t             pointer_t __kernel_ptr_semantics;
+typedef vm_offset_t             vm_address_t __kernel_ptr_semantics;
 
 /*
  * We use addr64_t for 64-bit addresses that are used on both
@@ -65,13 +66,19 @@ typedef uint32_t        reg64_t;
  * addresses (that are page aligned) as 32-bit page numbers.
  * This limits the physical address space to 16TB of RAM.
  */
-typedef uint32_t ppnum_t;               /* Physical page number */
+typedef uint32_t ppnum_t __kernel_ptr_semantics; /* Physical page number */
 #define PPNUM_MAX UINT32_MAX
 
 
 #ifdef  KERNEL_PRIVATE
 
-#include <sys/cdefs.h>
+__options_decl(vm_map_create_options_t, uint32_t, {
+	VM_MAP_CREATE_DEFAULT          = 0x00000000,
+	VM_MAP_CREATE_PAGEABLE         = 0x00000001,
+	VM_MAP_CREATE_CORPSE_FOOTPRINT = 0x00000002,
+	VM_MAP_CREATE_DISABLE_HOLELIST = 0x00000004,
+	VM_MAP_CREATE_NEVER_FAULTS     = 0x00000008,
+});
 
 #ifndef MACH_KERNEL_PRIVATE
 /*
@@ -96,7 +103,7 @@ typedef struct vm_object        *vm_object_t;
 typedef struct vm_object_fault_info     *vm_object_fault_info_t;
 
 #define PMAP_NULL               ((pmap_t) NULL)
-#define VM_OBJECT_NULL  ((vm_object_t) NULL)
+#define VM_OBJECT_NULL          ((vm_object_t) NULL)
 
 #else   /* KERNEL_PRIVATE */
 
@@ -121,36 +128,48 @@ typedef mach_port_t             vm_map_t, vm_map_read_t, vm_map_inspect_t;
 typedef uint64_t                vm_object_offset_t;
 typedef uint64_t                vm_object_size_t;
 
+/*!
+ * @typedef
+ *
+ * @brief
+ * Pair of a min/max address used to denote a memory region.
+ *
+ * @discussion
+ * @c min_address must be smaller or equal to @c max_address.
+ */
+typedef struct mach_vm_range {
+	mach_vm_offset_t        min_address;
+	mach_vm_offset_t        max_address;
+} *mach_vm_range_t;
+
 
 #ifdef XNU_KERNEL_PRIVATE
 
 #define VM_TAG_ACTIVE_UPDATE    1
 
-typedef uint16_t vm_tag_t;
+typedef uint16_t                vm_tag_t;
 
 #define VM_TAG_NAME_LEN_MAX     0x7F
 #define VM_TAG_NAME_LEN_SHIFT   0
-#define VM_TAG_BT               0x0080
 #define VM_TAG_UNLOAD           0x0100
 #define VM_TAG_KMOD             0x0200
 
-#if DEBUG || DEVELOPMENT
-#if __LP64__
-#define VM_MAX_TAG_ZONES        84
-#else
-#define VM_MAX_TAG_ZONES        31
-#endif
-#else
-#define VM_MAX_TAG_ZONES        0
-#endif
-
-#if VM_MAX_TAG_ZONES
+#if !KASAN && (DEBUG || DEVELOPMENT)
+/*
+ * To track the utilization of memory at every kalloc callsite, zone tagging
+ * allocates an array of stats (of size VM_TAG_SIZECLASSES), one for each
+ * size class exposed by kalloc.
+ *
+ * If VM_TAG_SIZECLASSES is modified ensure that z_tags_sizeclass
+ * has sufficient bits to represent all values (max value exclusive).
+ */
+#define VM_TAG_SIZECLASSES      36
 // must be multiple of 64
 #define VM_MAX_TAG_VALUE        1536
 #else
+#define VM_TAG_SIZECLASSES      0
 #define VM_MAX_TAG_VALUE        256
 #endif
-
 
 #define ARRAY_COUNT(a)  (sizeof((a)) / sizeof((a)[0]))
 
@@ -179,10 +198,6 @@ struct vm_allocation_site {
 	/* char      name[0]; -- this is placed after subtotals, see KA_NAME() */
 };
 typedef struct vm_allocation_site vm_allocation_site_t;
-
-#define VM_ALLOC_SITE_STATIC(iflags, itag)                                          \
-	static vm_allocation_site_t site __attribute__((section("__DATA, __data"))) \
-	 = { .refcount = 2, .tag = (itag), .flags = (iflags) };
 
 extern int vmrtf_extract(uint64_t, boolean_t, unsigned long, void *, unsigned long *);
 extern unsigned int vmrtfaultinfo_bufsz(void);

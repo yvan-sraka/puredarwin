@@ -72,19 +72,19 @@ void kxld_log_callback(
 * C Function Prototypes for Friend Declarations.
 *********************************************************************/
 class OSKext;
+class OSDextStatistics;
 
 extern "C" {
 void OSKextLog(
 	OSKext         * aKext,
 	OSKextLogSpec    msgLogSpec,
-	const char     * format, ...)
-__attribute__((format(printf, 3, 4)));
+	const char     * format, ...) __printflike(3, 4);
 
 void OSKextVLog(
 	OSKext         * aKext,
 	OSKextLogSpec    msgLogSpec,
 	const char     * format,
-	va_list          srcArgList);
+	va_list          srcArgList) __printflike(3, 0);;
 
 #ifdef XNU_KERNEL_PRIVATE
 void OSKextRemoveKextBootstrap(void);
@@ -143,6 +143,15 @@ struct OSKextGrabPgoStruct {
 
 struct OSKextAccount {
 	vm_allocation_site_t site;
+
+#if DEVELOPMENT || DEBUG
+	struct os_refgrp     task_refgrp;
+	/*
+	 * '5' for the "task_" prefix. task_refgrp_name can be entirely dropped
+	 * once we can directly flag the refgrp to be logged.
+	 */
+	char                 task_refgrp_name[5 + KMOD_MAX_NAME];
+#endif /* DEVELOPMENT || DEBUG */
 	uint32_t             loadTag;
 	OSKext             * kext;
 };
@@ -169,6 +178,36 @@ private:
 	vm_size_t   vmsize;
 	void      * data;
 };
+
+typedef enum {
+	kOSDextCrashPolicyNone,
+	kOSDextCrashPolicyReboot,
+} OSDextCrashPolicy;
+
+enum {
+	kMaxDextCrashesInOneDayDefault = 3,
+};
+
+class OSDextStatistics : public OSObject {
+	OSDeclareDefaultStructors(OSDextStatistics);
+public:
+	static OSPtr<OSDextStatistics> create();
+	virtual bool init() APPLE_KEXT_OVERRIDE;
+	virtual void free() APPLE_KEXT_OVERRIDE;
+
+	OSDextCrashPolicy recordCrash();
+	size_t getCrashCount();
+
+private:
+	OSPtr<OSArray> crashes;
+	IOLock * lock;
+};
+
+__enum_closed_decl(OSKextInitResult, uint8_t, {
+	kOSKextInitFailure = 0,
+	kOSKextInitialized,
+	kOSKextAlreadyExist,
+});
 
 #endif /* XNU_KERNEL_PRIVATE */
 
@@ -201,7 +240,7 @@ class OSKext : public OSObject
 		OSKext         * aKext,
 		OSKextLogSpec    msgLogSpec,
 		const char     * format,
-		va_list          srcArgList);
+		va_list          srcArgList) __printflike(3, 0);
 
 	friend void OSKextRemoveKextBootstrap(void);
 	friend OSReturn OSKextUnloadKextWithLoadTag(uint32_t);
@@ -316,6 +355,10 @@ private:
 		unsigned int jettisonLinkeditSeg:1;
 		unsigned int resetSegmentsFromImmutableCopy:1;
 		unsigned int unloadUnsupported:1;
+		unsigned int dextToReplace:1;
+
+		/* The Mach-O header contains segment addresses which are unslid. */
+		unsigned int unslidMachO:1;
 	} flags;
 
 	uint32_t matchingRefCount;
@@ -326,6 +369,9 @@ private:
 	OSKextAccount * account;
 	uint32_t builtinKmodIdx;
 	OSPtr<OSArray> savedMutableSegments;
+	OSPtr<OSDextStatistics> dextStatistics;
+	OSPtr<OSData> dextUniqueID;
+	uint32_t dextLaunchedCount;
 
 #if PRAGMA_MARK
 /**************************************/
@@ -347,6 +393,7 @@ public:
 		const char     * kextIdentifier,
 		OSKextLogSpec    msgLogSpec);
 	static void OSKextLogDriverKitInfoLoad(OSKext *kext);
+	static bool iokitDaemonAvailable(void);
 #endif /* XNU_KERNEL_PRIVATE */
 
 private:
@@ -365,6 +412,13 @@ private:
 
 /* Instance life cycle.
  */
+	static OSData *parseDextUniqueID(
+		OSDictionary * anInfoDict,
+		const char *dextIDCS);
+	static void setDextUniqueIDInPersonalities(
+		OSDictionary * anInfoDict,
+		OSData * dextUniqueID);
+
 	static OSPtr<OSKext> withBooterData(
 		OSString * deviceTreeName,
 		OSData   * booterData);
@@ -378,10 +432,10 @@ private:
 	virtual bool initWithPrelinkedInfoDict(
 		OSDictionary * infoDict,
 		bool doCoalesedSlides, kc_kind_t type);
-
 	static OSSharedPtr<OSKext> withCodelessInfo(
-		OSDictionary * infoDict);
-	virtual bool initWithCodelessInfo(
+		OSDictionary * infoDict, OSKextInitResult *result);
+
+	virtual OSKextInitResult initWithCodelessInfo(
 		OSDictionary * infoDict);
 
 	static void setAllVMAttributes(void);
@@ -393,7 +447,7 @@ private:
 		OSData       * anExecutable,
 		OSData       * externalData        = NULL,
 		bool           externalDataIsMkext = false);
-	virtual bool registerIdentifier(void);
+	virtual OSKextInitResult registerIdentifier(void);
 
 	virtual void free(void) APPLE_KEXT_OVERRIDE;
 
@@ -403,6 +457,9 @@ private:
 
 	virtual bool isInExcludeList(void);
 	virtual bool isLoadable(void);
+
+	static OSKext * allocAndInitFakeKext(
+		kmod_info_t *kmod_info);
 
 /* Mkexts.
  */
@@ -491,7 +548,7 @@ private:
 		OSKextExcludeLevel   startMatchingOpt = kOSKextExcludeAll,
 		OSArray            * personalityNames = NULL);// priv/prot
 	virtual OSReturn unload(void);
-	virtual OSReturn queueKextNotification(
+	static OSReturn queueKextNotification(
 		const char * notificationName,
 		OSString   * kextIdentifier);
 
@@ -553,6 +610,9 @@ private:
 		OSDictionary *requestDict,
 		OSArray  *infoKeys = NULL);
 	static OSPtr<OSData> copyKextUUIDForAddress(OSNumber *address = NULL);
+	static OSPtr<OSArray> copyDextsInfo(
+		OSArray * kextIdentifiers = NULL,
+		OSArray * keys = NULL);
 	virtual OSPtr<OSDictionary> copyInfo(OSArray * keys = NULL);
 
 /* Logging to user space.
@@ -602,9 +662,9 @@ private:
 		void                 *map_entry_list);
 	static void freeKCFileSetcontrol(void);
 	OSReturn resetKCFileSetSegments(void);
-	static void jettisonFileSetLinkeditSegment(kernel_mach_header_t *mh);
 #endif //(__x86_64__) || defined(__i386__)
 
+	static void jettisonFileSetLinkeditSegment(kernel_mach_header_t *mh);
 	static OSReturn validateKCFileSetUUID(
 		OSDictionary         *infoDict,
 		kc_kind_t            type);
@@ -644,7 +704,15 @@ private:
 		bool     invokeFlag = true);
 	virtual uint32_t countRequestCallbacks(void);
 	OSReturn resetMutableSegments(void);
+	virtual OSData * getDextUniqueID(void);
 
+	static bool upgradeDext(
+		OSKext * olddext,
+		OSKext * newdext);
+	static bool removeDext(OSKext * dext);
+	static void replaceDextInternal(
+		OSKext * olddext,
+		OSKext * newdext);
 /* panic() support.
  */
 public:
@@ -687,6 +755,7 @@ private:
 	static void updateLoadedKextSummaries(void);
 	void updateLoadedKextSummary(OSKextLoadedKextSummary *summary);
 	void updateActiveAccount(OSKextActiveAccount *accountp);
+	static void removeDaemonExitRequests(void);
 
 #ifdef XNU_KERNEL_PRIVATE
 public:
@@ -708,6 +777,7 @@ public:
 	static OSPtr<OSKext> lookupKextWithLoadTag(OSKextLoadTag aTag);
 	static OSPtr<OSKext> lookupKextWithAddress(vm_address_t address);
 	static OSPtr<OSKext> lookupKextWithUUID(uuid_t uuid);
+	static OSPtr<OSKext> lookupDextWithIdentifier(OSString * dextIdentifier, OSData *dextUniqueIdentifier);
 
 	kernel_section_t *lookupSection(const char *segname, const char*secname);
 
@@ -756,14 +826,12 @@ public:
 		OSString        * kextIdentifier,
 		OSString        * serverName,
 		OSNumber        * serverTag,
-		class IOUserServerCheckInToken ** checkInToken);
-
-	static OSReturn requestDaemonLaunch(
+		OSBoolean       * reslide,
+		class IOUserServerCheckInToken * checkInToken,
+			OSData *serverDUI);
+	static OSReturn notifyDextUpgrade(
 		OSString        * kextIdentifier,
-		OSString        * serverName,
-		OSNumber        * serverTag,
-		OSSharedPtr<class IOUserServerCheckInToken> &checkInToken);
-
+		OSData          * dextUniqueIdentifier);
 	static OSReturn requestResource(
 		const char                    * kextIdentifier,
 		const char                    * resourceName,
@@ -789,6 +857,7 @@ public:
 
 	virtual bool    setAutounloadEnabled(bool flag);
 
+	virtual const OSObject   * getBundleExecutable(void);
 	virtual const OSSymbol   * getIdentifier(void);
 	virtual const char       * getIdentifierCString(void);
 	virtual OSKextVersion      getVersion(void);
@@ -802,13 +871,22 @@ public:
 	virtual OSPtr<OSData>          copyUUID(void);
 	OSPtr<OSData>                  copyTextUUID(void);
 	OSPtr<OSData>                  copyMachoUUID(const kernel_mach_header_t * header);
+	OSPtr<OSDextStatistics>        copyDextStatistics();
 	virtual OSPtr<OSArray>         copyPersonalitiesArray(void);
 	static bool                copyUserExecutablePath(const OSSymbol * bundleID, char * pathResult, size_t pathSize);
-	virtual void               setDriverKitUUID(OSData *uuid);
+	virtual void               setDriverKitUUID(LIBKERN_CONSUMED OSData *uuid);
+	static  bool               incrementDextLaunchCount(OSKext *dext, OSData *dextUniqueIDToMatch);
+	static  bool               decrementDextLaunchCount(OSString *bundleID);
+
 /* This removes personalities naming the kext (by CFBundleIdentifier),
  * not all personalities defined by the kext (IOPersonalityPublisher or CFBundleIdentifier).
  */
 	virtual void               removePersonalitiesFromCatalog(void);
+/*
+ * This removes the personalities naming the kext (by CFBundleIdentifier), and atomically adds
+ * the new personalities upgradedPersonalities.
+ */
+	virtual void               updatePersonalitiesInCatalog(OSArray *upgradedPersonalities);
 
 /* Converts common string-valued properties to OSSymbols for lower memory consumption.
  */
@@ -816,6 +894,8 @@ public:
 #ifdef XNU_KERNEL_PRIVATE
 	static void uniquePersonalityProperties(OSDictionary * personalityDict, bool defaultAddKernelBundleIdentifier);
 #endif
+
+	static bool                iokitDaemonActive(void);
 
 	virtual bool               declaresExecutable(void); // might be missing
 	virtual bool               isInterface(void);

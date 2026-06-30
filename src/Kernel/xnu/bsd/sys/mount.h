@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2000-2018 Apple Inc. All rights reserved.
+ * Copyright (c) 2000-2021 Apple Inc. All rights reserved.
  *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
  *
@@ -87,6 +87,7 @@
 #endif
 
 #include <sys/_types/_fsid_t.h> /* file system id type */
+#include <sys/_types/_graftdmg_un.h>
 
 /*
  * file system statistics
@@ -330,6 +331,7 @@ struct vfs_attr {
 #define MNT_NOUSERXATTR 0x01000000      /* Don't allow user extended attributes */
 #define MNT_DEFWRITE    0x02000000      /* filesystem should defer writes */
 #define MNT_MULTILABEL  0x04000000      /* MAC support for individual labels */
+#define MNT_NOFOLLOW    0x08000000      /* don't follow symlink when resolving mount point */
 #define MNT_NOATIME             0x10000000      /* disable update of file access time */
 #define MNT_SNAPSHOT    0x40000000 /* The mount is a snapshot */
 #define MNT_STRICTATIME 0x80000000      /* enable strict update of file access time */
@@ -352,7 +354,8 @@ struct vfs_attr {
 	                MNT_ROOTFS	| MNT_DOVOLFS	| MNT_DONTBROWSE | \
 	                MNT_IGNORE_OWNERSHIP | MNT_AUTOMOUNTED | MNT_JOURNALED | \
 	                MNT_NOUSERXATTR | MNT_DEFWRITE	| MNT_MULTILABEL | \
-	                MNT_NOATIME | MNT_STRICTATIME | MNT_SNAPSHOT | MNT_CPROTECT)
+	                MNT_NOFOLLOW | MNT_NOATIME | MNT_STRICTATIME | \
+	                MNT_SNAPSHOT | MNT_CPROTECT)
 /*
  * External filesystem command modifier flags.
  * Unmount can use the MNT_FORCE flag.
@@ -648,10 +651,10 @@ struct vfsops {
 	 *  @param mp Mount for which to get parameters.
 	 *  @param vfa Container for specifying which attributes are desired and which attributes the filesystem
 	 *  supports, as well as for returning results.
-	 *  @param ctx Context to authenticate for getting filesystem attributes.
+	 *  @param context Context to authenticate for getting filesystem attributes.
 	 *  @return 0 for success, else an error code.
 	 */
-	int  (*vfs_getattr)(struct mount *mp, struct vfs_attr *, vfs_context_t context);
+	int  (*vfs_getattr)(struct mount *mp, struct vfs_attr *vfa, vfs_context_t context);
 /*	int  (*vfs_statfs)(struct mount *mp, struct vfsstatfs *sbp, vfs_context_t context);*/
 
 	/*!
@@ -660,7 +663,7 @@ struct vfsops {
 	 *  @discussion vfs_sync will be called as part of the sync() system call and during unmount.
 	 *  @param mp Mountpoint to sync.
 	 *  @param waitfor MNT_WAIT: flush synchronously, waiting for all data to be written before returning. MNT_NOWAIT: start I/O but do not wait for it.
-	 *  @param ctx Context to authenticate for the sync.
+	 *  @param context Context to authenticate for the sync.
 	 *  @return 0 for success, else an error code.
 	 */
 	int  (*vfs_sync)(struct mount *mp, int waitfor, vfs_context_t context);
@@ -687,7 +690,7 @@ struct vfsops {
 	 *  @param fhlen Size of file handle structure, as returned by vfs_vptofh.
 	 *  @param fhp Pointer to handle.
 	 *  @param vpp Destination for vnode.
-	 *  @param ctx Context against which to authenticate the file-handle conversion.
+	 *  @param context Context against which to authenticate the file-handle conversion.
 	 *  @return 0 for success, else an error code.
 	 */
 	int  (*vfs_fhtovp)(struct mount *mp, int fhlen, unsigned char *fhp, struct vnode **vpp,
@@ -696,10 +699,10 @@ struct vfsops {
 	/*!
 	 *  @field vfs_vptofh
 	 *  @abstract Get a persistent handle corresponding to a vnode.
-	 *  @param mp Mount against which to convert the vnode to a handle.
+	 *  @param vp Vnode against which to obtain the file-handle
 	 *  @param fhlen Size of buffer provided for handle; set to size of actual handle returned.
 	 *  @param fhp Pointer to buffer in which to place handle data.
-	 *  @param ctx Context against which to authenticate the file-handle request.
+	 *  @param context Context against which to authenticate the file-handle request.
 	 *  @return 0 for success, else an error code.
 	 */
 	int  (*vfs_vptofh)(struct vnode *vp, int *fhlen, unsigned char *fhp, vfs_context_t context);
@@ -711,12 +714,12 @@ struct vfsops {
 	 *  is mounted; it allows the filesystem to initialize whatever global data structures
 	 *  are shared across all mounts.  If this returns successfully, a filesystem should be ready to have
 	 *  instances mounted.
-	 *  @param vfsconf Configuration information.  Currently, the only useful data are the filesystem name,
+	 *  @param vfsc Configuration information.  Currently, the only useful data are the filesystem name,
 	 *  typenum, and flags.  The flags field will be either 0 or MNT_LOCAL.  Many filesystems ignore this
 	 *  parameter.
 	 *  @return 0 for success, else an error code.
 	 */
-	int  (*vfs_init)(struct vfsconf *);
+	int  (*vfs_init)(struct vfsconf *vfsc);
 
 	/*!
 	 *  @field vfs_sysctl
@@ -740,7 +743,7 @@ struct vfsops {
 	 *  @param context Context against which to authenticate attribute change.
 	 *  @return 0 for success, else an error code.
 	 */
-	int  (*vfs_setattr)(struct mount *mp, struct vfs_attr *, vfs_context_t context);
+	int  (*vfs_setattr)(struct mount *mp, struct vfs_attr *vfa, vfs_context_t context);
 
 	/*!
 	 *  @field vfs_ioctl
@@ -754,7 +757,7 @@ struct vfsops {
 	 *  If it is an address, it is valid and resides in the kernel; callers of
 	 *  VFS_IOCTL() are responsible for copying to and from userland.
 	 *  @param flags Reserved for future use, set to zero
-	 *  @param ctx Context against which to authenticate ioctl request.
+	 *  @param context Context against which to authenticate ioctl request.
 	 *  @return 0 for success, else an error code.
 	 */
 	int  (*vfs_ioctl)(struct mount *mp, u_long command, caddr_t data,
@@ -1337,10 +1340,17 @@ int vfs_isswapmount(mount_t mp);
 int     vfs_context_dataless_materialization_is_prevented(vfs_context_t);
 boolean_t vfs_context_is_dataless_manipulator(vfs_context_t);
 boolean_t vfs_context_can_resolve_triggers(vfs_context_t);
+boolean_t vfs_context_can_break_leases(vfs_context_t);
 void    vfs_setmntsystem(mount_t mp);
 void    vfs_setmntsystemdata(mount_t mp);
 void    vfs_setmntswap(mount_t mp);
 boolean_t vfs_is_basesystem(mount_t mp);
+boolean_t vfs_iskernelmount(mount_t mp);
+
+boolean_t vfs_shutdown_in_progress(void);
+boolean_t vfs_shutdown_finished(void);
+void    vfs_update_last_completion_time(void);
+uint64_t vfs_last_completion_time(void);
 
 OS_ENUM(bsd_bootfail_mode, uint32_t,
     BSD_BOOTFAIL_SEAL_BROKEN = 1,
@@ -1435,12 +1445,31 @@ void vfs_get_statfs64(struct mount *mp, struct statfs64 *sfs);
  */
 uint64_t vfs_mount_id(mount_t mp);
 
+/*!
+ * @function vfs_mount_at_path
+ * @abstract A wrapper around kernel_mount() to be used only in special
+ * circumstances.
+ */
+int vfs_mount_at_path(const char *fstype, const char *path,
+    vnode_t pvp, vnode_t vp, void *data, size_t datalen, int mnt_flags,
+    int flags);
+
+/*!
+ * @function vfs_mount_override_type_name
+ * @abstract override the fstypename for statfs.
+ * @param mp Mountpint for which to override the type name.
+ * @param name Name to override.
+ */
+int vfs_mount_override_type_name(mount_t mp, const char *name);
+
+#define VFS_MOUNT_FLAG_NOAUTH           0x01 /* Don't check the UID of the directory we are mounting on */
+#define VFS_MOUNT_FLAG_PERMIT_UNMOUNT   0x02 /* Allow (non-forced) unmounts by users other the one who mounted the volume */
+#define VFS_MOUNT_FLAG_CURRENT_CONTEXT  0x04 /* Mount using the current VFS context */
+
 #endif  /* KERNEL_PRIVATE */
 __END_DECLS
 
 #endif /* KERNEL */
-
-#ifndef KERNEL
 
 /*
  * Generic file handle
@@ -1455,6 +1484,37 @@ struct fhandle {
 };
 typedef struct fhandle  fhandle_t;
 
+/*
+ * Cryptex authentication
+ * Note: these 2 enums are used in conjunction, graftdmg_type is used for authentication while grafting
+ * cryptexes and cryptex_auth_type is currently used for authentication while mounting generic
+ * cryptexes. We need to make sure we do not use the reserved values in each for a new authentication type.
+ */
+// bump up the version for any change that has kext dependency
+#define CRYPTEX_AUTH_STRUCT_VERSION 1
+OS_ENUM(graftdmg_type, uint32_t,
+    GRAFTDMG_CRYPTEX_BOOT = 1,
+    GRAFTDMG_CRYPTEX_PREBOOT = 2,
+    GRAFTDMG_CRYPTEX_DOWNLEVEL = 3,
+    // Reserved: CRYPTEX1_AUTH_ENV_GENERIC = 4,
+    // Reserved: CRYPTEX1_AUTH_ENV_GENERIC_SUPPLEMENTAL = 5,
+    GRAFTDMG_CRYPTEX_PDI_NONCE = 6,
+    GRAFTDMG_CRYPTEX_EFFECTIVE_AP = 7,
+    // Update this when a new type is added
+    GRAFTDMG_CRYPTEX_MAX = 7);
+
+OS_ENUM(cryptex_auth_type, uint32_t,
+    // Reserved: GRAFTDMG_CRYPTEX_BOOT = 1,
+    // Reserved: GRAFTDMG_CRYPTEX_PREBOOT = 2,
+    // Reserved: GRAFTDMG_CRYPTEX_DOWNLEVEL = 3,
+    CRYPTEX1_AUTH_ENV_GENERIC = 4,
+    CRYPTEX1_AUTH_ENV_GENERIC_SUPPLEMENTAL = 5,
+    CRYPTEX_AUTH_PDI_NONCE = 6,
+    // Reserved: GRAFTDMG_CRYPTEX_EFFECTIVE_AP = 7
+    // Update this when a new type is added
+    CRYPTEX_AUTH_MAX = 7);
+
+#ifndef KERNEL
 
 __BEGIN_DECLS
 int     fhopen(const struct fhandle *, int);
@@ -1484,6 +1544,8 @@ int     unmount(const char *, int);
 int     getvfsbyname(const char *, struct vfsconf *);
 #if PRIVATE
 int     pivot_root(const char *, const char *) __OSX_AVAILABLE(10.16);
+int     graftdmg(int, const char *, uint32_t, graftdmg_args_un *) __OSX_AVAILABLE(13.0) __IOS_AVAILABLE(16.0);
+int     ungraftdmg(const char *, uint64_t) __OSX_AVAILABLE(13.0) __IOS_AVAILABLE(16.0);
 #endif
 __END_DECLS
 

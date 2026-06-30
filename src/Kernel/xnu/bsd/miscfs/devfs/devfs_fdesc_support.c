@@ -207,6 +207,7 @@ fdesc_allocvp(fdntype ftype, int ix, struct mount *mp, struct vnode **vpp, enum 
 	int error = 0;
 	int vid = 0;
 	struct vnode_fsparam vfsp;
+	struct vnode *vp;
 
 	fdesc_lock();
 
@@ -215,14 +216,18 @@ loop:
 	for (fd = fc->lh_first; fd != 0; fd = fd->fd_hash.le_next) {
 		if (fd->fd_ix == ix && vnode_mount(fd->fd_vnode) == mp) {
 			vid = vnode_vid(fd->fd_vnode);
+			vp = fd->fd_vnode;
+			vnode_hold(vp);
 			fdesc_unlock();
 
-			if (vnode_getwithvid(fd->fd_vnode, vid)) {
+			if (vnode_getwithvid(vp, vid)) {
+				vnode_drop(vp);
 				fdesc_lock();
 				goto loop;
 			}
 
-			*vpp = fd->fd_vnode;
+			vnode_drop(vp);
+			*vpp = vp;
 			(*vpp)->v_type = (uint16_t)vtype;
 
 			return error;
@@ -239,7 +244,7 @@ loop:
 	fdcache_lock |= FDL_LOCKED;
 	fdesc_unlock();
 
-	MALLOC(fd, void *, sizeof(struct fdescnode), M_TEMP, M_WAITOK);
+	fd = kalloc_type(struct fdescnode, Z_WAITOK);
 
 	vfsp.vnfs_mp = mp;
 	vfsp.vnfs_vtype = vtype;
@@ -254,9 +259,10 @@ loop:
 	vfsp.vnfs_marksystem = 0;
 	vfsp.vnfs_markroot = 0;
 
-	error = vnode_create(VNCREATE_FLAVOR, VCREATESIZE, &vfsp, vpp);
+	error = vnode_create_ext(VNCREATE_FLAVOR, VCREATESIZE, &vfsp, vpp,
+	    VNODE_CREATE_DEFAULT);
 	if (error) {
-		FREE(fd, M_TEMP);
+		kfree_type(struct fdescnode, fd);
 		fdesc_lock();
 		goto out;
 	}
@@ -264,10 +270,9 @@ loop:
 	(*vpp)->v_tag = VT_FDESC;
 	fd->fd_vnode = *vpp;
 	fd->fd_type = ftype;
-	fd->fd_fd = -1;
+	fd->fd_fd = fdno;
 	fd->fd_link = NULL;
 	fd->fd_ix = ix;
-	fd->fd_fd = fdno;
 
 	fdesc_lock();
 
@@ -300,7 +305,7 @@ devfs_devfd_lookup(struct vnop_lookup_args *ap)
 	struct componentname *cnp = ap->a_cnp;
 	char *pname = cnp->cn_nameptr;
 	struct proc *p = vfs_context_proc(ap->a_context);
-	int numfiles = p->p_fd->fd_nfiles;
+	int numfiles = p->p_fd.fd_nfiles;
 	int fd;
 	int error;
 	struct vnode *fvp;
@@ -316,8 +321,7 @@ devfs_devfd_lookup(struct vnop_lookup_args *ap)
 
 	fd = 0;
 	while (*pname >= '0' && *pname <= '9') {
-		fd = 10 * fd + *pname++ - '0';
-		if (fd >= numfiles) {
+		if (os_mul_and_add_overflow(fd, 10, *pname++ - '0', &fd)) {
 			break;
 		}
 	}
@@ -394,14 +398,14 @@ fdesc_attr(int fd, struct vnode_attr *vap, vfs_context_t a_context)
 	}
 	switch (FILEGLOB_DTYPE(fp->fp_glob)) {
 	case DTYPE_VNODE:
-		if ((error = vnode_getwithref((struct vnode *) fp->fp_glob->fg_data)) != 0) {
+		if ((error = vnode_getwithref((struct vnode *)fp_get_data(fp))) != 0) {
 			break;
 		}
-		if ((error = vnode_authorize((struct vnode *)fp->fp_glob->fg_data,
+		if ((error = vnode_authorize((struct vnode *)fp_get_data(fp),
 		    NULL,
 		    KAUTH_VNODE_READ_ATTRIBUTES | KAUTH_VNODE_READ_SECURITY,
 		    a_context)) == 0) {
-			error = vnode_getattr((struct vnode *)fp->fp_glob->fg_data, vap, a_context);
+			error = vnode_getattr((struct vnode *)fp_get_data(fp), vap, a_context);
 		}
 		if (error == 0 && vap->va_type == VDIR) {
 			/*
@@ -412,17 +416,17 @@ fdesc_attr(int fd, struct vnode_attr *vap, vfs_context_t a_context)
 			 */
 			vap->va_mode &= ~((VEXEC) | (VEXEC >> 3) | (VEXEC >> 6));
 		}
-		(void)vnode_put((struct vnode *) fp->fp_glob->fg_data);
+		(void)vnode_put((struct vnode *)fp_get_data(fp));
 		break;
 
 	case DTYPE_SOCKET:
 	case DTYPE_PIPE:
 #if SOCKETS
 		if (FILEGLOB_DTYPE(fp->fp_glob) == DTYPE_SOCKET) {
-			error = soo_stat((struct socket *)fp->fp_glob->fg_data, (void *)&stb, 0);
+			error = soo_stat((struct socket *)fp_get_data(fp), (void *)&stb, 0);
 		} else
 #endif /* SOCKETS */
-		error = pipe_stat((struct pipe *)fp->fp_glob->fg_data, (void *)&stb, 0);
+		error = pipe_stat((struct pipe *)fp_get_data(fp), (void *)&stb, 0);
 
 		if (error == 0) {
 			if (FILEGLOB_DTYPE(fp->fp_glob) == DTYPE_SOCKET) {
@@ -472,7 +476,7 @@ fdesc_getattr(struct vnop_getattr_args *ap)
 		break;
 
 	default:
-		panic("Invalid type for an fdesc node!\n");
+		panic("Invalid type for an fdesc node!");
 		break;
 	}
 
@@ -495,6 +499,8 @@ fdesc_setattr(struct vnop_setattr_args *ap)
 {
 	struct fileproc *fp;
 	unsigned fd;
+	kauth_action_t action;
+	vnode_t vp;
 	int error;
 	struct proc * p = vfs_context_proc(ap->a_context);
 
@@ -505,7 +511,7 @@ fdesc_setattr(struct vnop_setattr_args *ap)
 	case Fdesc:
 		break;
 	default:
-		panic("Invalid type for an fdesc node!\n");
+		panic("Invalid type for an fdesc node!");
 		return EACCES;
 	}
 
@@ -520,11 +526,24 @@ fdesc_setattr(struct vnop_setattr_args *ap)
 	switch (FILEGLOB_DTYPE(fp->fp_glob)) {
 	case DTYPE_VNODE:
 	{
-		if ((error = vnode_getwithref((struct vnode *) fp->fp_glob->fg_data)) != 0) {
+		vp = (struct vnode *)fp_get_data(fp);
+
+		if ((error = vnode_getwithref(vp)) != 0) {
 			break;
 		}
-		error = vnode_setattr((struct vnode *) fp->fp_glob->fg_data, ap->a_vap, ap->a_context);
-		(void)vnode_put((struct vnode *) fp->fp_glob->fg_data);
+
+		if (((error = vnode_authattr(vp, ap->a_vap, &action, ap->a_context)) != 0) ||
+		    ((error = vnode_authorize(vp, NULL, action, ap->a_context)) != 0)) {
+			if (error == EACCES) {
+				error = EPERM;
+			}
+
+			(void)vnode_put(vp);
+			break;
+		}
+
+		error = vnode_setattr(vp, ap->a_vap, ap->a_context);
+		(void)vnode_put(vp);
 		break;
 	}
 
@@ -586,7 +605,7 @@ devfs_devfd_readdir(struct vnop_readdir_args *ap)
 	i = uio->uio_offset / UIO_MX;
 	error = 0;
 	while (uio_resid(uio) >= UIO_MX) {
-		if (i >= p->p_fd->fd_nfiles || i < 0) {
+		if (i >= p->p_fd.fd_nfiles || i < 0) {
 			break;
 		}
 
@@ -663,8 +682,7 @@ fdesc_reclaim(struct vnop_reclaim_args *ap)
 	fdesc_lock();
 
 	LIST_REMOVE(fd, fd_hash);
-	FREE(vp->v_data, M_TEMP);
-	vp->v_data = NULL;
+	kfree_type(struct fdescnode, vp->v_data);
 
 	fdesc_unlock();
 
@@ -714,35 +732,22 @@ fdesc_badop(void)
 
 #define VOPFUNC int (*)(void *)
 
-#define fdesc_create (int (*) (struct  vnop_create_args *))eopnotsupp
-#define fdesc_mknod (int (*) (struct  vnop_mknod_args *))eopnotsupp
-#define fdesc_close (int (*) (struct  vnop_close_args *))nullop
-#define fdesc_access (int (*) (struct  vnop_access_args *))nullop
-#define fdesc_mmap (int (*) (struct  vnop_mmap_args *))eopnotsupp
 #define fdesc_revoke nop_revoke
-#define fdesc_fsync (int (*) (struct  vnop_fsync_args *))nullop
-#define fdesc_remove (int (*) (struct  vnop_remove_args *))eopnotsupp
-#define fdesc_link (int (*) (struct  vnop_link_args *))eopnotsupp
-#define fdesc_rename (int (*) (struct  vnop_rename_args *))eopnotsupp
-#define fdesc_mkdir (int (*) (struct  vnop_mkdir_args *))eopnotsupp
-#define fdesc_rmdir (int (*) (struct  vnop_rmdir_args *))eopnotsupp
-#define fdesc_symlink (int (*) (struct vnop_symlink_args *))eopnotsupp
-#define fdesc_strategy (int (*) (struct  vnop_strategy_args *))fdesc_badop
-#define fdesc_advlock (int (*) (struct vnop_advlock_args *))eopnotsupp
-#define fdesc_bwrite (int (*) (struct  vnop_bwrite_args *))eopnotsupp
-#define fdesc_blktooff (int (*) (struct  vnop_blktooff_args *))eopnotsupp
-#define fdesc_offtoblk (int (*) (struct  vnop_offtoblk_args *))eopnotsupp
-#define fdesc_blockmap (int (*) (struct  vnop_blockmap_args *))eopnotsupp
+#define fdesc_strategy (void (*)(void))fdesc_badop
+
+#define fdesc_nullop (void (*)(void ))nullop
+#define fdesc_error (void (*)(void ))vn_default_error
+#define fdesc_notsupp (void (*)(void ))eopnotsupp
 
 int(**fdesc_vnodeop_p)(void *);
 const struct vnodeopv_entry_desc devfs_fdesc_vnodeop_entries[] = {
-	{ .opve_op = &vnop_default_desc, .opve_impl = (VOPFUNC)vn_default_error },
-	{ .opve_op = &vnop_lookup_desc, .opve_impl = (VOPFUNC)vn_default_error},        /* lookup */
-	{ .opve_op = &vnop_create_desc, .opve_impl = (VOPFUNC)fdesc_create },   /* create */
-	{ .opve_op = &vnop_mknod_desc, .opve_impl = (VOPFUNC)fdesc_mknod },     /* mknod */
+	{ .opve_op = &vnop_default_desc, .opve_impl = (VOPFUNC)fdesc_error },
+	{ .opve_op = &vnop_lookup_desc, .opve_impl = (VOPFUNC)fdesc_error},        /* lookup */
+	{ .opve_op = &vnop_create_desc, .opve_impl = (VOPFUNC)fdesc_notsupp },   /* create */
+	{ .opve_op = &vnop_mknod_desc, .opve_impl = (VOPFUNC)fdesc_notsupp },     /* mknod */
 	{ .opve_op = &vnop_open_desc, .opve_impl = (VOPFUNC)fdesc_open },       /* open */
-	{ .opve_op = &vnop_close_desc, .opve_impl = (VOPFUNC)fdesc_close },     /* close */
-	{ .opve_op = &vnop_access_desc, .opve_impl = (VOPFUNC)fdesc_access },   /* access */
+	{ .opve_op = &vnop_close_desc, .opve_impl = (VOPFUNC)fdesc_nullop },     /* close */
+	{ .opve_op = &vnop_access_desc, .opve_impl = (VOPFUNC)fdesc_nullop },   /* access */
 	{ .opve_op = &vnop_getattr_desc, .opve_impl = (VOPFUNC)fdesc_getattr }, /* getattr */
 	{ .opve_op = &vnop_setattr_desc, .opve_impl = (VOPFUNC)fdesc_setattr }, /* setattr */
 	{ .opve_op = &vnop_read_desc, .opve_impl = (VOPFUNC)fdesc_read },       /* read */
@@ -750,28 +755,28 @@ const struct vnodeopv_entry_desc devfs_fdesc_vnodeop_entries[] = {
 	{ .opve_op = &vnop_ioctl_desc, .opve_impl = (VOPFUNC)fdesc_ioctl },     /* ioctl */
 	{ .opve_op = &vnop_select_desc, .opve_impl = (VOPFUNC)fdesc_select },   /* select */
 	{ .opve_op = &vnop_revoke_desc, .opve_impl = (VOPFUNC)fdesc_revoke },   /* revoke */
-	{ .opve_op = &vnop_mmap_desc, .opve_impl = (VOPFUNC)fdesc_mmap },       /* mmap */
-	{ .opve_op = &vnop_fsync_desc, .opve_impl = (VOPFUNC)fdesc_fsync },     /* fsync */
-	{ .opve_op = &vnop_remove_desc, .opve_impl = (VOPFUNC)fdesc_remove },   /* remove */
-	{ .opve_op = &vnop_link_desc, .opve_impl = (VOPFUNC)fdesc_link },       /* link */
-	{ .opve_op = &vnop_rename_desc, .opve_impl =  (VOPFUNC)fdesc_rename },   /* rename */
-	{ .opve_op = &vnop_mkdir_desc, .opve_impl = (VOPFUNC)fdesc_mkdir },     /* mkdir */
-	{ .opve_op = &vnop_rmdir_desc, .opve_impl = (VOPFUNC)fdesc_rmdir },     /* rmdir */
-	{ .opve_op = &vnop_symlink_desc, .opve_impl = (VOPFUNC)fdesc_symlink }, /* symlink */
-	{ .opve_op = &vnop_readdir_desc, .opve_impl = (VOPFUNC)vn_default_error},/* readdir */
+	{ .opve_op = &vnop_mmap_desc, .opve_impl = (VOPFUNC)fdesc_notsupp },       /* mmap */
+	{ .opve_op = &vnop_fsync_desc, .opve_impl = (VOPFUNC)fdesc_nullop },     /* fsync */
+	{ .opve_op = &vnop_remove_desc, .opve_impl = (VOPFUNC)fdesc_notsupp },   /* remove */
+	{ .opve_op = &vnop_link_desc, .opve_impl = (VOPFUNC)fdesc_notsupp },       /* link */
+	{ .opve_op = &vnop_rename_desc, .opve_impl =  (VOPFUNC)fdesc_notsupp },   /* rename */
+	{ .opve_op = &vnop_mkdir_desc, .opve_impl = (VOPFUNC)fdesc_notsupp },     /* mkdir */
+	{ .opve_op = &vnop_rmdir_desc, .opve_impl = (VOPFUNC)fdesc_notsupp },     /* rmdir */
+	{ .opve_op = &vnop_symlink_desc, .opve_impl = (VOPFUNC)fdesc_notsupp }, /* symlink */
+	{ .opve_op = &vnop_readdir_desc, .opve_impl = (VOPFUNC)fdesc_error},/* readdir */
 	{ .opve_op = &vnop_readlink_desc, .opve_impl = (VOPFUNC)err_readlink}, /* readlink */
 	{ .opve_op = &vnop_inactive_desc, .opve_impl = (VOPFUNC)fdesc_inactive },/* inactive */
 	{ .opve_op = &vnop_reclaim_desc, .opve_impl = (VOPFUNC)fdesc_reclaim }, /* reclaim */
 	{ .opve_op = &vnop_strategy_desc, .opve_impl = (VOPFUNC)fdesc_strategy },       /* strategy */
 	{ .opve_op = &vnop_pathconf_desc, .opve_impl = (VOPFUNC)fdesc_pathconf },       /* pathconf */
-	{ .opve_op = &vnop_advlock_desc, .opve_impl = (VOPFUNC)fdesc_advlock }, /* advlock */
-	{ .opve_op = &vnop_bwrite_desc, .opve_impl = (VOPFUNC)fdesc_bwrite },   /* bwrite */
+	{ .opve_op = &vnop_advlock_desc, .opve_impl = (VOPFUNC)fdesc_notsupp }, /* advlock */
+	{ .opve_op = &vnop_bwrite_desc, .opve_impl = (VOPFUNC)fdesc_notsupp },   /* bwrite */
 	{ .opve_op = &vnop_pagein_desc, .opve_impl = (VOPFUNC)err_pagein },     /* pagein */
 	{ .opve_op = &vnop_pageout_desc, .opve_impl = (VOPFUNC)err_pageout },   /* pageout */
 	{ .opve_op = &vnop_copyfile_desc, .opve_impl = (VOPFUNC)err_copyfile }, /* Copyfile */
-	{ .opve_op = &vnop_blktooff_desc, .opve_impl = (VOPFUNC)fdesc_blktooff },       /* blktooff */
-	{ .opve_op = &vnop_blktooff_desc, .opve_impl = (VOPFUNC)fdesc_offtoblk },       /* offtoblk */
-	{ .opve_op = &vnop_blockmap_desc, .opve_impl = (VOPFUNC)fdesc_blockmap },       /* blockmap */
+	{ .opve_op = &vnop_blktooff_desc, .opve_impl = (VOPFUNC)fdesc_notsupp },       /* blktooff */
+	{ .opve_op = &vnop_blktooff_desc, .opve_impl = (VOPFUNC)fdesc_notsupp },       /* offtoblk */
+	{ .opve_op = &vnop_blockmap_desc, .opve_impl = (VOPFUNC)fdesc_notsupp },       /* blockmap */
 	{ .opve_op = (struct vnodeop_desc*)NULL, .opve_impl = (VOPFUNC)NULL }
 };
 

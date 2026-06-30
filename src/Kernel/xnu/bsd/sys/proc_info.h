@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2005-2020 Apple Computer, Inc. All rights reserved.
+ * Copyright (c) 2005-2021 Apple Inc. All rights reserved.
  *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
  *
@@ -102,8 +102,8 @@ struct proc_bsdshortinfo {
 	uint32_t                pbsi_rfu;               /* reserved for future use*/
 };
 
-
 #ifdef  PRIVATE
+
 struct proc_uniqidentifierinfo {
 	uint8_t                 p_uuid[16];             /* UUID of the main executable */
 	uint64_t                p_uniqueid;             /* 64 bit unique identifier for process */
@@ -113,7 +113,6 @@ struct proc_uniqidentifierinfo {
 	uint64_t                p_reserve3;             /* reserved for future use */
 	uint64_t                p_reserve4;             /* reserved for future use */
 };
-
 
 struct proc_bsdinfowithuniqid {
 	struct proc_bsdinfo             pbsd;
@@ -145,8 +144,28 @@ struct proc_ipctableinfo {
 	uint32_t               table_free;
 };
 
-#endif
+struct proc_threadschedinfo {
+	uint64_t               int_time_ns;         /* time spent in interrupt context */
+};
 
+// See PROC_PIDTHREADCOUNTS for a description of how to use these structures.
+
+struct proc_threadcounts_data {
+	uint64_t ptcd_instructions;
+	uint64_t ptcd_cycles;
+	uint64_t ptcd_user_time_mach;
+	uint64_t ptcd_system_time_mach;
+	uint64_t ptcd_energy_nj;
+};
+
+struct proc_threadcounts {
+	uint16_t ptc_len;
+	uint16_t ptc_reserved0;
+	uint32_t ptc_reserved1;
+	struct proc_threadcounts_data ptc_counts[];
+};
+
+#endif /* PRIVATE */
 
 /* pbi_flags values */
 #define PROC_FLAG_SYSTEM        1       /*  System process */
@@ -180,6 +199,7 @@ struct proc_ipctableinfo {
 #define PROC_FLAG_SUPPRESSED         0x800000 /* Process is suppressed */
 #define PROC_FLAG_APPLICATION 0x1000000 /* Process is an application */
 #define PROC_FLAG_IOS_APPLICATION PROC_FLAG_APPLICATION /* Process is an application */
+#define PROC_FLAG_ROSETTA 0x2000000 /* Process is running translated under Rosetta */
 #endif
 
 
@@ -679,13 +699,15 @@ struct kqueue_dyninfo {
 };
 
 /* keep in sync with KQ_* in sys/eventvar.h */
-#define PROC_KQUEUE_SELECT      0x01
-#define PROC_KQUEUE_SLEEP       0x02
-#define PROC_KQUEUE_32          0x08
-#define PROC_KQUEUE_64          0x10
-#define PROC_KQUEUE_QOS         0x20
-
+#define PROC_KQUEUE_SELECT      0x0001
+#define PROC_KQUEUE_SLEEP       0x0002
+#define PROC_KQUEUE_32          0x0008
+#define PROC_KQUEUE_64          0x0010
+#define PROC_KQUEUE_QOS         0x0020
 #ifdef PRIVATE
+#define PROC_KQUEUE_WORKQ       0x0040
+#define PROC_KQUEUE_WORKLOOP    0x0080
+
 struct kevent_extinfo {
 	struct kevent_qos_s kqext_kev;
 	uint64_t kqext_sdata;
@@ -721,6 +743,8 @@ typedef uint64_t proc_info_udata_t;
 #define PROX_FDTYPE_PIPE        6
 #define PROX_FDTYPE_FSEVENTS    7
 #define PROX_FDTYPE_NETPOLICY   9
+#define PROX_FDTYPE_CHANNEL     10
+#define PROX_FDTYPE_NEXUS       11
 
 struct proc_fdinfo {
 	int32_t                 proc_fd;
@@ -732,6 +756,39 @@ struct proc_fileportinfo {
 	uint32_t                proc_fdtype;
 };
 
+/*
+ * Channel
+ */
+
+/* type */
+#define PROC_CHANNEL_TYPE_USER_PIPE             0
+#define PROC_CHANNEL_TYPE_KERNEL_PIPE           1
+#define PROC_CHANNEL_TYPE_NET_IF                2
+#define PROC_CHANNEL_TYPE_FLOW_SWITCH           3
+
+/* flags */
+#define PROC_CHANNEL_FLAGS_MONITOR_TX           0x1
+#define PROC_CHANNEL_FLAGS_MONITOR_RX           0x2
+#define PROC_CHANNEL_FLAGS_MONITOR_NO_COPY      0x4
+#define PROC_CHANNEL_FLAGS_EXCLUSIVE            0x10
+#define PROC_CHANNEL_FLAGS_USER_PACKET_POOL     0x20
+#define PROC_CHANNEL_FLAGS_DEFUNCT_OK           0x40
+#define PROC_CHANNEL_FLAGS_LOW_LATENCY          0x80
+#define PROC_CHANNEL_FLAGS_MONITOR                                      \
+	(PROC_CHANNEL_FLAGS_MONITOR_TX | PROC_CHANNEL_FLAGS_MONITOR_RX)
+
+struct proc_channel_info {
+	uuid_t                  chi_instance;
+	uint32_t                chi_port;
+	uint32_t                chi_type;
+	uint32_t                chi_flags;
+	uint32_t                rfu_1;/* reserved */
+};
+
+struct channel_fdinfo {
+	struct proc_fileinfo    pfi;
+	struct proc_channel_info channelinfo;
+};
 
 /* Flavors for proc_pidinfo() */
 #define PROC_PIDLISTFDS                 1
@@ -835,6 +892,41 @@ struct proc_fileportinfo {
 #define PROC_PIDIPCTABLEINFO 32
 #define PROC_PIDIPCTABLEINFO_SIZE (sizeof(struct proc_ipctableinfo))
 
+#define PROC_PIDTHREADSCHEDINFO 33
+#define PROC_PIDTHREADSCHEDINFO_SIZE (sizeof(struct proc_threadschedinfo))
+
+// PROC_PIDTHREADCOUNTS returns a list of counters for the given thread,
+// separated out by the "perf-level" it was running on (typically either
+// "performance" or "efficiency").
+//
+// This interface works a bit differently from the other proc_info(3) flavors.
+// It copies out a structure with a variable-length array at the end of it.
+// The start of the `proc_threadcounts` structure contains a header indicating
+// the length of the subsequent array of `proc_threadcounts_data` elements.
+//
+// To use this interface, first read the `hw.nperflevels` sysctl to find out how
+// large to make the allocation that receives the counter data:
+//
+//     sizeof(proc_threadcounts) + nperflevels * sizeof(proc_threadcounts_data)
+//
+// Use the `hw.perflevel[0-9].name` sysctl to find out which perf-level maps to
+// each entry in the array.
+//
+// The complete usage would be (omitting error reporting):
+//
+//     uint32_t len = 0;
+//     int ret = sysctlbyname("hw.nperflevels", &len, &len_sz, NULL, 0);
+//     size_t size = sizeof(struct proc_threadcounts) +
+//             len * sizeof(struct proc_threadcounts_data);
+//     struct proc_threadcounts *counts = malloc(size);
+//     // Fill this in with a thread ID, like from `PROC_PIDLISTTHREADS`.
+//     uint64_t tid = 0;
+//     int size_copied = proc_info(getpid(), PROC_PIDTHREADCOUNTS, tid, counts,
+//             size);
+
+#define PROC_PIDTHREADCOUNTS 34
+#define PROC_PIDTHREADCOUNTS_SIZE (sizeof(struct proc_threadcounts))
+
 #endif /* PRIVATE */
 /* Flavors for proc_pidfdinfo */
 
@@ -869,6 +961,8 @@ struct proc_fileportinfo {
 #define PROC_PIDDYNKQUEUES_MAX  (1024 * 128)
 #endif /* PRIVATE */
 
+#define PROC_PIDFDCHANNELINFO           10
+#define PROC_PIDFDCHANNELINFO_SIZE      (sizeof(struct channel_fdinfo))
 
 /* Flavors for proc_pidfileportinfo */
 
@@ -971,6 +1065,8 @@ struct proc_fileportinfo {
 #define PROC_INFO_CALL_CANUSEFGHW        0xc
 #define PROC_INFO_CALL_PIDDYNKQUEUEINFO  0xd
 #define PROC_INFO_CALL_UDATA_INFO        0xe
+#define PROC_INFO_CALL_SET_DYLD_IMAGES   0xf
+#define PROC_INFO_CALL_TERMINATE_RSR     0x10
 
 /* __proc_info_extended_id() flags */
 #define PIF_COMPARE_IDVERSION           0x01
@@ -1008,6 +1104,9 @@ extern int pid_kqueue_listdynamickqueues(proc_t p, user_addr_t ubuf,
     uint32_t bufsize, int32_t *retval);
 extern int pid_dynamickqueue_extinfo(proc_t p, kqueue_id_t kq_id,
     user_addr_t ubuf, uint32_t bufsize, int32_t *retval);
+struct kern_channel;
+extern int fill_channelinfo(struct kern_channel * chan,
+    struct proc_channel_info *chan_info);
 extern int fill_procworkqueue(proc_t, struct proc_workqueueinfo *);
 extern boolean_t workqueue_get_pwq_exceeded(void *v, boolean_t *exceeded_total,
     boolean_t *exceeded_constrained);

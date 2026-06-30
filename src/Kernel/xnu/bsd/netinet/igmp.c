@@ -111,6 +111,10 @@
 #include <netinet/igmp_var.h>
 #include <netinet/kpi_ipfilter_var.h>
 
+#if SKYWALK
+#include <skywalk/core/skywalk_var.h>
+#endif /* SKYWALK */
+
 SLIST_HEAD(igmp_inm_relhead, in_multi);
 
 static void     igi_initvar(struct igmp_ifinfo *, struct ifnet *, int);
@@ -168,9 +172,13 @@ static int      sysctl_igmp_ifinfo SYSCTL_HANDLER_ARGS;
 static int      sysctl_igmp_gsr SYSCTL_HANDLER_ARGS;
 static int      sysctl_igmp_default_version SYSCTL_HANDLER_ARGS;
 
-static int igmp_timeout_run;            /* IGMP timer is scheduled to run */
-static void igmp_timeout(void *);
+static const uint32_t igmp_timeout_delay = 1000; /* in milliseconds */
+static const uint32_t igmp_timeout_leeway = 500; /* in millseconds  */
+static bool igmp_timeout_run;            /* IGMP timer is scheduled to run */
+static bool igmp_fast_timeout_run;       /* IGMP fast timer is scheduled to run */
+static void igmp_timeout(thread_call_param_t, thread_call_param_t);
 static void igmp_sched_timeout(void);
+static void igmp_sched_fast_timeout(void);
 
 static struct mbuf *m_raopt;            /* Router Alert option */
 
@@ -252,9 +260,8 @@ SYSCTL_NODE(_net_inet_igmp, OID_AUTO, ifinfo, CTLFLAG_RD | CTLFLAG_LOCKED,
     sysctl_igmp_ifinfo, "Per-interface IGMPv3 state");
 
 /* Lock group and attribute for igmp_mtx */
-static lck_attr_t       *igmp_mtx_attr;
-static lck_grp_t        *igmp_mtx_grp;
-static lck_grp_attr_t   *igmp_mtx_grp_attr;
+static LCK_ATTR_DECLARE(igmp_mtx_attr, 0, 0);
+static LCK_GRP_DECLARE(igmp_mtx_grp, "igmp_mtx");
 
 /*
  * Locking and reference counting:
@@ -286,7 +293,7 @@ static lck_grp_attr_t   *igmp_mtx_grp_attr;
  * Any may be taken independently, but if any are held at the same time,
  * the above lock order must be followed.
  */
-static decl_lck_mtx_data(, igmp_mtx);
+static LCK_MTX_DECLARE_ATTR(igmp_mtx, &igmp_mtx_grp, &igmp_mtx_attr);
 static int igmp_timers_are_running;
 
 #define IGMP_ADD_DETACHED_INM(_head, _inm) {                            \
@@ -302,8 +309,7 @@ static int igmp_timers_are_running;
 	VERIFY(SLIST_EMPTY(_head));                                     \
 }
 
-static ZONE_DECLARE(igi_zone, "igmp_ifinfo",
-    sizeof(struct igmp_ifinfo), ZC_ZFREE_CLEARMEM);
+static KALLOC_TYPE_DEFINE(igi_zone, struct igmp_ifinfo, NET_KT_DEFAULT);
 
 /* Store IGMPv3 record count in the module private scratch space */
 #define vt_nrecs        pkt_mpriv.__mpriv_u.__mpriv32[0].__mpriv32_u.__val16[0]
@@ -500,6 +506,16 @@ igmp_dispatch_queue(struct igmp_ifinfo *igi, struct ifqueue *ifq, int limit,
 		IGI_LOCK_ASSERT_HELD(igi);
 	}
 
+#if SKYWALK
+	/*
+	 * Since this function is called holding the igi lock, we need to ensure we
+	 * don't enter the driver directly because a deadlock can happen if another
+	 * thread holding the workloop lock tries to acquire the igi lock at
+	 * the same time.
+	 */
+	sk_protect_t protect = sk_async_transmit_protect();
+#endif /* SKYWALK */
+
 	for (;;) {
 		IF_DEQUEUE(ifq, m);
 		if (m == NULL) {
@@ -523,6 +539,10 @@ igmp_dispatch_queue(struct igmp_ifinfo *igi, struct ifqueue *ifq, int limit,
 			break;
 		}
 	}
+
+#if SKYWALK
+	sk_async_transmit_unprotect(protect);
+#endif /* SKYWALK */
 
 	if (igi != NULL) {
 		IGI_LOCK_ASSERT_HELD(igi);
@@ -697,7 +717,7 @@ igi_delete(const struct ifnet *ifp, struct igmp_inm_relhead *inm_dthead)
 		}
 		IGI_UNLOCK(igi);
 	}
-	panic("%s: igmp_ifinfo not found for ifp %p(%s)\n", __func__,
+	panic("%s: igmp_ifinfo not found for ifp %p(%s)", __func__,
 	    ifp, ifp->if_xname);
 }
 
@@ -745,7 +765,7 @@ igi_alloc(zalloc_flags_t how)
 {
 	struct igmp_ifinfo *igi = zalloc_flags(igi_zone, how | Z_ZERO);
 	if (igi != NULL) {
-		lck_mtx_init(&igi->igi_lock, igmp_mtx_grp, igmp_mtx_attr);
+		lck_mtx_init(&igi->igi_lock, &igmp_mtx_grp, &igmp_mtx_attr);
 		igi->igi_debug |= IFD_ALLOC;
 	}
 	return igi;
@@ -771,7 +791,7 @@ igi_free(struct igmp_ifinfo *igi)
 	igi->igi_debug &= ~IFD_ALLOC;
 	IGI_UNLOCK(igi);
 
-	lck_mtx_destroy(&igi->igi_lock, igmp_mtx_grp);
+	lck_mtx_destroy(&igi->igi_lock, &igmp_mtx_grp);
 	zfree(igi_zone, igi);
 }
 
@@ -1882,18 +1902,29 @@ igmp_set_timeout(struct igmp_tparams *itp)
 		if (itp->sct != 0) {
 			state_change_timers_running = 1;
 		}
-		igmp_sched_timeout();
+		if (itp->fast) {
+			igmp_sched_fast_timeout();
+		} else {
+			igmp_sched_timeout();
+		}
 		IGMP_UNLOCK();
 	}
+}
+
+void
+igmp_set_fast_timeout(struct igmp_tparams *itp)
+{
+	VERIFY(itp != NULL);
+	itp->fast = true;
+	igmp_set_timeout(itp);
 }
 
 /*
  * IGMP timer handler (per 1 second).
  */
 static void
-igmp_timeout(void *arg)
+igmp_timeout(thread_call_param_t arg0, thread_call_param_t arg1 __unused)
 {
-#pragma unused(arg)
 	struct ifqueue           scq;   /* State-change packets */
 	struct ifqueue           qrq;   /* Query response packets */
 	struct ifnet            *ifp;
@@ -1901,6 +1932,7 @@ igmp_timeout(void *arg)
 	struct in_multi         *inm;
 	unsigned int             loop = 0, uri_sec = 0;
 	SLIST_HEAD(, in_multi)  inm_dthead;
+	bool                     fast = arg0 != NULL;
 
 	SLIST_INIT(&inm_dthead);
 
@@ -1913,10 +1945,19 @@ igmp_timeout(void *arg)
 
 	IGMP_LOCK();
 
-	IGMP_PRINTF(("%s: qpt %d, it %d, cst %d, sct %d\n", __func__,
+	IGMP_PRINTF(("%s: qpt %d, it %d, cst %d, sct %d, fast %d\n", __func__,
 	    querier_present_timers_running, interface_timers_running,
-	    current_state_timers_running, state_change_timers_running));
+	    current_state_timers_running, state_change_timers_running,
+	    fast));
 
+	if (fast) {
+		/*
+		 * When running the fast timer, skip processing
+		 * of "querier present" timers since they are
+		 * based on 1-second intervals.
+		 */
+		goto skip_query_timers;
+	}
 	/*
 	 * IGMPv1/v2 querier present timer processing.
 	 */
@@ -1957,6 +1998,7 @@ igmp_timeout(void *arg)
 		}
 	}
 
+skip_query_timers:
 	if (!current_state_timers_running &&
 	    !state_change_timers_running) {
 		goto out_locked;
@@ -2046,7 +2088,11 @@ next:
 
 out_locked:
 	/* re-arm the timer if there's work to do */
-	igmp_timeout_run = 0;
+	if (fast) {
+		igmp_fast_timeout_run = false;
+	} else {
+		igmp_timeout_run = false;
+	}
 	igmp_sched_timeout();
 	IGMP_UNLOCK();
 
@@ -2057,13 +2103,48 @@ out_locked:
 static void
 igmp_sched_timeout(void)
 {
-	IGMP_LOCK_ASSERT_HELD();
+	static thread_call_t igmp_timeout_tcall;
+	uint64_t deadline = 0, leeway = 0;
 
+	IGMP_LOCK_ASSERT_HELD();
+	if (igmp_timeout_tcall == NULL) {
+		igmp_timeout_tcall =
+		    thread_call_allocate_with_options(igmp_timeout,
+		    NULL,
+		    THREAD_CALL_PRIORITY_KERNEL,
+		    THREAD_CALL_OPTIONS_ONCE);
+	}
 	if (!igmp_timeout_run &&
 	    (querier_present_timers_running || current_state_timers_running ||
 	    interface_timers_running || state_change_timers_running)) {
-		igmp_timeout_run = 1;
-		timeout(igmp_timeout, NULL, hz);
+		igmp_timeout_run = true;
+		clock_interval_to_deadline(igmp_timeout_delay, NSEC_PER_MSEC,
+		    &deadline);
+		clock_interval_to_absolutetime_interval(igmp_timeout_leeway,
+		    NSEC_PER_MSEC, &leeway);
+		thread_call_enter_delayed_with_leeway(igmp_timeout_tcall, NULL,
+		    deadline, leeway,
+		    THREAD_CALL_DELAY_LEEWAY);
+	}
+}
+
+static void
+igmp_sched_fast_timeout(void)
+{
+	static thread_call_t igmp_fast_timeout_tcall;
+
+	IGMP_LOCK_ASSERT_HELD();
+	if (igmp_fast_timeout_tcall == NULL) {
+		igmp_fast_timeout_tcall =
+		    thread_call_allocate_with_options(igmp_timeout,
+		    igmp_sched_fast_timeout,
+		    THREAD_CALL_PRIORITY_KERNEL,
+		    THREAD_CALL_OPTIONS_ONCE);
+	}
+	if (!igmp_fast_timeout_run &&
+	    (current_state_timers_running || state_change_timers_running)) {
+		igmp_fast_timeout_run = true;
+		thread_call_enter(igmp_fast_timeout_tcall);
 	}
 }
 
@@ -2361,13 +2442,13 @@ igmp_set_version(struct igmp_ifinfo *igi, const int igmp_version)
 
 	if (igi->igi_v1_timer == 0 && igi->igi_v2_timer > 0) {
 		if (igi->igi_version != IGMP_VERSION_2) {
-			igi->igi_version = IGMP_VERSION_2;
 			igmp_v3_cancel_link_timers(igi);
+			igi->igi_version = IGMP_VERSION_2;
 		}
 	} else if (igi->igi_v1_timer > 0) {
 		if (igi->igi_version != IGMP_VERSION_1) {
-			igi->igi_version = IGMP_VERSION_1;
 			igmp_v3_cancel_link_timers(igi);
+			igi->igi_version = IGMP_VERSION_1;
 		}
 	}
 
@@ -2415,7 +2496,7 @@ igmp_v3_cancel_link_timers(struct igmp_ifinfo *igi)
 	IN_FIRST_MULTI(step, inm);
 	while (inm != NULL) {
 		INM_LOCK(inm);
-		if (inm->inm_ifp != ifp) {
+		if (inm->inm_ifp != ifp && inm->inm_igi != igi) {
 			goto next;
 		}
 
@@ -2522,9 +2603,9 @@ igmp_v1v2_process_querier_timers(struct igmp_ifinfo *igi)
 				    igi->igi_version, IGMP_VERSION_2,
 				    (uint64_t)VM_KERNEL_ADDRPERM(igi->igi_ifp),
 				    if_name(igi->igi_ifp)));
-				igi->igi_version = IGMP_VERSION_2;
 				IF_DRAIN(&igi->igi_gq);
 				igmp_v3_cancel_link_timers(igi);
+				igi->igi_version = IGMP_VERSION_2;
 			}
 		}
 	} else if (igi->igi_v1_timer > 0) {
@@ -2933,6 +3014,7 @@ igmp_final_leave(struct in_multi *inm, struct igmp_ifinfo *igi,
     struct igmp_tparams *itp)
 {
 	int syncstates = 1;
+	bool retried_already = false;
 
 	INM_LOCK_ASSERT_HELD(inm);
 	IGI_LOCK_ASSERT_NOTHELD(igi);
@@ -2943,6 +3025,7 @@ igmp_final_leave(struct in_multi *inm, struct igmp_ifinfo *igi,
 	    _igmp_inet_buf, (uint64_t)VM_KERNEL_ADDRPERM(inm->inm_ifp),
 	    if_name(inm->inm_ifp)));
 
+retry:
 	switch (inm->inm_state) {
 	case IGMP_NOT_MEMBER:
 	case IGMP_SILENT_MEMBER:
@@ -2959,9 +3042,22 @@ igmp_final_leave(struct in_multi *inm, struct igmp_ifinfo *igi,
 		if (igi->igi_version == IGMP_VERSION_2) {
 			if (inm->inm_state == IGMP_G_QUERY_PENDING_MEMBER ||
 			    inm->inm_state == IGMP_SG_QUERY_PENDING_MEMBER) {
-				panic("%s: IGMPv3 state reached, not IGMPv3 "
-				    "mode\n", __func__);
-				/* NOTREACHED */
+				/*
+				 * We may be in the process of downgrading to
+				 * IGMPv2 but because we just grabbed the
+				 * igi_lock we may have lost the race.
+				 */
+				if (!retried_already) {
+					IGI_UNLOCK(igi);
+					retried_already = true;
+					goto retry;
+				} else {
+					/*
+					 * Proceed with leaving the group
+					 * as if it were IGMPv2 even though we
+					 * may have an inconsistent multicast state.
+					 */
+				}
 			}
 			/* scheduler timer if enqueue is successful */
 			itp->cst = (igmp_v1v2_queue_report(inm,
@@ -4094,12 +4190,6 @@ igmp_init(struct protosw *pp, struct domain *dp)
 	IGMP_PRINTF(("%s: initializing\n", __func__));
 
 	igmp_timers_are_running = 0;
-
-	/* Setup lock group and attribute for igmp_mtx */
-	igmp_mtx_grp_attr = lck_grp_attr_alloc_init();
-	igmp_mtx_grp = lck_grp_alloc_init("igmp_mtx", igmp_mtx_grp_attr);
-	igmp_mtx_attr = lck_attr_alloc_init();
-	lck_mtx_init(&igmp_mtx, igmp_mtx_grp, igmp_mtx_attr);
 
 	LIST_INIT(&igi_head);
 	m_raopt = igmp_ra_alloc();
