@@ -101,6 +101,9 @@
 #include <kern/task.h>
 #include <kern/clock.h>         /* for absolutetime_to_microtime() */
 #include <netinet/in.h>         /* for TRAFFIC_MGT_SO_* */
+#if CONFIG_FREEZE
+#include <sys/kern_memorystatus_freeze.h> /* for memorystatus_freeze_mark_ui_transition */
+#endif /* CONFIG_FREEZE */
 #include <sys/socketvar.h>      /* for struct socket */
 #if NECP
 #include <net/necp.h>
@@ -117,9 +120,13 @@
 #include <security/mac_framework.h>
 #endif
 
-int     donice(struct proc *curp, struct proc *chgp, int n);
-int     dosetrlimit(struct proc *p, u_int which, struct rlimit *limp);
-int     uthread_get_background_state(uthread_t);
+static void proc_limitblock(proc_t p);
+static void proc_limitunblock(proc_t p);
+static void proc_limitupdate(proc_t p, bool unblock,
+    void (^update)(struct plimit *plim));
+
+static int donice(struct proc *curp, struct proc *chgp, int n);
+static int dosetrlimit(struct proc *p, u_int which, struct rlimit *limp);
 static void do_background_socket(struct proc *p, thread_t thread);
 static int do_background_thread(thread_t thread, int priority);
 static int do_background_proc(struct proc *curp, struct proc *targetp, int priority);
@@ -127,16 +134,12 @@ static int set_gpudeny_proc(struct proc *curp, struct proc *targetp, int priorit
 static int proc_set_darwin_role(proc_t curp, proc_t targetp, int priority);
 static int proc_get_darwin_role(proc_t curp, proc_t targetp, int *priority);
 static int get_background_proc(struct proc *curp, struct proc *targetp, int *priority);
-int proc_pid_rusage(int pid, int flavor, user_addr_t buf, int32_t *retval);
-void gather_rusage_info(proc_t p, rusage_info_current *ru, int flavor);
+
 int fill_task_rusage(task_t task, rusage_info_current *ri);
 void fill_task_billed_usage(task_t task, rusage_info_current *ri);
 int fill_task_io_rusage(task_t task, rusage_info_current *ri);
 int fill_task_qos_rusage(task_t task, rusage_info_current *ri);
-uint64_t get_task_logical_writes(task_t task, boolean_t external);
-void fill_task_monotonic_rusage(task_t task, rusage_info_current *ri);
-
-int proc_get_rusage(proc_t p, int flavor, user_addr_t buffer, __unused int is_zombie);
+uint64_t get_task_logical_writes(task_t task, bool external);
 
 rlim_t maxdmap = MAXDSIZ;       /* XXX */
 rlim_t maxsmap = MAXSSIZ - PAGE_MAX_SIZE;       /* XXX */
@@ -144,7 +147,7 @@ rlim_t maxsmap = MAXSSIZ - PAGE_MAX_SIZE;       /* XXX */
 /* For plimit reference count */
 os_refgrp_decl(, rlimit_refgrp, "plimit_refcnt", NULL);
 
-ZONE_DECLARE(plimit_zone, "plimit", sizeof(struct plimit), ZC_NOENCRYPT);
+static KALLOC_TYPE_DEFINE(plimit_zone, struct plimit, KT_DEFAULT);
 
 /*
  * Limits on the number of open files per process, and the number
@@ -217,8 +220,8 @@ getpriority(struct proc *curp, struct getpriority_args *uap, int32_t *retval)
 
 		if (uap->who == 0) {
 			/* returns the pgrp to ref */
-			pg = proc_pgrp(curp);
-		} else if ((pg = pgfind(uap->who)) == PGRP_NULL) {
+			pg = proc_pgrp(curp, NULL);
+		} else if ((pg = pgrp_find(uap->who)) == PGRP_NULL) {
 			break;
 		}
 		/* No need for iteration as it is a simple scan */
@@ -229,7 +232,7 @@ getpriority(struct proc *curp, struct getpriority_args *uap, int32_t *retval)
 			}
 		}
 		pgrp_unlock(pg);
-		pg_rele(pg);
+		pgrp_rele(pg);
 		break;
 	}
 
@@ -406,8 +409,8 @@ setpriority(struct proc *curp, struct setpriority_args *uap, int32_t *retval)
 		struct ppgrp_nice_args ppgrp;
 
 		if (uap->who == 0) {
-			pg = proc_pgrp(curp);
-		} else if ((pg = pgfind(uap->who)) == PGRP_NULL) {
+			pg = proc_pgrp(curp, NULL);
+		} else if ((pg = pgrp_find(uap->who)) == PGRP_NULL) {
 			break;
 		}
 
@@ -416,8 +419,8 @@ setpriority(struct proc *curp, struct setpriority_args *uap, int32_t *retval)
 		ppgrp.foundp = &found;
 		ppgrp.errorp = &error;
 
-		/* PGRP_DROPREF drops the reference on process group */
-		pgrp_iterate(pg, PGRP_DROPREF, ppgrp_donice_callback, (void *)&ppgrp, NULL, NULL);
+		pgrp_iterate(pg, ppgrp_donice_callback, (void *)&ppgrp, NULL);
+		pgrp_rele(pg);
 
 		break;
 	}
@@ -528,7 +531,7 @@ setpriority(struct proc *curp, struct setpriority_args *uap, int32_t *retval)
  *		EACCES
  *	mac_check_proc_sched:???
  */
-int
+static int
 donice(struct proc *curp, struct proc *chgp, int n)
 {
 	int error = 0;
@@ -661,6 +664,12 @@ proc_set_darwin_role(proc_t curp, proc_t targetp, int priority)
 	proc_set_task_policy(proc_task(targetp), TASK_POLICY_ATTRIBUTE,
 	    TASK_POLICY_ROLE, role);
 
+#if CONFIG_FREEZE
+	if (priority == PRIO_DARWIN_ROLE_UI_FOCAL || priority == PRIO_DARWIN_ROLE_UI || priority == PRIO_DARWIN_ROLE_UI_NON_FOCAL) {
+		memorystatus_freezer_mark_ui_transition(targetp);
+	}
+#endif /* CONFIG_FREEZE */
+
 out:
 	kauth_cred_unref(&target_cred);
 	return error;
@@ -789,6 +798,11 @@ do_background_socket(struct proc *p, thread_t thread)
 	int              update_necp = false;
 #endif /* NECP */
 
+	if (thread != THREAD_NULL &&
+	    get_threadtask(thread) != proc_task(p)) {
+		return;
+	}
+
 	proc_fdlock(p);
 
 	if (thread != THREAD_NULL) {
@@ -806,7 +820,7 @@ do_background_socket(struct proc *p, thread_t thread)
 		if (thread == THREAD_NULL) {
 			fdt_foreach(fp, p) {
 				if (FILEGLOB_DTYPE(fp->fp_glob) == DTYPE_SOCKET) {
-					struct socket *sockp = (struct socket *)fp->fp_glob->fg_data;
+					struct socket *sockp = (struct socket *)fp_get_data(fp);
 					socket_set_traffic_mgt_flags(sockp, TRAFFIC_MGT_SO_BACKGROUND);
 					sockp->so_background_thread = NULL;
 				}
@@ -829,7 +843,7 @@ do_background_socket(struct proc *p, thread_t thread)
 			struct socket *sockp;
 
 			if (FILEGLOB_DTYPE(fp->fp_glob) == DTYPE_SOCKET) {
-				sockp = (struct socket *)fp->fp_glob->fg_data;
+				sockp = (struct socket *)fp_get_data(fp);
 				/* skip if only clearing this thread's sockets */
 				if ((thread) && (sockp->so_background_thread != thread)) {
 					continue;
@@ -872,16 +886,8 @@ do_background_socket(struct proc *p, thread_t thread)
 static int
 do_background_thread(thread_t thread, int priority)
 {
-	struct uthread *ut;
 	int enable, external;
 	int rv = 0;
-
-	ut = get_bsdthread_info(thread);
-
-	/* Backgrounding is unsupported for threads in vfork */
-	if ((ut->uu_flag & UT_VFORK) != 0) {
-		return EPERM;
-	}
 
 	/* Backgrounding is unsupported for workq threads */
 	if (thread_is_static_param(thread)) {
@@ -933,13 +939,12 @@ setrlimit(struct proc *p, struct setrlimit_args *uap, __unused int32_t *retval)
  *		case that the current usage (e.g. RLIMIT_STACK) is already
  *		in excess of the requested limit.
  */
-int
+static int
 dosetrlimit(struct proc *p, u_int which, struct rlimit *newrlim)
 {
-	struct rlimit        rlim;
+	struct rlimit        rlim, stack_rlim = {.rlim_cur = 0, .rlim_max = 0};
 	int                  error;
 	kern_return_t        kr;
-	int                  posix = (which & _RLIMIT_POSIX_FLAG) ? 1 : 0;
 
 	/* Mask out POSIX flag, saved above */
 	which &= ~_RLIMIT_POSIX_FLAG;
@@ -949,14 +954,19 @@ dosetrlimit(struct proc *p, u_int which, struct rlimit *newrlim)
 		return EINVAL;
 	}
 
+	proc_lock(p);
+
+	/* Only one thread is able to change the current process's rlimit values */
+	proc_limitblock(p);
+
 	/*
 	 * Take a snapshot of the current rlimit values and read this throughout
 	 * this routine. This minimizes the critical sections and allow other
 	 * processes in the system to access the plimit while we are in the
 	 * middle of this setrlimit call.
 	 */
-	proc_lock(p);
-	rlim = p->p_limit->pl_rlimit[which];
+	rlim = smr_serialized_load(&p->p_limit)->pl_rlimit[which];
+
 	proc_unlock(p);
 
 	error = 0;
@@ -966,7 +976,8 @@ dosetrlimit(struct proc *p, u_int which, struct rlimit *newrlim)
 	}
 	/*
 	 * Sanity check: only super-user may raise the hard limit.
-	 * newrlim->rlim_cur > rlim.rlim_max implies that the call is increasing the hard limit as well.
+	 * newrlim->rlim_cur > rlim.rlim_max implies that the call
+	 * is increasing the hard limit as well.
 	 */
 	else if (newrlim->rlim_cur > rlim.rlim_max || newrlim->rlim_max > rlim.rlim_max) {
 		/* suser() returns 0 if the calling thread is super user. */
@@ -975,19 +986,14 @@ dosetrlimit(struct proc *p, u_int which, struct rlimit *newrlim)
 
 	if (error) {
 		/* Invalid setrlimit request: EINVAL or EPERM */
-		return error;
+		goto out;
 	}
-
-	/* Only one thread is able to change the current process's rlimit values */
-	proc_lock(p);
-	proc_limitblock(p);
-	proc_unlock(p);
 
 	/* We have the reader lock of the process's plimit so it's safe to read the rlimit values */
 	switch (which) {
 	case RLIMIT_CPU:
 		if (newrlim->rlim_cur == RLIM_INFINITY) {
-			task_vtimer_clear(p->task, TASK_VTIMER_RLIM);
+			task_vtimer_clear(proc_task(p), TASK_VTIMER_RLIM);
 			timerclear(&p->p_rlim_cpu);
 		} else {
 			task_absolutetime_info_data_t   tinfo;
@@ -997,7 +1003,7 @@ dosetrlimit(struct proc *p, u_int which, struct rlimit *newrlim)
 			clock_usec_t                    tv_usec;
 
 			count = TASK_ABSOLUTETIME_INFO_COUNT;
-			task_info(p->task, TASK_ABSOLUTETIME_INFO, (task_info_t)&tinfo, &count);
+			task_info(proc_task(p), TASK_ABSOLUTETIME_INFO, (task_info_t)&tinfo, &count);
 			absolutetime_to_microtime(tinfo.total_user + tinfo.total_system, &tv_sec, &tv_usec);
 			ttv.tv_sec = tv_sec;
 			ttv.tv_usec = tv_usec;
@@ -1008,9 +1014,9 @@ dosetrlimit(struct proc *p, u_int which, struct rlimit *newrlim)
 
 			timerclear(&tv);
 			if (timercmp(&p->p_rlim_cpu, &tv, >)) {
-				task_vtimer_set(p->task, TASK_VTIMER_RLIM);
+				task_vtimer_set(proc_task(p), TASK_VTIMER_RLIM);
 			} else {
-				task_vtimer_clear(p->task, TASK_VTIMER_RLIM);
+				task_vtimer_clear(proc_task(p), TASK_VTIMER_RLIM);
 
 				timerclear(&p->p_rlim_cpu);
 
@@ -1020,11 +1026,20 @@ dosetrlimit(struct proc *p, u_int which, struct rlimit *newrlim)
 		break;
 
 	case RLIMIT_DATA:
+#if 00
 		if (newrlim->rlim_cur > maxdmap) {
 			newrlim->rlim_cur = maxdmap;
 		}
 		if (newrlim->rlim_max > maxdmap) {
 			newrlim->rlim_max = maxdmap;
+		}
+#endif
+
+		/* Over to Mach VM to validate the new data limit */
+		if (vm_map_set_data_limit(current_map(), newrlim->rlim_cur) != KERN_SUCCESS) {
+			/* The limit specified cannot be lowered because current usage is already higher than the limit. */
+			error =  EINVAL;
+			goto out;
 		}
 		break;
 
@@ -1035,24 +1050,25 @@ dosetrlimit(struct proc *p, u_int which, struct rlimit *newrlim)
 			goto out;
 		}
 
-		/* Disallow illegal stack size instead of clipping */
+		/*
+		 * Note: the real stack size limit is enforced by maxsmap, not a process's RLIMIT_STACK.
+		 *
+		 * The kernel uses maxsmap to control the actual stack size limit. While we allow
+		 * processes to set RLIMIT_STACK to RLIM_INFINITY (UNIX 03), accessing memory
+		 * beyond the maxsmap will still trigger an exception.
+		 *
+		 * stack_rlim is used to store the user-defined RLIMIT_STACK values while we adjust
+		 * the stack size using kernel limit (i.e. maxsmap).
+		 */
 		if (newrlim->rlim_cur > maxsmap ||
 		    newrlim->rlim_max > maxsmap) {
-			if (posix) {
-				error = EINVAL;
-				goto out;
-			} else {
-				/*
-				 * 4797860 - workaround poorly written installers by
-				 * doing previous implementation (< 10.5) when caller
-				 * is non-POSIX conforming.
-				 */
-				if (newrlim->rlim_cur > maxsmap) {
-					newrlim->rlim_cur = maxsmap;
-				}
-				if (newrlim->rlim_max > maxsmap) {
-					newrlim->rlim_max = maxsmap;
-				}
+			if (newrlim->rlim_cur > maxsmap) {
+				stack_rlim.rlim_cur = newrlim->rlim_cur;
+				newrlim->rlim_cur = maxsmap;
+			}
+			if (newrlim->rlim_max > maxsmap) {
+				stack_rlim.rlim_max = newrlim->rlim_max;
+				newrlim->rlim_max = maxsmap;
 			}
 		}
 
@@ -1066,13 +1082,17 @@ dosetrlimit(struct proc *p, u_int which, struct rlimit *newrlim)
 			mach_vm_size_t size;
 
 			/* grow stack */
-			size = round_page_64(newrlim->rlim_cur);
+			size = newrlim->rlim_cur;
+			if (round_page_overflow(size, &size)) {
+				error = EINVAL;
+				goto out;
+			}
 			size -= round_page_64(rlim.rlim_cur);
 
 			addr = (mach_vm_offset_t)(p->user_stack - round_page_64(newrlim->rlim_cur));
 			kr = mach_vm_protect(current_map(), addr, size, FALSE, VM_PROT_DEFAULT);
 			if (kr != KERN_SUCCESS) {
-				error =  EINVAL;
+				error = EINVAL;
 				goto out;
 			}
 		} else if (newrlim->rlim_cur < rlim.rlim_cur) {
@@ -1118,6 +1138,17 @@ dosetrlimit(struct proc *p, u_int which, struct rlimit *newrlim)
 		} else {
 			/* no change ... */
 		}
+
+		/*
+		 * We've adjusted the process's stack region. If the user-defined limit is greater
+		 * than maxsmap, we need to reflect this change in rlimit interface.
+		 */
+		if (stack_rlim.rlim_cur != 0) {
+			newrlim->rlim_cur = stack_rlim.rlim_cur;
+		}
+		if (stack_rlim.rlim_max != 0) {
+			newrlim->rlim_max = stack_rlim.rlim_max;
+		}
 		break;
 
 	case RLIMIT_NOFILE:
@@ -1125,6 +1156,15 @@ dosetrlimit(struct proc *p, u_int which, struct rlimit *newrlim)
 		 * Nothing to be done here as we already performed the sanity checks before entering the switch code block.
 		 * The real NOFILE limits enforced by the kernel is capped at MIN(RLIMIT_NOFILE, maxfilesperproc)
 		 */
+		break;
+
+	case RLIMIT_AS:
+		/* Over to Mach VM to validate the new address space limit */
+		if (vm_map_set_size_limit(current_map(), newrlim->rlim_cur) != KERN_SUCCESS) {
+			/* The limit specified cannot be lowered because current usage is already higher than the limit. */
+			error =  EINVAL;
+			goto out;
+		}
 		break;
 
 	case RLIMIT_NPROC:
@@ -1169,10 +1209,9 @@ out:
 		 * COW the current plimit if it's shared, otherwise update it in place.
 		 * Finally unblock other threads wishing to change plimit.
 		 */
-		proc_lock(p);
-		proc_limitupdate(p, newrlim, (uint8_t)which);
-		proc_limitunblock(p);
-		proc_unlock(p);
+		proc_limitupdate(p, true, ^(struct plimit *plim) {
+			plim->pl_rlimit[which] = *newrlim;
+		});
 	} else {
 		/*
 		 * This setrlimit has failed, just leave the plimit as is and unblock other
@@ -1201,7 +1240,7 @@ getrlimit(struct proc *p, struct getrlimit_args *uap, __unused int32_t *retval)
 	if (uap->which >= RLIM_NLIMITS) {
 		return EINVAL;
 	}
-	proc_limitget(p, uap->which, &lim);
+	lim = proc_limitget(p, uap->which);
 	return copyout((caddr_t)&lim,
 	           uap->rlp, sizeof(struct rlimit));
 }
@@ -1222,7 +1261,7 @@ calcru(struct proc *p, struct timeval *up, struct timeval *sp, struct timeval *i
 		timerclear(ip);
 	}
 
-	task = p->task;
+	task = proc_task(p);
 	if (task) {
 		mach_task_basic_info_data_t tinfo;
 		task_thread_times_info_data_t ttimesinfo;
@@ -1367,122 +1406,100 @@ update_rusage_info_child(struct rusage_info_child *ri, rusage_info_current *ri_c
 	    ri_current->ri_proc_start_abstime) + ri_current->ri_child_elapsed_abstime);
 }
 
+static void
+proc_limit_free(void *plimit)
+{
+	zfree(plimit_zone, plimit);
+}
+
+static void
+proc_limit_release(struct plimit *plimit)
+{
+	if (os_ref_release(&plimit->pl_refcnt) == 0) {
+		smr_global_retire(plimit, sizeof(*plimit), proc_limit_free);
+	}
+}
+
 /*
  * Reading soft limit from specified resource.
  */
 rlim_t
-proc_limitgetcur(proc_t p, int which, boolean_t to_lock_proc)
+proc_limitgetcur(proc_t p, int which)
 {
 	rlim_t rlim_cur;
 
 	assert(p);
 	assert(which < RLIM_NLIMITS);
 
-	/*
-	 * Serialize access to the process's plimit pointer for concurrent threads.
-	 */
-	if (to_lock_proc) {
-		lck_mtx_assert(&p->p_mlock, LCK_MTX_ASSERT_NOTOWNED);
-		proc_lock(p);
-	}
-
-	rlim_cur = p->p_limit->pl_rlimit[which].rlim_cur;
-
-	if (to_lock_proc) {
-		proc_unlock(p);
-	}
+	smr_global_enter();
+	rlim_cur = smr_entered_load(&p->p_limit)->pl_rlimit[which].rlim_cur;
+	smr_global_leave();
 
 	return rlim_cur;
 }
 
 /*
+ * Handle commonly asked limit that needs to be clamped with maxfilesperproc.
+ */
+int
+proc_limitgetcur_nofile(struct proc *p)
+{
+	rlim_t lim = proc_limitgetcur(p, RLIMIT_NOFILE);
+
+	return (int)MIN(lim, maxfilesperproc);
+}
+
+/*
  * Writing soft limit to specified resource. This is an internal function
- * used only by proc_exit and vfork_exit_internal to update RLIMIT_FSIZE in
+ * used only by proc_exit to update RLIMIT_FSIZE in
  * place without invoking setrlimit.
  */
 void
-proc_limitsetcur_internal(proc_t p, int which, rlim_t value)
+proc_limitsetcur_fsize(proc_t p, rlim_t value)
 {
-	struct rlimit rlim;
-
-	assert(p);
-	assertf(which == RLIMIT_FSIZE, "%s only supports RLIMIT_FSIZE\n", __FUNCTION__);
-
-
-	proc_lock(p);
-
-	/* Only one thread is able to change rlimit values at a time */
-	proc_limitblock(p);
-
-	/* Prepare an rlimit for proc_limitupdate */
-	rlim = p->p_limit->pl_rlimit[which];
-	rlim.rlim_cur = value;
-
-	/*
-	 * proc_limitupdate will COW the current plimit and update specified the soft limit
-	 * if the plimit is shared, otherwise it will update the soft limit in place.
-	 */
-	proc_limitupdate(p, &rlim, (uint8_t)which);
-
-	/* Unblock other threads wishing to change plimit */
-	proc_limitunblock(p);
-
-	proc_unlock(p);
+	proc_limitupdate(p, false, ^(struct plimit *plimit) {
+		plimit->pl_rlimit[RLIMIT_FSIZE].rlim_cur = value;
+	});
 }
 
-void
-proc_limitget(proc_t p, int which, struct rlimit * limp)
+struct rlimit
+proc_limitget(proc_t p, int which)
 {
-	assert(p);
-	assert(limp);
+	struct rlimit lim;
+
 	assert(which < RLIM_NLIMITS);
 
-	/* Protect writes to the process's plimit pointer issued by concurrent threads */
-	proc_lock(p);
+	smr_global_enter();
+	lim = smr_entered_load(&p->p_limit)->pl_rlimit[which];
+	smr_global_leave();
 
-	limp->rlim_cur = p->p_limit->pl_rlimit[which].rlim_cur;
-	limp->rlim_max = p->p_limit->pl_rlimit[which].rlim_max;
-
-	proc_unlock(p);
+	return lim;
 }
 
 void
 proc_limitfork(proc_t parent, proc_t child)
 {
-	assert(parent && child);
+	struct plimit *plim;
 
-	proc_lock(parent);
+	smr_global_enter();
+	plim = smr_entered_load(&parent->p_limit);
+	os_ref_retain(&plim->pl_refcnt);
+	smr_global_leave();
 
-	/* Child proc inherits parent's plimit */
-	child->p_limit = parent->p_limit;
-
-	/* Increment refcnt of the shared plimit */
-	os_ref_retain(&parent->p_limit->pl_refcnt);
-
-	proc_unlock(parent);
+	smr_init_store(&child->p_limit, plim);
 }
 
 void
 proc_limitdrop(proc_t p)
 {
-	struct plimit *free_plim = NULL;
-	os_ref_count_t refcnt;
+	struct plimit *plimit = NULL;
 
 	proc_lock(p);
-
-	/* Drop the plimit reference before exiting the system */
-	refcnt = os_ref_release(&p->p_limit->pl_refcnt);
-	if (refcnt == 0) {
-		free_plim = p->p_limit;
-	}
-
-	p->p_limit = NULL;
+	plimit = smr_serialized_load(&p->p_limit);
+	smr_clear_store(&p->p_limit);
 	proc_unlock(p);
 
-	/* We are the last user of this plimit, free it now. */
-	if (free_plim != NULL) {
-		zfree(plimit_zone, free_plim);
-	}
+	proc_limit_release(plimit);
 }
 
 /*
@@ -1491,7 +1508,7 @@ proc_limitdrop(proc_t p)
  * Callers must be holding the proc lock to enter, return with
  * the proc lock locked
  */
-void
+static void
 proc_limitblock(proc_t p)
 {
 	lck_mtx_assert(&p->p_mlock, LCK_MTX_ASSERT_OWNED);
@@ -1507,7 +1524,7 @@ proc_limitblock(proc_t p)
  * Callers must be holding the proc lock to enter, return with
  * the proc lock locked
  */
-void
+static void
 proc_limitunblock(proc_t p)
 {
 	lck_mtx_assert(&p->p_mlock, LCK_MTX_ASSERT_OWNED);
@@ -1520,84 +1537,38 @@ proc_limitunblock(proc_t p)
 }
 
 /*
- * Change the rlimit values of process "p" to "rlim" for resource "which".
+ * Perform an rlimit update (as defined by the arbitrary `update` function).
  *
- * If the current plimit is shared by multiple processes (refcnt > 1):
- *    this routine replaces the process's original plimit with a new plimit,
- *    update the requeted rlimit values, and free the original plimit if this
- *    process is the last user.
- *
- * If the current plimit is used only by the calling process (refcnt == 1):
- *    this routine updates the new rlimit values in place.
- *
- * Note: caller must be holding the proc lock before entering this routine.
- * This routine allocates and frees kernel memory without holding the proc lock
- * to minimize contention, and returns with the proc lock held.
+ * Because plimits are accessed without holding any locks,
+ * with only a hazard reference, the struct plimit is always
+ * copied, updated, and replaced, to implement a const value type.
  */
-void
-proc_limitupdate(proc_t p, struct rlimit *rlim, uint8_t which)
+static void
+proc_limitupdate(proc_t p, bool unblock, void (^update)(struct plimit *))
 {
+	struct plimit  *cur_plim;
 	struct plimit  *copy_plim;
-	struct plimit  *free_plim;
-	os_ref_count_t refcnt;
 
-	assert(p && p->p_limit);
-	assert(rlim);
-	assert(which < RLIM_NLIMITS);
-	lck_mtx_assert(&p->p_mlock, LCK_MTX_ASSERT_OWNED);
+	copy_plim = zalloc_flags(plimit_zone, Z_WAITOK | Z_ZERO | Z_NOFAIL);
 
-	/*
-	 * If we are the only user of this plimit, don't bother allocating a plimit
-	 * before making changes. Just modify the rlimit values in place.
-	 */
-	refcnt = os_ref_get_count(&p->p_limit->pl_refcnt);
-	if (refcnt == 1) {
-		p->p_limit->pl_rlimit[which] = *rlim;
-		return;
-	}
-
-	/*
-	 * Allocating a new plimit for this process to apply the requested rlimit values.
-	 * Not holding the lock on the original plimit gives other processes in the system
-	 * a chance to access the plimit while we wait for memory below.
-	 *
-	 * The default zalloc should always succeed when WAIT flag.
-	 */
-	proc_unlock(p);
-	copy_plim = zalloc(plimit_zone);
-
-	/* Copy the current p_limit */
 	proc_lock(p);
-	bcopy(p->p_limit->pl_rlimit, copy_plim->pl_rlimit, sizeof(struct rlimit) * RLIM_NLIMITS);
 
-	/*
-	 * Drop our reference to the old plimit. Other processes sharing the old plimit could
-	 * have exited the system when we wait for memory for the new plimit above, thus, we
-	 * need to check the refcnt again and free the old plimit if this process is the last
-	 * user. Also since we are holding the proc lock here, it's impossible for another threads
-	 * to dereference the plimit, so it's safe to free the old plimit memory.
-	 */
-	free_plim = NULL;
-	refcnt = os_ref_release(&p->p_limit->pl_refcnt);
-	if (refcnt == 0) {
-		free_plim = p->p_limit;
-	}
-	/* Initialize the newly allocated plimit */
+	cur_plim = smr_serialized_load(&p->p_limit);
+
 	os_ref_init_count(&copy_plim->pl_refcnt, &rlimit_refgrp, 1);
+	bcopy(cur_plim->pl_rlimit, copy_plim->pl_rlimit,
+	    sizeof(struct rlimit) * RLIM_NLIMITS);
 
-	/* Apply new rlimit values */
-	copy_plim->pl_rlimit[which] = *rlim;
+	update(copy_plim);
 
-	/* All set, update the process's plimit pointer to the new plimit. */
-	p->p_limit = copy_plim;
+	smr_serialized_store(&p->p_limit, copy_plim);
+
+	if (unblock) {
+		proc_limitunblock(p);
+	}
 	proc_unlock(p);
 
-	if (free_plim != NULL) {
-		zfree(plimit_zone, free_plim);
-	}
-
-	/* Return with proc->p_mlock locked */
-	proc_lock(p);
+	proc_limit_release(cur_plim);
 }
 
 static int
@@ -1606,8 +1577,6 @@ static int
 iopolicysys_vfs_hfs_case_sensitivity(struct proc *p, int cmd, int scope, int policy, struct _iopol_param_t *iop_param);
 static int
 iopolicysys_vfs_atime_updates(struct proc *p, int cmd, int scope, int policy, struct _iopol_param_t *iop_param);
-static int
-iopolicysys_vfs_materialize_dataless_files(struct proc *p, int cmd, int scope, int policy, struct _iopol_param_t *iop_param);
 static int
 iopolicysys_vfs_statfs_no_data_volume(struct proc *p, int cmd, int scope, int policy, struct _iopol_param_t *iop_param);
 static int
@@ -1618,6 +1587,11 @@ static int
 iopolicysys_vfs_ignore_node_permissions(struct proc *p, int cmd, int scope, int policy, struct _iopol_param_t *ipo_param);
 static int
 iopolicysys_vfs_skip_mtime_update(struct proc *p, int cmd, int scope, int policy, struct _iopol_param_t *iop_param);
+static int
+iopolicysys_vfs_allow_lowspace_writes(struct proc *p, int cmd, int scope, int policy, struct _iopol_param_t *iop_param);
+static int
+iopolicysys_vfs_disallow_rw_for_o_evtonly(struct proc *p, int cmd, int scope, int policy, struct _iopol_param_t *iop_param);
+static int iopolicysys_vfs_altlink(struct proc *p, int cmd, int scope, int policy, struct _iopol_param_t *iop_param);
 
 /*
  * iopolicysys
@@ -1700,6 +1674,25 @@ iopolicysys(struct proc *p, struct iopolicysys_args *uap, int32_t *retval)
 			goto out;
 		}
 		break;
+	case IOPOL_TYPE_VFS_ALLOW_LOW_SPACE_WRITES:
+		error = iopolicysys_vfs_allow_lowspace_writes(p, uap->cmd, iop_param.iop_scope, iop_param.iop_policy, &iop_param);
+		if (error) {
+			goto out;
+		}
+		break;
+	case IOPOL_TYPE_VFS_DISALLOW_RW_FOR_O_EVTONLY:
+		error = iopolicysys_vfs_disallow_rw_for_o_evtonly(p, uap->cmd, iop_param.iop_scope, iop_param.iop_policy, &iop_param);
+		if (error) {
+			goto out;
+		}
+		break;
+	case IOPOL_TYPE_VFS_ALTLINK:
+		error = iopolicysys_vfs_altlink(p, uap->cmd, iop_param.iop_scope, iop_param.iop_policy, &iop_param);
+		if (error) {
+			goto out;
+		}
+		break;
+
 	default:
 		error = EINVAL;
 		goto out;
@@ -1874,7 +1867,7 @@ iopolicysys_vfs_hfs_case_sensitivity(struct proc *p, int cmd, int scope, int pol
 		if (0 == kauth_cred_issuser(kauth_cred_get())) {
 			/* If it's a non-root process, it needs to have the entitlement to set the policy */
 			boolean_t entitled = FALSE;
-			entitled = IOTaskHasEntitlement(current_task(), "com.apple.private.iopol.case_sensitivity");
+			entitled = IOCurrentTaskHasEntitlement("com.apple.private.iopol.case_sensitivity");
 			if (!entitled) {
 				error = EPERM;
 				goto out;
@@ -2047,7 +2040,7 @@ get_proc_materialize_policy(struct proc *p)
 	return (p->p_vfs_iopolicy & P_VFS_IOPOLICY_MATERIALIZE_DATALESS_FILES) ? IOPOL_MATERIALIZE_DATALESS_FILES_ON : IOPOL_MATERIALIZE_DATALESS_FILES_OFF;
 }
 
-static int
+int
 iopolicysys_vfs_materialize_dataless_files(struct proc *p __unused, int cmd, int scope, int policy, struct _iopol_param_t *iop_param)
 {
 	int                     error = 0;
@@ -2141,7 +2134,7 @@ iopolicysys_vfs_statfs_no_data_volume(struct proc *p __unused, int cmd,
 		if (0 == kauth_cred_issuser(kauth_cred_get())) {
 			/* If it's a non-root process, it needs to have the entitlement to set the policy */
 			boolean_t entitled = FALSE;
-			entitled = IOTaskHasEntitlement(current_task(), "com.apple.private.iopol.case_sensitivity");
+			entitled = IOCurrentTaskHasEntitlement("com.apple.private.iopol.case_sensitivity");
 			if (!entitled) {
 				error = EPERM;
 				goto out;
@@ -2271,7 +2264,7 @@ iopolicysys_vfs_ignore_content_protection(struct proc *p, int cmd, int scope,
 		if (0 == kauth_cred_issuser(kauth_cred_get())) {
 			/* If it's a non-root process, it needs to have the entitlement to set the policy */
 			boolean_t entitled = FALSE;
-			entitled = IOTaskHasEntitlement(current_task(), "com.apple.private.iopol.case_sensitivity");
+			entitled = IOCurrentTaskHasEntitlement("com.apple.private.iopol.case_sensitivity");
 			if (!entitled) {
 				error = EPERM;
 				goto out;
@@ -2333,7 +2326,7 @@ iopolicysys_vfs_ignore_node_permissions(struct proc *p, int cmd, int scope,
 		goto out;
 	}
 
-	if (!IOTaskHasEntitlement(current_task(), AUTHORIZED_ACCESS_ENTITLEMENT)) {
+	if (!IOCurrentTaskHasEntitlement(AUTHORIZED_ACCESS_ENTITLEMENT)) {
 		error = EPERM;
 		goto out;
 	}
@@ -2382,7 +2375,7 @@ iopolicysys_vfs_skip_mtime_update(struct proc *p, int cmd, int scope,
 		break;
 	}
 
-	if (!IOTaskHasEntitlement(current_task(), SKIP_MTIME_UPDATE_ENTITLEMENT)) {
+	if (!IOCurrentTaskHasEntitlement(SKIP_MTIME_UPDATE_ENTITLEMENT)) {
 		error = EPERM;
 		goto out;
 	}
@@ -2403,19 +2396,129 @@ out_ok:
 out:
 	return error;
 }
-/* BSD call back function for task_policy networking changes */
-void
-proc_apply_task_networkbg(void * bsd_info, thread_t thread)
+
+#define ALLOW_LOW_SPACE_WRITES_ENTITLEMENT \
+	"com.apple.private.vfs.allow-low-space-writes"
+static int
+iopolicysys_vfs_allow_lowspace_writes(struct proc *p, int cmd, int scope,
+    int policy, __unused struct _iopol_param_t *iop_param)
 {
-	assert(bsd_info != PROC_NULL);
+	int error = EINVAL;
 
-	pid_t pid = proc_pid((proc_t)bsd_info);
+	switch (scope) {
+	case IOPOL_SCOPE_PROCESS:
+		break;
+	default:
+		goto out;
+	}
 
+	switch (cmd) {
+	case IOPOL_CMD_GET:
+		policy = os_atomic_load(&p->p_vfs_iopolicy, relaxed) & P_VFS_IOPOLICY_ALLOW_LOW_SPACE_WRITES ?
+		    IOPOL_VFS_ALLOW_LOW_SPACE_WRITES_ON : IOPOL_VFS_ALLOW_LOW_SPACE_WRITES_OFF;
+		iop_param->iop_policy = policy;
+		goto out_ok;
+	case IOPOL_CMD_SET:
+		break;
+	default:
+		break;
+	}
+
+	if (!IOCurrentTaskHasEntitlement(ALLOW_LOW_SPACE_WRITES_ENTITLEMENT)) {
+		error = EPERM;
+		goto out;
+	}
+
+	switch (policy) {
+	case IOPOL_VFS_ALLOW_LOW_SPACE_WRITES_OFF:
+		os_atomic_andnot(&p->p_vfs_iopolicy, P_VFS_IOPOLICY_ALLOW_LOW_SPACE_WRITES, relaxed);
+		break;
+	case IOPOL_VFS_ALLOW_LOW_SPACE_WRITES_ON:
+		os_atomic_or(&p->p_vfs_iopolicy, P_VFS_IOPOLICY_ALLOW_LOW_SPACE_WRITES, relaxed);
+		break;
+	default:
+		break;
+	}
+
+out_ok:
+	error = 0;
+out:
+	return error;
+}
+
+static int
+iopolicysys_vfs_disallow_rw_for_o_evtonly(struct proc *p, int cmd, int scope,
+    int policy, __unused struct _iopol_param_t *iop_param)
+{
+	int error = EINVAL;
+
+	switch (scope) {
+	case IOPOL_SCOPE_PROCESS:
+		break;
+	default:
+		goto out;
+	}
+
+	switch (cmd) {
+	case IOPOL_CMD_GET:
+		policy = (os_atomic_load(&p->p_vfs_iopolicy, relaxed) &
+		    P_VFS_IOPOLICY_DISALLOW_RW_FOR_O_EVTONLY) ?
+		    IOPOL_VFS_DISALLOW_RW_FOR_O_EVTONLY_ON :
+		    IOPOL_VFS_DISALLOW_RW_FOR_O_EVTONLY_DEFAULT;
+		iop_param->iop_policy = policy;
+		goto out_ok;
+	case IOPOL_CMD_SET:
+		break;
+	default:
+		goto out;
+	}
+
+	/* Once set, we don't allow the process to clear it. */
+	switch (policy) {
+	case IOPOL_VFS_DISALLOW_RW_FOR_O_EVTONLY_ON:
+		os_atomic_or(&p->p_vfs_iopolicy,
+		    P_VFS_IOPOLICY_DISALLOW_RW_FOR_O_EVTONLY, relaxed);
+		break;
+	default:
+		goto out;
+	}
+
+out_ok:
+	error = 0;
+out:
+	return error;
+}
+
+static int
+iopolicysys_vfs_altlink(struct proc *p, int cmd, int scope, int policy,
+    struct _iopol_param_t *iop_param)
+{
+	if (scope != IOPOL_SCOPE_PROCESS) {
+		return EINVAL;
+	}
+
+	if (cmd == IOPOL_CMD_GET) {
+		policy = (os_atomic_load(&p->p_vfs_iopolicy, relaxed) & P_VFS_IOPOLICY_ALTLINK) ?
+		    IOPOL_VFS_ALTLINK_ENABLED : IOPOL_VFS_ALTLINK_DISABLED;
+		iop_param->iop_policy = policy;
+		return 0;
+	}
+
+	/* Once set, we don't allow the process to clear it. */
+	if (policy == IOPOL_VFS_ALTLINK_ENABLED) {
+		os_atomic_or(&p->p_vfs_iopolicy, P_VFS_IOPOLICY_ALTLINK, relaxed);
+		return 0;
+	}
+
+	return EINVAL;
+}
+
+void
+proc_apply_task_networkbg(int pid, thread_t thread)
+{
 	proc_t p = proc_find(pid);
 
 	if (p != PROC_NULL) {
-		assert(p == (proc_t)bsd_info);
-
 		do_background_socket(p, thread);
 		proc_rele(p);
 	}
@@ -2429,29 +2532,33 @@ gather_rusage_info(proc_t p, rusage_info_current *ru, int flavor)
 	assert(p->p_stats != NULL);
 	memset(ru, 0, sizeof(*ru));
 	switch (flavor) {
+	case RUSAGE_INFO_V6:
+		/* Any P-specific resource counters are captured in fill_task_rusage. */
+		OS_FALLTHROUGH;
+
 	case RUSAGE_INFO_V5:
-#if !XNU_TARGET_OS_OSX && __has_feature(ptrauth_calls)
-		if (vm_shared_region_is_reslide(p->task)) {
+#if __has_feature(ptrauth_calls)
+		if (vm_shared_region_is_reslide(proc_task(p))) {
 			ru->ri_flags |= RU_PROC_RUNS_RESLIDE;
 		}
-#endif /* !XNU_TARGET_OS_OSX && __has_feature(ptrauth_calls) */
+#endif /* __has_feature(ptrauth_calls) */
 		OS_FALLTHROUGH;
+
 	case RUSAGE_INFO_V4:
-		ru->ri_logical_writes = get_task_logical_writes(p->task, FALSE);
-		ru->ri_lifetime_max_phys_footprint = get_task_phys_footprint_lifetime_max(p->task);
+		ru->ri_logical_writes = get_task_logical_writes(proc_task(p), false);
+		ru->ri_lifetime_max_phys_footprint = get_task_phys_footprint_lifetime_max(proc_task(p));
 #if CONFIG_LEDGER_INTERVAL_MAX
-		ru->ri_interval_max_phys_footprint = get_task_phys_footprint_interval_max(p->task, FALSE);
+		ru->ri_interval_max_phys_footprint = get_task_phys_footprint_interval_max(proc_task(p), FALSE);
 #endif
-		fill_task_monotonic_rusage(p->task, ru);
 		OS_FALLTHROUGH;
 
 	case RUSAGE_INFO_V3:
-		fill_task_qos_rusage(p->task, ru);
-		fill_task_billed_usage(p->task, ru);
+		fill_task_qos_rusage(proc_task(p), ru);
+		fill_task_billed_usage(proc_task(p), ru);
 		OS_FALLTHROUGH;
 
 	case RUSAGE_INFO_V2:
-		fill_task_io_rusage(p->task, ru);
+		fill_task_io_rusage(proc_task(p), ru);
 		OS_FALLTHROUGH;
 
 	case RUSAGE_INFO_V1:
@@ -2473,7 +2580,7 @@ gather_rusage_info(proc_t p, rusage_info_current *ru, int flavor)
 
 	case RUSAGE_INFO_V0:
 		proc_getexecutableuuid(p, (unsigned char *)&ru->ri_uuid, sizeof(ru->ri_uuid));
-		fill_task_rusage(p->task, ru);
+		fill_task_rusage(proc_task(p), ru);
 		ru->ri_proc_start_abstime = p->p_stats->ps_start;
 	}
 }
@@ -2483,7 +2590,6 @@ proc_get_rusage(proc_t p, int flavor, user_addr_t buffer, __unused int is_zombie
 {
 	rusage_info_current ri_current = {};
 
-	int error = 0;
 	size_t size = 0;
 
 	switch (flavor) {
@@ -2510,6 +2616,10 @@ proc_get_rusage(proc_t p, int flavor, user_addr_t buffer, __unused int is_zombie
 	case RUSAGE_INFO_V5:
 		size = sizeof(struct rusage_info_v5);
 		break;
+
+	case RUSAGE_INFO_V6:
+		size = sizeof(struct rusage_info_v6);
+		break;
 	default:
 		return EINVAL;
 	}
@@ -2522,16 +2632,13 @@ proc_get_rusage(proc_t p, int flavor, user_addr_t buffer, __unused int is_zombie
 	 * If task is still alive, collect info from the live task itself.
 	 * Otherwise, look to the cached info in the zombie proc.
 	 */
-	if (p->p_ru == NULL) {
+	if (p->p_ru) {
+		return copyout(&p->p_ru->ri, buffer, size);
+	} else {
 		gather_rusage_info(p, &ri_current, flavor);
 		ri_current.ri_proc_exit_abstime = 0;
-		error = copyout(&ri_current, buffer, size);
-	} else {
-		ri_current = p->p_ru->ri;
-		error = copyout(&p->p_ru->ri, buffer, size);
+		return copyout(&ri_current, buffer, size);
 	}
-
-	return error;
 }
 
 static int
@@ -2605,7 +2712,7 @@ proc_rlimit_control(__unused struct proc *p, struct proc_rlimit_control_args *ua
 		if ((error = copyin(uap->arg, &wakeupmon_args, sizeof(wakeupmon_args))) != 0) {
 			break;
 		}
-		if ((error = mach_to_bsd_rv(task_wakeups_monitor_ctl(targetp->task, &wakeupmon_args.wm_flags,
+		if ((error = mach_to_bsd_rv(task_wakeups_monitor_ctl(proc_task(targetp), &wakeupmon_args.wm_flags,
 		    &wakeupmon_args.wm_rate))) != 0) {
 			break;
 		}
@@ -2613,7 +2720,7 @@ proc_rlimit_control(__unused struct proc *p, struct proc_rlimit_control_args *ua
 		break;
 	case RLIMIT_CPU_USAGE_MONITOR:
 		cpumon_flags = (uint32_t)uap->arg; // XXX temporarily stashing flags in argp (12592127)
-		error = mach_to_bsd_rv(task_cpu_usage_monitor_ctl(targetp->task, &cpumon_flags));
+		error = mach_to_bsd_rv(task_cpu_usage_monitor_ctl(proc_task(targetp), &cpumon_flags));
 		break;
 	case RLIMIT_THREAD_CPULIMITS:
 		cpulimits_flags = (uint32_t)uap->arg; // only need a limited set of bits, pass in void * argument
@@ -2627,9 +2734,9 @@ proc_rlimit_control(__unused struct proc *p, struct proc_rlimit_control_args *ua
 		uint32_t ms_refill = 0;
 		uint64_t ns_refill;
 
-		percent = (uint8_t)(cpulimits_flags & 0xffU);                                   /* low 8 bits for percent */
+		percent = (uint8_t)(cpulimits_flags & 0xffU);           /* low 8 bits for percent */
 		ms_refill = (cpulimits_flags >> 8) & 0xffffff;          /* next 24 bits represent ms refill value */
-		if (percent >= 100) {
+		if (percent >= 100 || percent == 0) {
 			error = EINVAL;
 			break;
 		}
@@ -2649,7 +2756,7 @@ proc_rlimit_control(__unused struct proc *p, struct proc_rlimit_control_args *ua
 			error = EINVAL;
 			break;
 		}
-		interval_max_footprint = get_task_phys_footprint_interval_max(targetp->task, TRUE);
+		interval_max_footprint = get_task_phys_footprint_interval_max(proc_task(targetp), TRUE);
 		break;
 #endif /* CONFIG_LEDGER_INTERVAL_MAX */
 	default:
@@ -2679,11 +2786,3 @@ thread_selfusage(struct proc *p __unused, struct thread_selfusage_args *uap __un
 
 	return 0;
 }
-
-#if !MONOTONIC
-int
-thread_selfcounts(__unused struct proc *p, __unused struct thread_selfcounts_args *uap, __unused int *ret_out)
-{
-	return ENOTSUP;
-}
-#endif /* !MONOTONIC */

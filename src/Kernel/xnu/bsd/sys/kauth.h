@@ -148,59 +148,8 @@ struct kauth_cache_sizes {
 /*
  * Credentials.
  */
-
-#if 0
-/*
- * Supplemental credential data.
- *
- * This interface allows us to associate arbitrary data with a credential.
- * As with the credential, the data is considered immutable.
- */
-struct kauth_cred_supplement {
-	TAILQ_ENTRY(kauth_cred_supplement) kcs_link;
-
-	int     kcs_ref;                /* reference count */
-	int     kcs_id;                 /* vended identifier */
-	size_t  kcs_size;               /* size of data field */
-	char    kcs_data[0];
-};
-
-typedef struct kauth_cred_supplement *kauth_cred_supplement_t;
-
-struct kauth_cred {
-	TAILQ_ENTRY(kauth_cred) kc_link;
-
-	int     kc_ref;                 /* reference count */
-	uid_t   kc_uid;                 /* effective user id */
-	uid_t   kc_ruid;                /* real user id */
-	uid_t   kc_svuid;               /* saved user id */
-	gid_t   kc_gid;                 /* effective group id */
-	gid_t   kc_rgid;                /* real group id */
-	gid_t   kc_svgid;               /* saved group id */
-
-	int     kc_flags;
-#define KAUTH_CRED_GRPOVERRIDE          (1<<0)  /* private group list is authoritative */
-
-	int     kc_npvtgroups;          /* private group list, advisory or authoritative */
-	gid_t   kc_pvtgroups[NGROUPS];  /* based on KAUTH_CRED_GRPOVERRIDE flag */
-
-	int     kc_nsuppgroups;         /* supplementary group list */
-	gid_t   *kc_suppgroups;
-
-	int     kc_nwhtgroups;          /* whiteout group list */
-	gid_t   *kc_whtgroups;
-
-	struct au_session cr_audit;     /* user auditing data */
-
-	int     kc_nsupplement;         /* entry count in supplemental data pointer array */
-	kauth_cred_supplement_t *kc_supplement;
-};
-#else
-
 /* XXX just for now */
 #include <sys/ucred.h>
-// typedef struct ucred *kauth_cred_t;
-#endif
 
 /* Kernel SPI for now */
 __BEGIN_DECLS
@@ -279,6 +228,12 @@ extern int      kauth_cred_issuser(kauth_cred_t _cred);
 /* GUID, NTSID helpers */
 extern guid_t   kauth_null_guid;
 extern int      kauth_guid_equal(guid_t *_guid1, guid_t *_guid2);
+
+#ifdef KERNEL_PRIVATE
+extern int      kauth_cred_getgroups(kauth_cred_t _cred, gid_t *_groups, size_t *_groupcount);
+
+#endif /* KERNEL_PRIVATE */
+
 #ifdef XNU_KERNEL_PRIVATE
 extern int      kauth_ntsid_equal(ntsid_t *_sid1, ntsid_t *_sid2);
 
@@ -298,17 +253,51 @@ extern kauth_cred_t kauth_cred_setuidgid(kauth_cred_t cred, uid_t uid, gid_t gid
 extern kauth_cred_t kauth_cred_setsvuidgid(kauth_cred_t cred, uid_t uid, gid_t gid);
 extern kauth_cred_t kauth_cred_setgroups(kauth_cred_t cred, gid_t *groups, size_t groupcount, uid_t gmuid);
 struct uthread;
-extern void     kauth_cred_uthread_update(struct uthread *, proc_t);
+extern void     kauth_cred_thread_update(struct thread *, proc_t);
 #ifdef CONFIG_MACF
 extern void kauth_proc_label_update_execve(struct proc *p, struct vfs_context *ctx, struct vnode *vp, off_t offset, struct vnode *scriptvp, struct label *scriptlabel, struct label *execlabel, unsigned int *csflags, void *psattr, int *disjoint, int *update_return);
 #endif
-extern int      kauth_cred_getgroups(kauth_cred_t _cred, gid_t *_groups, size_t *_groupcount);
 extern int      kauth_cred_gid_subset(kauth_cred_t _cred1, kauth_cred_t _cred2, int *_resultp);
 struct auditinfo_addr;
 extern kauth_cred_t kauth_cred_setauditinfo(kauth_cred_t, au_session_t *);
 extern int      kauth_cred_supplementary_register(const char *name, int *ident);
 extern int      kauth_cred_supplementary_add(kauth_cred_t cred, int ident, const void *data, size_t datasize);
 extern int      kauth_cred_supplementary_remove(kauth_cred_t cred, int ident);
+
+extern kauth_cred_t kauth_cred_require(kauth_cred_t cred) __pure2;
+
+extern void     kauth_cred_set(kauth_cred_t *credp, kauth_cred_t new_cred);
+extern void     kauth_cred_set_and_unref(kauth_cred_t *credp, kauth_cred_t *new_credp);
+
+#if HAS_APPLE_PAC
+/*
+ * `kauth_cred_set` and `kauth_cred_unref` take pointers to a
+ * `kauth_cred_t`, which the compiler considers strictly different from a
+ * pointer to a signed `kauth_cred_t` (as it should do).  These macros
+ * therefore authenticate the arguments into naked locals, pass them to the
+ * function and then write back the results, signing them in the process.
+ */
+#define kauth_cred_set(credp, new_cred) \
+    do { \
+	    kauth_cred_t _cred = *(credp); \
+	    (kauth_cred_set)(&_cred, (new_cred)); \
+	    *(credp) = _cred; \
+    } while (0)
+
+#define kauth_cred_set_and_unref(credp, new_credp) \
+    do { \
+	    kauth_cred_t _cred = *(credp); \
+	    (kauth_cred_set_and_unref)(&_cred, (new_credp)); \
+	    *(credp) = _cred; \
+    } while (0)
+
+#define kauth_cred_unref(credp) \
+    do { \
+	    kauth_cred_t _credp = *(credp); \
+	    (kauth_cred_unref)(&_credp); \
+	    *(credp) = _credp; \
+    } while (0)
+#endif /* HAS_APPLE_PAC */
 
 #endif /* XNU_KERNEL_PRIVATE */
 __END_DECLS
@@ -521,11 +510,15 @@ extern int      kauth_authorize_action(kauth_scope_t _scope, kauth_cred_t _crede
 extern int      kauth_authorize_allow(kauth_cred_t _credential, void *_idata, kauth_action_t _action,
     uintptr_t _arg0, uintptr_t _arg1, uintptr_t _arg2, uintptr_t _arg3);
 
+#ifdef KERNEL_PRIVATE
+extern int      kauth_acl_evaluate(kauth_cred_t _credential, kauth_acl_eval_t _eval);
+
+#endif /* KERNEL_PRIVATE */
+
 
 #ifdef XNU_KERNEL_PRIVATE
 void            kauth_filesec_acl_setendian(int, kauth_filesec_t, kauth_acl_t);
 int             kauth_copyinfilesec(user_addr_t xsecurity, kauth_filesec_t *xsecdestpp);
-extern int      kauth_acl_evaluate(kauth_cred_t _credential, kauth_acl_eval_t _eval);
 extern int      kauth_acl_inherit(vnode_t _dvp, kauth_acl_t _initial, kauth_acl_t *_product, int _isdir, vfs_context_t _ctx);
 
 #endif /* XNU_KERNEL_PRIVATE */
@@ -759,7 +752,7 @@ __END_DECLS
 #if 0
 # ifndef _FN_KPRINTF
 #  define       _FN_KPRINTF
-void kprintf(const char *fmt, ...);
+void kprintf(const char *fmt, ...) __printflike(1, 2);
 # endif /* !_FN_KPRINTF */
 # define KAUTH_DEBUG_ENABLE
 # define K_UUID_FMT "%08x:%08x:%08x:%08x"
@@ -788,12 +781,7 @@ __BEGIN_DECLS
 extern lck_grp_t kauth_lck_grp;
 
 extern void     kauth_init(void);
-extern void     kauth_cred_init(void);
-/*
- * If you need accounting for KM_KAUTH consider using
- * KALLOC_HEAP_DEFINE to define a view.
- */
-#define KM_KAUTH     KHEAP_DEFAULT
+
 #if CONFIG_EXT_RESOLVER
 extern void     kauth_resolver_identity_reset(void);
 #endif

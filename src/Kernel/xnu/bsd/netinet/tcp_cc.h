@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2010-2018 Apple Inc. All rights reserved.
+ * Copyright (c) 2010-2021 Apple Inc. All rights reserved.
  *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
  *
@@ -165,6 +165,7 @@ enum tcp_cc_event {
 #define TCP_CA_NAME_MAX 16
 
 extern int tcp_recv_bg;
+extern uint32_t bg_ss_fltsz;
 
 /*
  * Structure to hold definition various actions defined by a congestion
@@ -174,7 +175,7 @@ extern int tcp_recv_bg;
  */
 struct tcp_cc_algo {
 	char name[TCP_CA_NAME_MAX];
-	uint32_t num_sockets;
+	_Atomic uint32_t num_sockets;
 	uint32_t flags;
 
 	/* init the congestion algorithm for the specified control block */
@@ -214,10 +215,8 @@ struct tcp_cc_algo {
 	int (*delay_ack)(struct tcpcb *tp, struct tcphdr *th);
 
 	/* Switch a connection to this CC algorithm after sending some packets */
-	void (*switch_to)(struct tcpcb *tp, uint16_t old_cc_index);
+	void (*switch_to)(struct tcpcb *tp);
 } __attribute__((aligned(4)));
-
-extern struct zone *tcp_cc_zone;
 
 extern struct tcp_cc_algo* tcp_cc_algo_list[TCP_CC_ALGO_COUNT];
 
@@ -230,13 +229,44 @@ extern struct tcp_cc_algo* tcp_cc_algo_list[TCP_CC_ALGO_COUNT];
  */
 #define TCP_CC_CWND_NONVALIDATED_PERIOD (3 * 60 * TCP_RETRANSHZ)
 
-extern void     tcp_cc_init(void);
+/* Less than BE congestion control algo for receive window */
+struct tcp_rcv_cc_algo {
+	char name[TCP_CA_NAME_MAX];
+	_Atomic uint32_t num_sockets;
+	uint32_t flags;
+
+	/* init the congestion algorithm for the specified control block */
+	void (*init) (struct tcpcb *tp);
+
+	/*
+	 * cleanup any state that is stored in the connection
+	 * related to the algorithm
+	 */
+	void (*cleanup) (struct tcpcb *tp);
+
+	/* initialize rwnd at the start of a connection */
+	void (*rwnd_init) (struct tcpcb *tp);
+
+	/* called on the receipt of valid data */
+	void (*data_rcvd) (struct tcpcb *tp, struct tcphdr *th,
+	    struct tcpopt *to, uint32_t segment_len);
+
+	uint32_t (*get_rlwin) (struct tcpcb *tp);
+
+	/* perform tasks when data transfer resumes after an idle period */
+	void (*after_idle) (struct tcpcb *tp);
+
+	/* called when we switch from foreground to background */
+	void (*switch_to) (struct tcpcb *tp);
+} __attribute__((aligned(4)));
+
+extern struct tcp_rcv_cc_algo tcp_cc_rledbat;
+
+extern void tcp_cc_init(void);
 extern void tcp_cc_resize_sndbuf(struct tcpcb *tp);
 extern void tcp_bad_rexmt_fix_sndbuf(struct tcpcb *tp);
 extern void tcp_cc_cwnd_init_or_reset(struct tcpcb *tp);
 extern int tcp_cc_delay_ack(struct tcpcb *tp, struct tcphdr *th);
-extern void tcp_ccdbg_trace(struct tcpcb *tp, struct tcphdr *th,
-    int32_t event);
 extern void tcp_cc_allocate_state(struct tcpcb *tp);
 extern void tcp_cc_after_idle_stretchack(struct tcpcb *tp);
 extern uint32_t tcp_cc_is_cwnd_nonvalidated(struct tcpcb *tp);

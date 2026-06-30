@@ -75,6 +75,8 @@
 
 #include <kern/kern_types.h>
 #include <kern/locks.h>
+#include <kern/sched_prim.h>
+#include <kern/bits.h>
 
 #include <libkern/OSAtomic.h>
 
@@ -163,6 +165,7 @@ extern int      vm_debug_events;
 #define VM_INFO7                        0x111
 #define VM_INFO8                        0x112
 #define VM_INFO9                        0x113
+#define VM_INFO10                       0x114
 
 #define VM_UPL_PAGE_WAIT                0x120
 #define VM_IOPL_PAGE_WAIT               0x121
@@ -260,8 +263,8 @@ extern void               vm_page_free_list(
 	vm_page_t   mem,
 	boolean_t   prepare_object);
 
-extern kern_return_t      vm_page_alloc_list(
-	int         page_count,
+extern kern_return_t vm_page_alloc_list(
+	vm_size_t   page_count,
 	kma_flags_t flags,
 	vm_page_t  *list);
 
@@ -275,6 +278,9 @@ extern ppnum_t            vm_page_get_phys_page(vm_page_t page);
 extern vm_page_t          vm_page_get_next(vm_page_t page);
 
 extern kern_return_t    mach_vm_pressure_level_monitor(boolean_t wait_for_pressure, unsigned int *pressure_level);
+#if KERNEL_PRIVATE
+extern kern_return_t    mach_vm_wire_level_monitor(int64_t requested_pages);
+#endif /* KERNEL_PRIVATE */
 
 #if XNU_TARGET_OS_OSX
 extern kern_return_t    vm_pageout_wait(uint64_t deadline);
@@ -286,6 +292,13 @@ extern kern_return_t    vm_pageout_wait(uint64_t deadline);
 
 extern unsigned int     vm_pageout_scan_event_counter;
 extern unsigned int     vm_page_anonymous_count;
+extern thread_t         vm_pageout_scan_thread;
+extern thread_t         vm_pageout_gc_thread;
+
+#define VM_PAGEOUT_GC_INIT      ((void *)0)
+#define VM_PAGEOUT_GC_COLLECT   ((void *)1)
+#define VM_PAGEOUT_GC_EVENT     ((event_t)&vm_pageout_garbage_collect)
+extern void vm_pageout_garbage_collect(void *, wait_result_t);
 
 
 /*
@@ -294,12 +307,10 @@ extern unsigned int     vm_page_anonymous_count;
  */
 struct vm_pageout_queue {
 	vm_page_queue_head_t pgo_pending;  /* laundry pages to be processed by pager's iothread */
-	uint64_t        pgo_tid;           /* thread ID of I/O thread that services this queue */
 	unsigned int    pgo_laundry;       /* current count of laundry pages on queue or in flight */
 	unsigned int    pgo_maxlaundry;
 
 	uint32_t
-	    pgo_idle:1,        /* iothread is blocked waiting for work to do */
 	    pgo_busy:1,        /* iothread is currently processing request from pgo_pending */
 	    pgo_throttled:1,   /* vm_pageout_scan thread needs a wakeup when pgo_laundry drops */
 	    pgo_lowpriority:1, /* iothread is set to use low priority I/O */
@@ -320,6 +331,8 @@ extern struct   vm_pageout_queue        vm_pageout_queue_external;
  */
 extern void             vm_pageout(void);
 
+__startup_func extern void             vm_config_init(void);
+
 extern kern_return_t    vm_pageout_internal_start(void);
 
 extern void             vm_pageout_object_terminate(
@@ -339,8 +352,6 @@ extern void             vm_pageout_initialize_page(
 #define upl_unlock(object)      lck_mtx_unlock(&(object)->Lock)
 #define upl_try_lock(object)    lck_mtx_try_lock(&(object)->Lock)
 
-#define MAX_VECTOR_UPL_ELEMENTS 8
-
 struct _vector_upl_iostates {
 	upl_offset_t offset;
 	upl_size_t   size;
@@ -352,28 +363,31 @@ struct _vector_upl {
 	upl_size_t              size;
 	uint32_t                num_upls;
 	uint32_t                invalid_upls;
-	uint32_t                _reserved;
+	uint32_t                max_upls;
 	vm_map_t                submap;
 	vm_offset_t             submap_dst_addr;
 	vm_object_offset_t      offset;
-	upl_t                   upl_elems[MAX_VECTOR_UPL_ELEMENTS];
 	upl_page_info_array_t   pagelist;
-	vector_upl_iostates_t   upl_iostates[MAX_VECTOR_UPL_ELEMENTS];
+	struct {
+		upl_t                   elem;
+		vector_upl_iostates_t   iostate;
+	} upls[];
 };
 
 typedef struct _vector_upl* vector_upl_t;
 
+uint32_t vector_upl_max_upls(const upl_t upl);
+
 /* universal page list structure */
 
 #if UPL_DEBUG
-#define UPL_DEBUG_STACK_FRAMES  16
 #define UPL_DEBUG_COMMIT_RECORDS 4
 
 struct ucd {
 	upl_offset_t    c_beg;
 	upl_offset_t    c_end;
 	int             c_aborted;
-	void *          c_retaddr[UPL_DEBUG_STACK_FRAMES];
+	uint32_t        c_btref; /* btref_t */
 };
 #endif
 
@@ -397,12 +411,13 @@ struct upl {
 	 */
 	vm_object_offset_t u_offset;
 	upl_size_t      u_size;       /* size in bytes of the address space */
+	upl_size_t      u_mapped_size;       /* size in bytes of the UPL that is mapped */
 	vm_offset_t     kaddr;      /* secondary mapping in kernel */
 	vm_object_t     map_object;
-	ppnum_t         highest_page;
-	void*           vector_upl;
+	vector_upl_t    vector_upl;
 	upl_t           associated_upl;
 	struct upl_io_completion *upl_iodone;
+	ppnum_t         highest_page;
 #if CONFIG_IOSCHED
 	int             upl_priority;
 	uint64_t        *upl_reprio_info;
@@ -418,10 +433,13 @@ struct upl {
 
 	uint32_t        upl_state;
 	uint32_t        upl_commit_index;
-	void    *upl_create_retaddr[UPL_DEBUG_STACK_FRAMES];
+	uint32_t        upl_create_btref; /* btref_t */
 
 	struct  ucd     upl_commit_records[UPL_DEBUG_COMMIT_RECORDS];
 #endif  /* UPL_DEBUG */
+
+	bitmap_t       *lite_list;
+	struct upl_page_info page_list[];
 };
 
 /* upl struct flags */
@@ -453,7 +471,7 @@ struct upl {
 #define UPL_CREATE_IO_TRACKING  0x4
 #define UPL_CREATE_EXPEDITE_SUP 0x8
 
-extern upl_t vector_upl_create(vm_offset_t);
+extern upl_t vector_upl_create(vm_offset_t, uint32_t);
 extern void vector_upl_deallocate(upl_t);
 extern boolean_t vector_upl_is_valid(upl_t);
 extern boolean_t vector_upl_set_subupl(upl_t, upl_t, u_int32_t);
@@ -504,8 +522,19 @@ extern kern_return_t vm_map_remove_upl(
 	vm_map_t                map,
 	upl_t                   upl);
 
-/* wired  page list structure */
-typedef uint32_t *wpl_array_t;
+extern kern_return_t vm_map_enter_upl_range(
+	vm_map_t                map,
+	upl_t                   upl,
+	vm_object_offset_t             offset,
+	upl_size_t               size,
+	vm_prot_t               prot,
+	vm_map_offset_t         *dst_addr);
+
+extern kern_return_t vm_map_remove_upl_range(
+	vm_map_t                map,
+	upl_t                   upl,
+	vm_object_offset_t             offset,
+	upl_size_t               size);
 
 extern struct vm_page_delayed_work*
 vm_page_delayed_work_get_ctx(void);
@@ -608,7 +637,8 @@ extern int vm_compressor_mode;
 extern kern_return_t vm_pageout_compress_page(void **, char *, vm_page_t);
 extern void vm_pageout_anonymous_pages(void);
 extern void vm_pageout_disconnect_all_pages(void);
-
+extern int vm_toggle_task_selfdonate_pages(task_t);
+extern void vm_task_set_selfdonate_pages(task_t, bool);
 
 struct  vm_config {
 	boolean_t       compressor_is_present;          /* compressor is initialized and can be used by the freezer, the sweep or the pager */
@@ -678,8 +708,7 @@ struct vm_pageout_state {
 	int memorystatus_purge_on_warning;
 	int memorystatus_purge_on_urgent;
 
-	thread_t vm_pageout_external_iothread;
-	thread_t vm_pageout_internal_iothread;
+	thread_t vm_pageout_early_swapout_iothread;
 };
 
 extern struct vm_pageout_state vm_pageout_state;
@@ -692,6 +721,7 @@ struct vm_pageout_vminfo {
 	unsigned long vm_pageout_considered_bq_internal;
 	unsigned long vm_pageout_considered_bq_external;
 	unsigned long vm_pageout_skipped_external;
+	unsigned long vm_pageout_skipped_internal;
 
 	unsigned long vm_pageout_pages_evicted;
 	unsigned long vm_pageout_pages_purged;
@@ -717,10 +747,16 @@ struct vm_pageout_vminfo {
 
 	unsigned long vm_phantom_cache_found_ghost;
 	unsigned long vm_phantom_cache_added_ghost;
+
+	unsigned long vm_pageout_protected_sharedcache;
+	unsigned long vm_pageout_forcereclaimed_sharedcache;
+	unsigned long vm_pageout_protected_realtime;
+	unsigned long vm_pageout_forcereclaimed_realtime;
 };
 
 extern struct vm_pageout_vminfo vm_pageout_vminfo;
 
+extern void vm_swapout_thread(void);
 
 #if DEVELOPMENT || DEBUG
 
@@ -767,6 +803,7 @@ struct vm_pageout_debug {
 	uint32_t vm_grab_anon_nops;
 
 	uint32_t vm_pageout_no_victim;
+	uint32_t vm_pageout_yield_for_free_pages;
 	unsigned long vm_pageout_throttle_up_count;
 	uint32_t vm_page_steal_pageout_page;
 
@@ -798,6 +835,34 @@ extern struct vm_pageout_debug vm_pageout_debug;
 
 #define MAX_COMPRESSOR_THREAD_COUNT      8
 
+/*
+ * Forward declarations for internal routines.
+ */
+
+/*
+ * Contains relevant state for pageout iothreads. Some state is unused by
+ * external (file-backed) thread.
+ */
+struct pgo_iothread_state {
+	struct vm_pageout_queue *q;
+	// cheads unused by external thread
+	void                    *current_early_swapout_chead;
+	void                    *current_regular_swapout_chead;
+	void                    *current_late_swapout_chead;
+	char                    *scratch_buf;
+	int                     id;
+	thread_t                pgo_iothread; // holds a +1 ref
+	sched_cond_atomic_t     pgo_wakeup;
+#if DEVELOPMENT || DEBUG
+	// for perf_compressor benchmark
+	struct vm_pageout_queue *benchmark_q;
+#endif /* DEVELOPMENT || DEBUG */
+};
+
+extern struct pgo_iothread_state pgo_iothread_internal_state[MAX_COMPRESSOR_THREAD_COUNT];
+
+extern struct pgo_iothread_state pgo_iothread_external_state;
+
 struct vm_compressor_swapper_stats {
 	uint64_t unripe_under_30s;
 	uint64_t unripe_under_60s;
@@ -817,6 +882,7 @@ typedef struct vmct_stats_s {
 	uint64_t vmct_runtimes[MAX_COMPRESSOR_THREAD_COUNT];
 	uint64_t vmct_pages[MAX_COMPRESSOR_THREAD_COUNT];
 	uint64_t vmct_iterations[MAX_COMPRESSOR_THREAD_COUNT];
+	// total mach absolute time that compressor threads has been running
 	uint64_t vmct_cthreads_total;
 	int32_t vmct_minpages[MAX_COMPRESSOR_THREAD_COUNT];
 	int32_t vmct_maxpages[MAX_COMPRESSOR_THREAD_COUNT];

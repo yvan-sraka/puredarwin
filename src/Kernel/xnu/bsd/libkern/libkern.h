@@ -183,20 +183,7 @@ int     _consume_printf_args(int, ...);
 #endif
 #endif
 
-uint16_t        crc16(uint16_t crc, const void *bufp, size_t len);
 uint32_t        crc32(uint32_t crc, const void *bufp, size_t len);
-
-#if XNU_KERNEL_PRIVATE
-#if KASAN
-uint16_t __nosan_crc16(uint16_t crc, const void *bufp, size_t len);
-#else
-static inline uint16_t
-__nosan_crc16(uint16_t crc, const void *bufp, size_t len)
-{
-	return crc16(crc, bufp, len);
-}
-#endif
-#endif
 
 int     copystr(const void *kfaddr, void *kdaddr, size_t len, size_t *done);
 int     copyinstr(const user_addr_t uaddr, void *kaddr, size_t len, size_t *done) OS_WARN_RESULT;
@@ -218,7 +205,7 @@ extern int      vscnprintf(char *, size_t, const char *, va_list) __printflike(3
 
 #if XNU_KERNEL_PRIVATE
 extern bool     printf_log_locked(bool addcr, const char*, ...) __printflike(2, 3);
-extern bool     vprintf_log_locked(const char *, va_list, bool addcr) __printflike(1, 0);
+extern bool     vprintf_log_locked(const char *, va_list, bool driverkit) __printflike(1, 0);
 extern void     osobject_retain(void * object);
 extern void     osobject_release(void * object);
 #endif
@@ -262,7 +249,7 @@ clz(unsigned int num)
 #define UNSUPPORTED_API(funcname, ...) \
 	_Pragma("clang diagnostic push") \
 	_Pragma("clang diagnostic ignored \"-Wunused-parameter\"") \
-	funcname(__VA_ARGS__) { panic(__func__ ": unsupported API\n"); } \
+	funcname(__VA_ARGS__) { panic("%s: unsupported API", __func__); } \
 	_Pragma("clang diagnostic pop")
 
 #endif

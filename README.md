@@ -11,7 +11,10 @@ See the [Website](https://www.puredarwin.org) for more information.
 ## Building PureDarwin
 
 To build PureDarwin, you will need OpenSSL installed, which is used by xar and ld64.
-PureDarwin builds only on macOS. It is currently tested with Xcode 14, but should work
-with any other modern Xcode.
+PureDarwin builds only on macOS. It is currently tested with Xcode 15 (required for the
+Ventura/Darwin 22 kernel), but should work with any later Xcode.
 
 You will also need zlib, which is used by the DTrace CTF tools used in building the kernel.
+
+The bundled XNU kernel source corresponds to **xnu-8796.141.3** (Darwin 22.6.0, macOS Ventura 13.6).
+Building it requires the macOS 13 (Ventura) SDK or later.

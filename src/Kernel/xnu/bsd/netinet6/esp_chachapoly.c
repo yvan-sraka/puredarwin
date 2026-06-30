@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2017 Apple Inc. All rights reserved.
+ * Copyright (c) 2017, 2021 Apple Inc. All rights reserved.
  *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
  *
@@ -62,8 +62,6 @@ _Static_assert(_Alignof(chacha20poly1305_ctx) <= 8,
         (ESP_CHACHAPOLY_NONCE_LEN != CCCHACHA20POLY1305_NONCE_NBYTES))
 #error "Invalid sizes"
 #endif
-
-extern lck_mtx_t *sadb_mutex;
 
 typedef struct _esp_chachapoly_ctx {
 	chacha20poly1305_ctx ccp_ctx;
@@ -280,6 +278,8 @@ esp_chachapoly_encrypt(struct mbuf *m, // head of mbuf chain
 	_Static_assert(sizeof(esp_hdr) == 8, "Bad size");
 	uint32_t nonce[ESP_CHACHAPOLY_NONCE_LEN / 4]; // ensure 32bit alignment
 	_Static_assert(sizeof(nonce) == ESP_CHACHAPOLY_NONCE_LEN, "Bad nonce length");
+	_Static_assert(ESP_CHACHAPOLY_SALT_LEN + ESP_CHACHAPOLY_IV_LEN == sizeof(nonce),
+	    "Bad nonce length");
 	esp_chachapoly_ctx_t esp_ccp_ctx;
 
 	ESP_CHECK_ARG(m);
@@ -288,15 +288,15 @@ esp_chachapoly_encrypt(struct mbuf *m, // head of mbuf chain
 	esp_ccp_ctx = (esp_chachapoly_ctx_t)sav->sched;
 
 	if (ivlen != (esp_ccp_ctx->ccp_implicit_iv ? 0 : ESP_CHACHAPOLY_IV_LEN)) {
-		m_freem(m);
 		esp_log_err("ChaChaPoly Invalid ivlen %u, SPI 0x%08x",
 		    ivlen, ntohl(sav->spi));
+		m_freem(m);
 		return EINVAL;
 	}
 	if (sav->ivlen != ivlen) {
-		m_freem(m);
 		esp_log_err("ChaChaPoly Invalid sav->ivlen %u, SPI 0x%08x",
 		    sav->ivlen, ntohl(sav->spi));
+		m_freem(m);
 		return EINVAL;
 	}
 
@@ -310,9 +310,9 @@ esp_chachapoly_encrypt(struct mbuf *m, // head of mbuf chain
 
 	rc = chacha20poly1305_reset(&esp_ccp_ctx->ccp_ctx);
 	if (rc != 0) {
-		m_freem(m);
 		esp_log_err("ChaChaPoly chacha20poly1305_reset failed %d, SPI 0x%08x",
 		    rc, ntohl(sav->spi));
+		m_freem(m);
 		return rc;
 	}
 
@@ -321,42 +321,47 @@ esp_chachapoly_encrypt(struct mbuf *m, // head of mbuf chain
 
 	// RFC 7634 dictates that the 12 byte nonce must be
 	// the 4 byte salt followed by the 8 byte IV.
-	// The IV MUST be non-repeating but does not need to be unpredictable,
-	// so we use 4 bytes of 0 followed by the 4 byte ESP sequence number.
-	// this allows us to use implicit IV -- draft-ietf-ipsecme-implicit-iv
-	// Note that sav->seq is zero here so we must get esp_seq from esp_hdr
+	memset(nonce, 0, ESP_CHACHAPOLY_NONCE_LEN);
 	memcpy(nonce, esp_ccp_ctx->ccp_salt, ESP_CHACHAPOLY_SALT_LEN);
-	memset(((uint8_t *)nonce) + ESP_CHACHAPOLY_SALT_LEN, 0, 4);
-	memcpy(((uint8_t *)nonce) + ESP_CHACHAPOLY_SALT_LEN + 4,
-	    &esp_hdr.esp_seq, sizeof(esp_hdr.esp_seq));
+	if (!esp_ccp_ctx->ccp_implicit_iv) {
+		// Increment IV and save back new value
+		uint64_t iv = 0;
+		_Static_assert(ESP_CHACHAPOLY_IV_LEN == sizeof(iv), "Bad IV length");
+		memcpy(&iv, sav->iv, sizeof(iv));
+		iv++;
+		memcpy(sav->iv, &iv, sizeof(iv));
 
-	_Static_assert(4 + sizeof(esp_hdr.esp_seq) == ESP_CHACHAPOLY_IV_LEN,
-	    "Bad IV length");
-	_Static_assert(ESP_CHACHAPOLY_SALT_LEN + ESP_CHACHAPOLY_IV_LEN == sizeof(nonce),
-	    "Bad nonce length");
+		// Copy the new IV into the nonce and the packet
+		memcpy(((uint8_t *)nonce) + ESP_CHACHAPOLY_SALT_LEN, &iv, sizeof(iv));
+		m_copyback(m, ivoff, ivlen, sav->iv);
+	} else {
+		// Use the sequence number in the ESP header to form the
+		// nonce according to RFC 8750. The first 4 bytes are the
+		// salt value, the next 4 bytes are zeroes, and the final
+		// 4 bytes are the ESP sequence number.
+		_Static_assert(4 + sizeof(esp_hdr.esp_seq) == ESP_CHACHAPOLY_IV_LEN,
+		    "Bad IV length");
+		memcpy(((uint8_t *)nonce) + ESP_CHACHAPOLY_SALT_LEN + 4,
+		    &esp_hdr.esp_seq, sizeof(esp_hdr.esp_seq));
+	}
 
 	rc = chacha20poly1305_setnonce(&esp_ccp_ctx->ccp_ctx, (uint8_t *)nonce);
+	cc_clear(sizeof(nonce), nonce);
 	if (rc != 0) {
-		m_freem(m);
 		esp_log_err("ChaChaPoly chacha20poly1305_setnonce failed %d, SPI 0x%08x",
 		    rc, ntohl(sav->spi));
+		m_freem(m);
 		return rc;
 	}
-
-	if (!esp_ccp_ctx->ccp_implicit_iv) {
-		memcpy(sav->iv, ((uint8_t *)nonce) + ESP_CHACHAPOLY_SALT_LEN, ESP_CHACHAPOLY_IV_LEN);
-		m_copyback(m, ivoff, ivlen, sav->iv);
-	}
-	cc_clear(sizeof(nonce), nonce);
 
 	// Set Additional Authentication Data (AAD)
 	rc = chacha20poly1305_aad(&esp_ccp_ctx->ccp_ctx,
 	    sizeof(esp_hdr),
 	    (void *)&esp_hdr);
 	if (rc != 0) {
-		m_freem(m);
 		esp_log_err("ChaChaPoly chacha20poly1305_aad failed %d, SPI 0x%08x",
 		    rc, ntohl(sav->spi));
+		m_freem(m);
 		return rc;
 	}
 
@@ -382,9 +387,9 @@ esp_chachapoly_encrypt(struct mbuf *m, // head of mbuf chain
 		rc = chacha20poly1305_encrypt(&esp_ccp_ctx->ccp_ctx,
 		    len, sp, sp);
 		if (rc != 0) {
-			m_freem(m);
 			esp_log_err("ChaChaPoly chacha20poly1305_encrypt failed %d, SPI 0x%08x",
 			    rc, ntohl(sav->spi));
+			m_freem(m);
 			return rc;
 		}
 
@@ -393,9 +398,9 @@ esp_chachapoly_encrypt(struct mbuf *m, // head of mbuf chain
 		s = s->m_next;
 	}
 	if (s == NULL && soff != m->m_pkthdr.len) {
-		m_freem(m);
 		esp_log_err("ChaChaPoly not enough mbufs %d %d, SPI 0x%08x",
 		    soff, m->m_pkthdr.len, ntohl(sav->spi));
+		m_freem(m);
 		return EFBIG;
 	}
 	return 0;
@@ -428,15 +433,15 @@ esp_chachapoly_decrypt(struct mbuf *m, // head of mbuf chain
 	esp_ccp_ctx = (esp_chachapoly_ctx_t)sav->sched;
 
 	if (ivlen != (esp_ccp_ctx->ccp_implicit_iv ? 0 : ESP_CHACHAPOLY_IV_LEN)) {
-		m_freem(m);
 		esp_log_err("ChaChaPoly Invalid ivlen %u, SPI 0x%08x",
 		    ivlen, ntohl(sav->spi));
+		m_freem(m);
 		return EINVAL;
 	}
 	if (sav->ivlen != ivlen) {
-		m_freem(m);
 		esp_log_err("ChaChaPoly Invalid sav->ivlen %u, SPI 0x%08x",
 		    sav->ivlen, ntohl(sav->spi));
+		m_freem(m);
 		return EINVAL;
 	}
 
@@ -450,9 +455,9 @@ esp_chachapoly_decrypt(struct mbuf *m, // head of mbuf chain
 
 	rc = chacha20poly1305_reset(&esp_ccp_ctx->ccp_ctx);
 	if (rc != 0) {
-		m_freem(m);
 		esp_log_err("ChaChaPoly chacha20poly1305_reset failed %d, SPI 0x%08x",
 		    rc, ntohl(sav->spi));
+		m_freem(m);
 		return rc;
 	}
 
@@ -476,9 +481,9 @@ esp_chachapoly_decrypt(struct mbuf *m, // head of mbuf chain
 
 	rc = chacha20poly1305_setnonce(&esp_ccp_ctx->ccp_ctx, (uint8_t *)nonce);
 	if (rc != 0) {
-		m_freem(m);
 		esp_log_err("ChaChaPoly chacha20poly1305_setnonce failed %d, SPI 0x%08x",
 		    rc, ntohl(sav->spi));
+		m_freem(m);
 		return rc;
 	}
 	cc_clear(sizeof(nonce), nonce);
@@ -488,9 +493,9 @@ esp_chachapoly_decrypt(struct mbuf *m, // head of mbuf chain
 	    sizeof(esp_hdr),
 	    (void *)&esp_hdr);
 	if (rc != 0) {
-		m_freem(m);
 		esp_log_err("ChaChaPoly chacha20poly1305_aad failed %d, SPI 0x%08x",
 		    rc, ntohl(sav->spi));
+		m_freem(m);
 		return rc;
 	}
 
@@ -516,9 +521,9 @@ esp_chachapoly_decrypt(struct mbuf *m, // head of mbuf chain
 		rc = chacha20poly1305_decrypt(&esp_ccp_ctx->ccp_ctx,
 		    len, sp, sp);
 		if (rc != 0) {
-			m_freem(m);
 			esp_packet_log_err("chacha20poly1305_decrypt failed %d, SPI 0x%08x",
 			    rc, ntohl(sav->spi));
+			m_freem(m);
 			return rc;
 		}
 
@@ -527,9 +532,9 @@ esp_chachapoly_decrypt(struct mbuf *m, // head of mbuf chain
 		s = s->m_next;
 	}
 	if (s == NULL && soff != m->m_pkthdr.len) {
-		m_freem(m);
 		esp_packet_log_err("not enough mbufs %d %d, SPI 0x%08x",
 		    soff, m->m_pkthdr.len, ntohl(sav->spi));
+		m_freem(m);
 		return EFBIG;
 	}
 	return 0;

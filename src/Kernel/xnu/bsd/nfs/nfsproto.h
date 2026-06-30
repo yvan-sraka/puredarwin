@@ -89,7 +89,7 @@
 #define NFS_V2MAXDATA   8192
 #define NFS_MAXDGRAMDATA 16384
 #define NFS_PREFDGRAMDATA 8192
-#define NFS_MAXDATA     (8 * 64 * PAGE_SIZE) /* Same as NFS_MAXBSIZE from nfsnode.h */
+#define NFS_MAXDATA     (1024 * 1024) /* Max data supported by kext is 2MB for x86 and 8MB for AS (8 * 64 * PAGE_SIZE) */
 #define NFS_MAXPATHLEN  1024
 #define NFS_MAXNAMLEN   255
 #define NFS_MAXPACKET   (16 * 1024 * 1024)
@@ -374,11 +374,6 @@ typedef enum { NFNON=0, NFREG=1, NFDIR=2, NFBLK=3, NFCHR=4, NFLNK=5,
 	        for (__i=0; __i < (L); __i++) \
 	                ((uint32_t*)(B))[__i] = 0; \
 	} while (0)
-
-extern uint32_t nfs_fs_attr_bitmap[NFS_ATTR_BITMAP_LEN];
-extern uint32_t nfs_object_attr_bitmap[NFS_ATTR_BITMAP_LEN];
-extern uint32_t nfs_getattr_bitmap[NFS_ATTR_BITMAP_LEN];
-extern uint32_t nfs4_getattr_write_bitmap[NFS_ATTR_BITMAP_LEN];
 
 #define NFS_CLEAR_ATTRIBUTES(A) NFS_BITMAP_ZERO((A), NFS_ATTR_BITMAP_LEN)
 #define NFS_COPY_ATTRIBUTES(SRC, DST) \
@@ -741,6 +736,7 @@ extern uint32_t nfs4_getattr_write_bitmap[NFS_ATTR_BITMAP_LEN];
 #define NFS_OP_WRITE                            38
 #define NFS_OP_RELEASE_LOCKOWNER                39
 #define NFS_OP_ILLEGAL                          10044
+#define NFS_OP_COUNT                            40
 /* NFSv4 callback opcodes */
 #define NFS_OP_CB_GETATTR                       3
 #define NFS_OP_CB_RECALL                        4

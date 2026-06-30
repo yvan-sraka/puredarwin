@@ -48,6 +48,7 @@ uint64_t vm_swapfile_get_blksize(vnode_t vp);
 uint64_t vm_swapfile_get_transfer_size(vnode_t vp);
 int vm_swapfile_io(vnode_t vp, uint64_t offset, uint64_t start, int npages, int flags, void *);
 int vm_record_file_write(struct vnode *vp, uint64_t offset, char *buf, int size);
+int vm_swap_vol_get_capacity(const char *volume_name, uint64_t *capacity);
 
 #if CONFIG_FREEZE
 int vm_swap_vol_get_budget(vnode_t vp, uint64_t *freeze_daily_budget);
@@ -227,7 +228,7 @@ vm_swapfile_io(vnode_t vp, uint64_t offset, uint64_t start, int npages, int flag
 	    VM_KERN_MEMORY_OSFMK);
 
 	if (kr != KERN_SUCCESS || (upl_size != io_size)) {
-		panic("vm_map_create_upl failed with %d\n", kr);
+		panic("vm_map_create_upl failed with %d", kr);
 	}
 
 	if (flags & SWAP_READ) {
@@ -313,8 +314,7 @@ vnode_trim_list(vnode_t vp, struct trim_list *tl, boolean_t route_only)
 	devvp = vp->v_mount->mnt_devvp;
 	blocksize = vp->v_mount->mnt_devblocksize;
 
-	extents = kheap_alloc(KHEAP_TEMP,
-	    sizeof(dk_extent_t) * MAX_BATCH_TO_TRIM, Z_WAITOK);
+	extents = kalloc_data(sizeof(dk_extent_t) * MAX_BATCH_TO_TRIM, Z_WAITOK);
 
 	if (vp->v_mount->mnt_ioflags & MNT_IOFLAGS_CSUNMAP_SUPPORTED) {
 		memset(&cs_unmap, 0, sizeof(_dk_cs_unmap_t));
@@ -392,7 +392,7 @@ vnode_trim_list(vnode_t vp, struct trim_list *tl, boolean_t route_only)
 		}
 	}
 trim_exit:
-	kheap_free(KHEAP_TEMP, extents, sizeof(dk_extent_t) * MAX_BATCH_TO_TRIM);
+	kfree_data(extents, sizeof(dk_extent_t) * MAX_BATCH_TO_TRIM);
 
 	return error;
 }
@@ -405,10 +405,48 @@ vm_swap_vol_get_budget(vnode_t vp, uint64_t *freeze_daily_budget)
 	vfs_context_t   ctx = vfs_context_kernel();
 	errno_t         err = 0;
 
-	devvp = vp->v_mount->mnt_devvp;
-
-	err = VNOP_IOCTL(devvp, DKIOCGETMAXSWAPWRITE, (caddr_t)freeze_daily_budget, 0, ctx);
+	err = vnode_getwithref(vp);
+	if (err == 0) {
+		if (vp->v_mount && vp->v_mount->mnt_devvp) {
+			devvp = vp->v_mount->mnt_devvp;
+			err = VNOP_IOCTL(devvp, DKIOCGETMAXSWAPWRITE, (caddr_t)freeze_daily_budget, 0, ctx);
+		} else {
+			err = ENODEV;
+		}
+		vnode_put(vp);
+	}
 
 	return err;
 }
 #endif /* CONFIG_FREEZE */
+
+int
+vm_swap_vol_get_capacity(const char *volume_name, uint64_t *capacity)
+{
+	vfs_context_t   ctx = vfs_context_kernel();
+	vnode_t vp = NULL, devvp = NULL;
+	uint64_t block_size = 0;
+	uint64_t block_count = 0;
+	int error = 0;
+	*capacity = 0;
+
+	if ((error = vnode_open(volume_name, FREAD, 0, 0, &vp, ctx))) {
+		printf("Unable to open swap volume\n");
+		return error;
+	}
+
+	devvp = vp->v_mount->mnt_devvp;
+	if ((error = VNOP_IOCTL(devvp, DKIOCGETBLOCKSIZE, (caddr_t)&block_size, 0, ctx))) {
+		printf("Unable to get swap volume block size\n");
+		goto out;
+	}
+	if ((error = VNOP_IOCTL(devvp, DKIOCGETBLOCKCOUNT, (caddr_t)&block_count, 0, ctx))) {
+		printf("Unable to get swap volume block count\n");
+		goto out;
+	}
+
+	*capacity = block_count * block_size;
+out:
+	error = vnode_close(vp, 0, ctx);
+	return error;
+}

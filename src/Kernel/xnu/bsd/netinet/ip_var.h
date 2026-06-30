@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2000-2020 Apple Inc. All rights reserved.
+ * Copyright (c) 2000-2021 Apple Inc. All rights reserved.
  *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
  *
@@ -70,6 +70,9 @@
 #define _NETINET_IP_VAR_H_
 #include <sys/appleapiopts.h>
 
+#include <netinet/in.h>
+#include <sys/types.h>
+
 /*
  * Overlay for ip header used by other protocols (tcp, udp).
  */
@@ -127,8 +130,10 @@ struct ip_moptions {
 	u_char  imo_multicast_loop;     /* 1 => hear sends if a member */
 	u_short imo_num_memberships;    /* no. memberships this socket */
 	u_short imo_max_memberships;    /* max memberships this socket */
-	struct  in_multi **imo_membership;      /* group memberships */
-	struct  in_mfilter *imo_mfilters;       /* source filters */
+	struct  in_multi **__counted_by(imo_max_memberships) imo_membership;
+	/* group memberships */
+	struct  in_mfilter *__counted_by(imo_max_memberships) imo_mfilters;
+	/* source filters */
 	u_int32_t imo_multicast_vif;    /* vif num outgoing multicasts */
 	struct  in_addr imo_multicast_addr; /* ifindex/addr on MULTICAST_IF */
 	void (*imo_trace)               /* callback fn for tracing refs */
@@ -163,6 +168,45 @@ struct ip_moptions {
 
 #define IMO_REMREF(_imo)                                                \
 	imo_remref(_imo)
+
+/*
+ * Drop any existing memberships and source
+ * filters on _imo. The order of operations is
+ * 1. imf_leave the in_mfilter
+ * 2. in_leavegroup the meembership group
+ * 3. imf_purge the filter
+ * 4. INM_REMREF the reference on the membership group.
+ *
+ * The above calls assume valid input; consequently those
+ * are predicated by checking that the membership and
+ * the filter pointers (imn and imf, correspondingly)
+ * are valid.
+ */
+#define IMO_PURGE_LOCKED(_imo) do {                                 \
+	IMO_LOCK_ASSERT_HELD((_imo));                                   \
+	for (int i = 0; i < (_imo)->imo_num_memberships; ++i) {         \
+	        struct in_mfilter *imf;                                 \
+	        struct in_multi   *imn;                                 \
+	        imf = (_imo)->imo_mfilters != NULL                      \
+	            ? &(_imo)->imo_mfilters[i]                          \
+	            : NULL;                                             \
+	        if (imf != NULL) {                                      \
+	            imf_leave(imf);                                     \
+	        }                                                       \
+	        imn = (_imo)->imo_membership[i];                        \
+	        (_imo)->imo_membership[i] = NULL;                       \
+	        if (imn != NULL) {                                      \
+	            (void) in_leavegroup(imn, imf);                     \
+	        }                                                       \
+	        if (imf != NULL) {                                      \
+	            imf_purge(imf);                                     \
+	        }                                                       \
+	                if (imn != NULL) {                              \
+	            INM_REMREF(imn);                                    \
+	        }                                                       \
+	}                                                               \
+	(_imo)->imo_num_memberships = 0;                                \
+} while (0)
 
 /* mbuf tag for ip_forwarding info */
 struct ip_fwd_tag {
@@ -272,28 +316,30 @@ struct sockopt;
  * Extra information passed to ip_output when IP_OUTARGS is set.
  *
  * Upon returning an error to the caller, ip_output may indicate through
- * ipoa_retflags any additional information regarding the error.
+ * ipoa_flags any additional information regarding the error.
  */
 struct ip_out_args {
 	unsigned int    ipoa_boundif;   /* boundif interface index */
 	struct flowadv  ipoa_flowadv;   /* flow advisory code */
 	u_int32_t       ipoa_flags;     /* IPOAF output flags (see below) */
-#define IPOAF_SELECT_SRCIF      0x00000001      /* src interface selection */
-#define IPOAF_BOUND_IF          0x00000002      /* boundif value is valid */
-#define IPOAF_BOUND_SRCADDR     0x00000004      /* bound to src address */
-#define IPOAF_NO_CELLULAR       0x00000010      /* skip IFT_CELLULAR */
-#define IPOAF_NO_EXPENSIVE      0x00000020      /* skip IFT_EXPENSIVE */
-#define IPOAF_AWDL_UNRESTRICTED 0x00000040      /* can send over
-	                                         *  AWDL_RESTRICTED */
+#define IPOAF_SELECT_SRCIF              0x00000001      /* src interface selection */
+#define IPOAF_BOUND_IF                  0x00000002      /* boundif value is valid */
+#define IPOAF_BOUND_SRCADDR             0x00000004      /* bound to src address */
+#define IPOAF_NO_CELLULAR               0x00000010      /* skip IFT_CELLULAR */
+#define IPOAF_NO_EXPENSIVE              0x00000020      /* skip IFT_EXPENSIVE */
+#define IPOAF_AWDL_UNRESTRICTED         0x00000040      /* can send over
+	                                                 *  AWDL_RESTRICTED */
 #define IPOAF_QOSMARKING_ALLOWED        0x00000080      /* policy allows Fastlane DSCP marking */
-#define IPOAF_NO_CONSTRAINED    0x00000100      /* skip IFXF_CONSTRAINED */
-#define IPOAF_REDO_QOSMARKING_POLICY    0x00000200      /* Re-evaluate QOS marking policy */
-	u_int32_t       ipoa_retflags;  /* IPOARF return flags (see below) */
-#define IPOARF_IFDENIED 0x00000001      /* denied access to interface */
+#define IPOAF_NO_CONSTRAINED            0x00000400      /* skip IFXF_CONSTRAINED */
+#define IPOAF_REDO_QOSMARKING_POLICY    0x00002000      /* Re-evaluate QOS marking policy */
+#define IPOAF_R_IFDENIED                0x00004000      /* denied access to interface */
+#define IPOAF_MANAGEMENT_ALLOWED        0x00008000      /* access to management interfaces */
 	int             ipoa_sotc;      /* traffic class for Fastlane DSCP mapping */
 	int             ipoa_netsvctype; /* network service type */
 	int32_t         qos_marking_gencount;
 };
+
+#define IPOAF_RET_MASK (IPOAF_R_IFDENIED)
 
 extern struct ipstat ipstat;
 extern int ip_use_randomid;
@@ -329,12 +375,11 @@ extern int ip_savecontrol(struct inpcb *, struct mbuf **, struct ip *,
     struct mbuf *);
 extern struct mbuf *ip_srcroute(void);
 extern void  ip_stripoptions(struct mbuf *);
-extern void ip_initid(void);
-extern u_int16_t ip_randomid(void);
+extern u_int16_t ip_randomid(uint64_t);
 extern int ip_fragment(struct mbuf *, struct ifnet *, uint32_t, int);
 
-extern void ip_setsrcifaddr_info(struct mbuf *, uint32_t, struct in_ifaddr *);
-extern void ip_setdstifaddr_info(struct mbuf *, uint32_t, struct in_ifaddr *);
+extern void ip_setsrcifaddr_info(struct mbuf *, uint16_t, struct in_ifaddr *);
+extern void ip_setdstifaddr_info(struct mbuf *, uint16_t, struct in_ifaddr *);
 extern int ip_getsrcifaddr_info(struct mbuf *, uint32_t *, uint32_t *);
 extern int ip_getdstifaddr_info(struct mbuf *, uint32_t *, uint32_t *);
 

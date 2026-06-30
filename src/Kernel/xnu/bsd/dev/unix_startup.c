@@ -88,7 +88,6 @@ SYSCTL_INT(_kern, OID_AUTO, nbuf, CTLFLAG_RD | CTLFLAG_LOCKED, &nbuf_headers, 0,
 SYSCTL_INT(_kern, OID_AUTO, maxnbuf, CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_KERN, &max_nbuf_headers, 0, "");
 
 __private_extern__ int customnbuf = 0;
-int             ncl = 0;
 
 /* Indicates a server boot when set */
 TUNABLE(int, serverperfmode, "serverperfmode", 0);
@@ -103,12 +102,13 @@ static int vnodes_sized = 0;
 
 extern void     bsd_startupearly(void);
 
-void
-bsd_startupearly(void)
+static vm_map_size_t    bufferhdr_map_size;
+SECURITY_READ_ONLY_LATE(struct mach_vm_range)  bufferhdr_range = {};
+
+static vm_map_size_t
+bsd_get_bufferhdr_map_size(void)
 {
-	vm_offset_t     firstaddr;
 	vm_size_t       size;
-	kern_return_t   ret;
 
 	/* clip the number of buf headers upto 16k */
 	if (max_nbuf_headers == 0) {
@@ -119,16 +119,6 @@ bsd_startupearly(void)
 	}
 	if (max_nbuf_headers < CONFIG_MIN_NBUF) {
 		max_nbuf_headers = CONFIG_MIN_NBUF;
-	}
-
-	/* clip the number of hash elements  to 200000 */
-	if ((customnbuf == 0) && nbuf_hashelements == 0) {
-		nbuf_hashelements = (int)atop_kernel(sane_size / 50);
-		if ((unsigned int)nbuf_hashelements > 200000) {
-			nbuf_hashelements = 200000;
-		}
-	} else {
-		nbuf_hashelements = max_nbuf_headers;
 	}
 
 	if (niobuf_headers == 0) {
@@ -145,39 +135,50 @@ bsd_startupearly(void)
 	size = (max_nbuf_headers + niobuf_headers) * sizeof(struct buf);
 	size = round_page(size);
 
-	ret = kmem_suballoc(kernel_map,
-	    &firstaddr,
-	    size,
-	    FALSE,
-	    VM_FLAGS_ANYWHERE,
-	    VM_MAP_KERNEL_FLAGS_NONE,
-	    VM_KERN_MEMORY_FILE,
-	    &bufferhdr_map);
+	return size;
+}
 
-	if (ret != KERN_SUCCESS) {
-		panic("Failed to create bufferhdr_map");
+KMEM_RANGE_REGISTER_DYNAMIC(bufferhdr, &bufferhdr_range, ^() {
+	return bufferhdr_map_size = bsd_get_bufferhdr_map_size();
+});
+
+void
+bsd_startupearly(void)
+{
+	vm_size_t size = bufferhdr_map_size;
+
+	assert(size);
+
+	/* clip the number of hash elements  to 200000 */
+	if ((customnbuf == 0) && nbuf_hashelements == 0) {
+		nbuf_hashelements = (int)atop_kernel(sane_size / 50);
+		if ((unsigned int)nbuf_hashelements > 200000) {
+			nbuf_hashelements = 200000;
+		}
+	} else {
+		nbuf_hashelements = max_nbuf_headers;
 	}
 
-	ret = kernel_memory_allocate(bufferhdr_map,
-	    &firstaddr,
+	bufferhdr_map = kmem_suballoc(kernel_map,
+	    &bufferhdr_range.min_address,
 	    size,
-	    0,
-	    KMA_HERE | KMA_KOBJECT,
+	    VM_MAP_CREATE_NEVER_FAULTS,
+	    VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE,
+	    KMS_PERMANENT | KMS_NOFAIL,
+	    VM_KERN_MEMORY_FILE).kmr_submap;
+
+	kmem_alloc(bufferhdr_map,
+	    &(vm_offset_t){ bufferhdr_range.min_address },
+	    size,
+	    KMA_NOFAIL | KMA_PERMANENT | KMA_ZERO | KMA_KOBJECT,
 	    VM_KERN_MEMORY_FILE);
 
-	if (ret != KERN_SUCCESS) {
-		panic("Failed to allocate bufferhdr_map");
-	}
-
-	buf_headers = (struct buf *) firstaddr;
-	bzero(buf_headers, size);
+	buf_headers = (struct buf *)bufferhdr_range.min_address;
 
 #if SOCKETS
 	{
 		static const unsigned int       maxspace = 128 * 1024;
 		int             scale;
-
-		nmbclusters = bsd_mbuf_cluster_reserve(NULL) / MCLBYTES;
 
 #if INET
 		if ((scale = nmbclusters / NMBCLUSTERS) > 1) {
@@ -217,12 +218,17 @@ bsd_startupearly(void)
 	}
 }
 
+#if SOCKETS
+SECURITY_READ_ONLY_LATE(struct mach_vm_range) mb_range = {};
+KMEM_RANGE_REGISTER_DYNAMIC(mb, &mb_range, ^() {
+	nmbclusters = bsd_mbuf_cluster_reserve(NULL) / MCLBYTES;
+	return (vm_map_size_t)(nmbclusters * MCLBYTES);
+});
+#endif /* SOCKETS */
+
 void
 bsd_bufferinit(void)
 {
-#if SOCKETS
-	kern_return_t   ret;
-#endif
 	/*
 	 * Note: Console device initialized in kminit() from bsd_autoconf()
 	 * prior to call to us in bsd_init().
@@ -231,18 +237,14 @@ bsd_bufferinit(void)
 	bsd_startupearly();
 
 #if SOCKETS
-	ret = kmem_suballoc(kernel_map,
-	    (vm_offset_t *) &mbutl,
+	mb_map = kmem_suballoc(kernel_map,
+	    &mb_range.min_address,
 	    (vm_size_t) (nmbclusters * MCLBYTES),
 	    FALSE,
-	    VM_FLAGS_ANYWHERE,
-	    VM_MAP_KERNEL_FLAGS_NONE,
-	    VM_KERN_MEMORY_MBUF,
-	    &mb_map);
-
-	if (ret != KERN_SUCCESS) {
-		panic("Failed to allocate mb_map\n");
-	}
+	    VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE,
+	    KMS_PERMANENT | KMS_NOFAIL,
+	    VM_KERN_MEMORY_MBUF).kmr_submap;
+	mbutl = (unsigned char *)mb_range.min_address;
 #endif /* SOCKETS */
 
 	/*
@@ -270,7 +272,7 @@ bsd_bufferinit(void)
 unsigned int
 bsd_mbuf_cluster_reserve(boolean_t *overridden)
 {
-	int mbuf_pool = 0;
+	int mbuf_pool = 0, ncl = 0;
 	static boolean_t was_overridden = FALSE;
 
 	/* If called more than once, return the previously calculated size */
@@ -333,7 +335,8 @@ extern int tcp_tcbhashsize;
 extern int max_cached_sock_count;
 #endif
 
-
+#define SERVER_PERF_MODE_VALIDATION_DISABLES 0x5dee
+extern unsigned int kern_feature_overrides;
 void
 bsd_scale_setup(int scale)
 {
@@ -383,5 +386,9 @@ bsd_scale_setup(int scale)
 		hard_maxproc = maxproc;
 	}
 #endif
+	if (serverperfmode) {
+		/* If running in serverperfmode disable some internal only diagnostics. */
+		kern_feature_overrides |= SERVER_PERF_MODE_VALIDATION_DISABLES;
+	}
 	bsd_exec_setup(scale);
 }

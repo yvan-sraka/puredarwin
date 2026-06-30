@@ -27,13 +27,13 @@
  */
 
 #ifdef  MACH_BSD
-#include <mach_debug.h>
 #include <mach_ldebug.h>
 
 #include <mach/kern_return.h>
 #include <mach/mach_traps.h>
 #include <mach/vm_param.h>
 
+#include <kern/bits.h>
 #include <kern/cpu_data.h>
 #include <arm/cpu_data_internal.h>
 #include <kern/mach_param.h>
@@ -163,11 +163,15 @@ dtrace_get_cpu_int_stack_top(void)
 	return getCpuDatap()->intstack_top;
 }
 #endif /* CONFIG_DTRACE */
-extern const char *const mach_syscall_name_table[];
 
 /* ARM64_TODO: remove this. still TODO?*/
 extern struct proc* current_proc(void);
 extern int proc_pid(struct proc*);
+
+#if CONFIG_DEBUG_SYSCALL_REJECTION
+extern int debug_syscall_rejection_mode;
+extern bool debug_syscall_rejection_handle(int syscall_mach_trap_number);
+#endif /* CONFIG_DEBUG_SYSCALL_REJECTION */
 
 void
 mach_syscall(struct arm_saved_state *state)
@@ -239,26 +243,44 @@ mach_syscall(struct arm_saved_state *state)
 	 * Not all mach traps are filtered. e.g., mach_absolute_time() and
 	 * mach_continuous_time(). See handle_svc().
 	 */
-	task_t task = current_task();
-	uint8_t *filter_mask = task->mach_trap_filter_mask;
+	thread_ro_t tro = current_thread_ro();
+	task_t task = tro->tro_task;
+	struct proc *proc = tro->tro_proc;
+	uint8_t *filter_mask = task_get_mach_trap_filter_mask(task);
 
 	if (__improbable(filter_mask != NULL &&
-	    !bitstr_test(filter_mask, call_number))) {
-		if (mac_task_mach_trap_evaluate != NULL) {
-			retval = mac_task_mach_trap_evaluate(get_bsdtask_info(task),
-			    call_number);
-			if (retval) {
-				goto skip_machcall;
+	    !bitstr_test(filter_mask, call_number) &&
+	    mac_task_mach_trap_evaluate != NULL)) {
+		retval = mac_task_mach_trap_evaluate(proc, call_number);
+		if (retval != KERN_SUCCESS) {
+			if (mach_trap_table[call_number].mach_trap_returns_port) {
+				retval = MACH_PORT_NULL;
 			}
+			goto skip_machcall;
 		}
 	}
 #endif /* CONFIG_MACF */
 
+#if CONFIG_DEBUG_SYSCALL_REJECTION
+	bitmap_t const *rejection_mask = uthread_get_syscall_rejection_mask(ut);
+	if (__improbable(rejection_mask != NULL &&
+	    uthread_syscall_rejection_is_enabled(ut)) &&
+	    !bitmap_test(rejection_mask, call_number)) {
+		if (debug_syscall_rejection_handle(-call_number)) {
+			if (mach_trap_table[call_number].mach_trap_returns_port) {
+				retval = MACH_PORT_NULL;
+			} else {
+				retval = KERN_DENIED;
+			}
+			goto skip_machcall;
+		}
+	}
+#endif /* CONFIG_DEBUG_SYSCALL_REJECTION */
+
+
 	retval = mach_call(&args);
 
-#if CONFIG_MACF
 skip_machcall:
-#endif
 
 	DEBUG_KPRINT_SYSCALL_MACH("mach_syscall: retval=0x%x (pid %d, tid %lld)\n", retval,
 	    proc_pid(current_proc()), thread_tid(current_thread()));
@@ -277,18 +299,13 @@ skip_machcall:
 	assertf(prior == NULL, "thread_set_allocation_name(\"%s\") not cleared", kern_allocation_get_name(prior));
 #endif /* DEBUG || DEVELOPMENT */
 
-#if PROC_REF_DEBUG
-	if (__improbable(uthread_get_proc_refcount(ut) != 0)) {
-		panic("system call returned with uu_proc_refcount != 0");
-	}
-#endif
-
+	uthread_assert_zero_proc_refcount(ut);
 	return;
 
 bad:
 	exc_code = call_number;
 	exception_triage(EXC_SYSCALL, &exc_code, 1);
 	/* NOTREACHED */
-	panic("Returned from exception_triage()?\n");
+	panic("Returned from exception_triage()?");
 }
 #endif /* MACH_BSD */

@@ -1,12 +1,18 @@
 /*
- * Copyright (c) 2000-2015 Apple Inc. All rights reserved.
+ * Copyright (c) 2000-2020 Apple Inc. All rights reserved.
+ *
+ * This file contains the low-level serial drivers used on ARM/ARM64 devices.
+ * The generic serial console code in osfmk/console/serial_console.c will call
+ * into this code to transmit and receive serial data.
+ *
+ * Logging can be performed on multiple serial interfaces at once through a
+ * method called serial multiplexing. This is implemented by enumerating which
+ * serial interfaces are available on boot and registering them into a linked
+ * list of interfaces pointed to by gPESF. When outputting or receiving
+ * characters, each interface is queried in turn.
+ *
+ * Please view doc/arm_serial.md for an in-depth description of these drivers.
  */
-
-/*
- * file: pe_serial.c Polled-mode UART0 driver for S3c2410 and PL011.
- */
-
-
 #include <kern/clock.h>
 #include <kern/debug.h>
 #include <libkern/OSBase.h>
@@ -17,84 +23,257 @@
 #include <pexpert/pexpert.h>
 #include <pexpert/protos.h>
 #include <pexpert/device_tree.h>
-#if defined __arm__
-#include <arm/caches_internal.h>
-#include <arm/machine_routines.h>
-#include <arm/proc_reg.h>
-#include <pexpert/arm/board_config.h>
-#include <vm/pmap.h>
-#elif defined __arm64__
 #include <pexpert/arm/consistent_debug.h>
 #include <pexpert/arm64/board_config.h>
 #include <arm64/proc_reg.h>
-#endif
+#include <pexpert/arm/protos.h>
+#include <kern/sched_prim.h>
 #if HIBERNATION
 #include <machine/pal_hibernate.h>
 #endif /* HIBERNATION */
 
 struct pe_serial_functions {
-	void            (*uart_init) (void);
-	void            (*uart_set_baud_rate) (int unit, uint32_t baud_rate);
-	int             (*tr0) (void);
-	void            (*td0) (int c);
-	int             (*rr0) (void);
-	int             (*rd0) (void);
+	/* Initialize the underlying serial hardware. */
+	void (*init) (void);
+
+	/* Return a non-zero value if the serial interface is ready to send more data. */
+	unsigned int (*transmit_ready) (void);
+
+	/* Write a single byte of data to serial. */
+	void (*transmit_data) (uint8_t c);
+
+	/* Return a non-zero value if there's a byte of data available. */
+	unsigned int (*receive_ready) (void);
+
+	/* Read a single byte from serial. */
+	uint8_t (*receive_data) (void);
+
+	/* Enables IRQs from this device. */
+	void (*enable_irq) (void);
+
+	/* Disables IRQs from this device and reports whether IRQs were enabled. */
+	bool (*disable_irq) (void);
+
+	/* Clears this device's IRQs targeting this agent, returning true if at least one IRQ was cleared. */
+	bool (*acknowledge_irq) (void);
+
+	/**
+	 * Whether this serial driver can handle irqs. This value should be set by
+	 * querying the device tree to see if the serial device has interrupts
+	 * associated with it.
+	 *
+	 * For a device to support IRQs:
+	 *   - enable_irq, disable_irq, and acknowledge_irq must be non-null
+	 *   - The AppleSerialShim kext must be able to match to the serial device
+	 *     in the IORegistry and call serial_enable_irq with the proper
+	 *     serial_device_t
+	 *   - The device tree entry for the serial device should have an interrupt
+	 *     associated with it.
+	 */
+	bool has_irq;
+
+	/* enum identifying which serial device these functions belong to. */
+	serial_device_t device;
+
+	/* Pointer to the next serial interface in the linked-list. */
 	struct pe_serial_functions *next;
 };
 
-SECURITY_READ_ONLY_LATE(static struct pe_serial_functions*) gPESF = NULL;
+MARK_AS_HIBERNATE_DATA_CONST_LATE static struct pe_serial_functions* gPESF = NULL;
 
-static int         uart_initted = 0;    /* 1 if init'ed */
-static vm_offset_t uart_base = 0;
+/**
+ * Whether uart has been initialized already. This value is kept across a
+ * sleep/wake cycle so we know we need to reinitialize when serial_init is
+ * called again after wake.
+ */
+MARK_AS_HIBERNATE_DATA static bool uart_initted = false;
+
+/* Whether uart should run in simple mode that works during hibernation resume. */
+MARK_AS_HIBERNATE_DATA static bool uart_hibernation = false;
+
+/** Set <=> transmission is authorized.
+ * Always set, unless SERIALMODE_ON_DEMAND is provided at boot,
+ * and no data has yet been received.
+ * Originaly meant to be a per-pe_serial_functions variable,
+ * but the data protection on the structs prevents it. */
+static bool serial_do_transmit = 1;
+
+/**
+ * Used to track if all IRQs have been initialized. Each bit of this variable
+ * represents whether or not a serial device that reports supporting IRQs has
+ * been initialized yet (1 -> not initialized, 0 -> initialized)
+ */
+static uint32_t serial_irq_status = 0;
+
+/**
+ * Set by the 'disable-uart-irq' boot-arg to force serial IRQs into polling mode
+ * by preventing the serial driver shim kext from registering itself with
+ * serial_enable_irq.
+ */
+static bool disable_uart_irq = 0;
+
+/**
+ * Indicates whether or not a given device's irqs have been set up by calling
+ * serial_enable_irq for that particular device.
+ *
+ * @param device_fns Serial functions for the device that is being checked
+ * @return Whether or not the irqs have been initialized for that device
+ */
+static bool
+irq_initialized(struct pe_serial_functions *device_fns)
+{
+	return (serial_irq_status & device_fns->device) == 0;
+}
+
+/**
+ * Indicates whether or not a given device supports irqs and if they are ready
+ * to be used.
+ *
+ * @param device_fns Serial functions for the device that is being checked
+ * @return Whether or not the device can and will send IRQs.
+ */
+static bool
+irq_available_and_ready(struct pe_serial_functions *device_fns)
+{
+	return device_fns->has_irq && irq_initialized(device_fns);
+}
+
+/**
+ * Searches through the global serial functions list and returns the serial function for a particular device
+ *
+ * @param device The device identifier to search for
+ * @return Serial functions for the specified device
+ */
+static struct pe_serial_functions *
+get_serial_functions(serial_device_t device)
+{
+	struct pe_serial_functions *fns = gPESF;
+	while (fns != NULL) {
+		if (fns->device == device) {
+			return fns;
+		}
+		fns = fns->next;
+	}
+	return NULL;
+}
+
+/**
+ * The action to take when polling and waiting for a serial device to be ready
+ * for output. On ARM64, takes a WFE because the WFE timeout will wake us up in
+ * the worst case. On ARMv7 devices, we need to hot poll.
+ */
+static void
+serial_poll(void)
+{
+	#if __arm64__
+	__builtin_arm_wfe();
+	#endif
+}
+
+/**
+ * This ensures that if we have a future product that supports hibernation, but
+ * doesn't support either UART serial or dock-channels, then hibernation will
+ * gracefully fall back to the serial method that is supported.
+ */
+#if HIBERNATION || defined(APPLE_UART)
+MARK_AS_HIBERNATE_DATA static volatile apple_uart_registers_t *apple_uart_registers = 0;
+#endif /* HIBERNATION || defined(APPLE_UART) */
+
+#if HIBERNATION || defined(DOCKCHANNEL_UART)
+MARK_AS_HIBERNATE_DATA static vm_offset_t dockchannel_uart_base = 0;
+#endif /* HIBERNATION || defined(DOCKCHANNEL_UART) */
 
 /*****************************************************************************/
 
-#ifdef  S3CUART
-
-static int32_t dt_pclk      = -1;
+#ifdef APPLE_UART
 static int32_t dt_sampling  = -1;
 static int32_t dt_ubrdiv    = -1;
 
-static void ln2410_uart_set_baud_rate(__unused int unit, uint32_t baud_rate);
+static void apple_uart_set_baud_rate(uint32_t baud_rate);
 
+/**
+ * The Apple UART is configured to use 115200-8-N-1 communication.
+ */
 static void
-ln2410_uart_init(void)
+apple_uart_init(void)
 {
-	uint32_t ucon0 = 0x405; /* NCLK, No interrupts, No DMA - just polled */
+	ucon_t ucon = { .raw = 0 };
+	// Use NCLK (which is constant) instead of PCLK (which is variable).
+	ucon.clock_selection = UCON_CLOCK_SELECTION_NCLK;
+	ucon.transmit_mode = UCON_TRANSMIT_MODE_INTERRUPT_OR_POLLING;
+	ucon.receive_mode = UCON_RECEIVE_MODE_INTERRUPT_OR_POLLING;
+	apple_uart_registers->ucon = ucon;
 
-	rULCON0 = 0x03;         /* 81N, not IR */
+	// Configure 8-N-1 communication.
+	ulcon_t ulcon = { .raw = 0 };
+	ulcon.word_length = ULCON_WORD_LENGTH_8_BITS;
+	ulcon.parity_mode = ULCON_PARITY_MODE_NONE;
+	ulcon.number_of_stop_bits = ULCON_STOP_BITS_1;
+	apple_uart_registers->ulcon = ulcon;
 
-	// Override with pclk dt entry
-	if (dt_pclk != -1) {
-		ucon0 = ucon0 & ~0x400;
-	}
+	apple_uart_set_baud_rate(115200);
 
-	rUCON0 = ucon0;
-	rUMCON0 = 0x00;         /* Clear Flow Control */
-
-	ln2410_uart_set_baud_rate(0, 115200);
-
-	rUFCON0 = 0x03;         /* Clear & Enable FIFOs */
-	rUMCON0 = 0x01;         /* Assert RTS on UART0 */
+	// Enable and reset FIFOs.
+	ufcon_t ufcon = { .raw = 0 };
+	ufcon.fifo_enable = 1;
+	ufcon.tx_fifo_reset = 1;
+	ufcon.rx_fifo_reset = 1;
+	apple_uart_registers->ufcon = ufcon;
 }
 
 static void
-ln2410_uart_set_baud_rate(__unused int unit, uint32_t baud_rate)
+apple_uart_enable_irq(void)
+{
+	// Set the Tx FIFO interrupt trigger level to 0 bytes so interrupts occur when
+	// the Tx FIFO is completely empty; this leads to higher Tx throughput.
+	apple_uart_registers->ufcon.tx_fifo_interrupt_trigger_level_dma_watermark = UFCON_TX_FIFO_ITL_0_BYTES;
+
+	// Enable Tx interrupts.
+	apple_uart_registers->ucon.transmit_interrupt = 1;
+}
+
+static bool
+apple_uart_disable_irq(void)
+{
+	/* Disables Tx interrupts */
+	ucon_t ucon = apple_uart_registers->ucon;
+	const bool irqs_were_enabled = ucon.transmit_interrupt;
+
+	if (irqs_were_enabled) {
+		ucon.transmit_interrupt = 0;
+		apple_uart_registers->ucon = ucon;
+	}
+
+	return irqs_were_enabled;
+}
+
+static bool
+apple_uart_ack_irq(void)
+{
+	apple_uart_registers->utrstat.transmit_interrupt_status = 1;
+	return true;
+}
+
+static void
+apple_uart_drain_fifo(void)
+{
+	while (({
+		ufstat_t ufstat = apple_uart_registers->ufstat;
+		ufstat.tx_fifo_full || ufstat.tx_fifo_count;
+	})) {
+		serial_poll();
+	}
+}
+
+static void
+apple_uart_set_baud_rate(uint32_t baud_rate)
 {
 	uint32_t div = 0;
-	uint32_t uart_clock = 0;
+	const uint32_t uart_clock = (uint32_t)gPEClockFrequencyInfo.fix_frequency_hz;
 	uint32_t sample_rate = 16;
 
 	if (baud_rate < 300) {
 		baud_rate = 9600;
-	}
-
-	if (rUCON0 & 0x400) {
-		// NCLK
-		uart_clock = (uint32_t)gPEClockFrequencyInfo.fix_frequency_hz;
-	} else {
-		// PCLK
-		uart_clock = (uint32_t)gPEClockFrequencyInfo.prf_frequency_hz;
 	}
 
 	if (dt_sampling != -1) {
@@ -118,413 +297,70 @@ ln2410_uart_set_baud_rate(__unused int unit, uint32_t baud_rate)
 		}
 	}
 
-	// Sample Rate [19:16], UBRDIV [15:0]
-	rUBRDIV0 = ((16 - sample_rate) << 16) | div;
+	ubrdiv_t ubrdiv = apple_uart_registers->ubrdiv;
+	ubrdiv.sample_rate = 16 - sample_rate;
+	ubrdiv.ubr_div = div;
+	apple_uart_registers->ubrdiv = ubrdiv;
 }
 
-static int
-ln2410_tr0(void)
+MARK_AS_HIBERNATE_TEXT static unsigned int
+apple_uart_transmit_ready(void)
 {
-	return rUTRSTAT0 & 0x04;
-}
-static void
-ln2410_td0(int c)
-{
-	rUTXH0 = (unsigned)(c & 0xff);
-}
-static int
-ln2410_rr0(void)
-{
-	return rUTRSTAT0 & 0x01;
-}
-static int
-ln2410_rd0(void)
-{
-	return (int)rURXH0;
+	return !apple_uart_registers->ufstat.tx_fifo_full;
 }
 
-SECURITY_READ_ONLY_LATE(static struct pe_serial_functions) ln2410_serial_functions =
+MARK_AS_HIBERNATE_TEXT static void
+apple_uart_transmit_data(uint8_t c)
 {
-	.uart_init = ln2410_uart_init,
-	.uart_set_baud_rate = ln2410_uart_set_baud_rate,
-	.tr0 = ln2410_tr0,
-	.td0 = ln2410_td0,
-	.rr0 = ln2410_rr0,
-	.rd0 = ln2410_rd0
-};
-
-#endif  /* S3CUART */
-
-/*****************************************************************************/
-
-static void
-dcc_uart_init(void)
-{
+	apple_uart_registers->utxh.txdata = c;
 }
 
 static unsigned int
-read_dtr(void)
+apple_uart_receive_ready(void)
 {
-#ifdef __arm__
-	unsigned int    c;
-	__asm__ volatile (
-                 "mrc p14, 0, %0, c0, c5\n"
- :               "=r"(c));
-	return c;
-#else
-	/* ARM64_TODO */
-	panic_unimplemented();
-	return 0;
-#endif
-}
-static void
-write_dtr(unsigned int c)
-{
-#ifdef __arm__
-	__asm__ volatile (
-                 "mcr p14, 0, %0, c0, c5\n"
-                 :
-                 :"r"(c));
-#else
-	/* ARM64_TODO */
-	(void)c;
-	panic_unimplemented();
-#endif
+	const ufstat_t ufstat = apple_uart_registers->ufstat;
+	return ufstat.rx_fifo_full || ufstat.rx_fifo_count;
 }
 
-static int
-dcc_tr0(void)
+static uint8_t
+apple_uart_receive_data(void)
 {
-#ifdef __arm__
-	return !(arm_debug_read_dscr() & ARM_DBGDSCR_TXFULL);
-#else
-	/* ARM64_TODO */
-	panic_unimplemented();
-	return 0;
-#endif
+	return apple_uart_registers->urxh.rxdata;
 }
 
-static void
-dcc_td0(int c)
+MARK_AS_HIBERNATE_DATA_CONST_LATE
+static struct pe_serial_functions apple_serial_functions =
 {
-	write_dtr(c);
-}
-
-static int
-dcc_rr0(void)
-{
-#ifdef __arm__
-	return arm_debug_read_dscr() & ARM_DBGDSCR_RXFULL;
-#else
-	/* ARM64_TODO */
-	panic_unimplemented();
-	return 0;
-#endif
-}
-
-static int
-dcc_rd0(void)
-{
-	return read_dtr();
-}
-
-SECURITY_READ_ONLY_LATE(static struct pe_serial_functions) dcc_serial_functions =
-{
-	.uart_init = dcc_uart_init,
-	.uart_set_baud_rate = NULL,
-	.tr0 = dcc_tr0,
-	.td0 = dcc_td0,
-	.rr0 = dcc_rr0,
-	.rd0 = dcc_rd0
+	.init = apple_uart_init,
+	.transmit_ready = apple_uart_transmit_ready,
+	.transmit_data = apple_uart_transmit_data,
+	.receive_ready = apple_uart_receive_ready,
+	.receive_data = apple_uart_receive_data,
+	.enable_irq = apple_uart_enable_irq,
+	.disable_irq = apple_uart_disable_irq,
+	.acknowledge_irq = apple_uart_ack_irq,
+	.device = SERIAL_APPLE_UART
 };
 
-/*****************************************************************************/
-
-#ifdef SHMCON
-
-#define CPU_CACHELINE_SIZE      (1 << MMU_CLINE)
-
-#ifndef SHMCON_NAME
-#define SHMCON_NAME             "AP-xnu"
-#endif
-
-#define SHMCON_MAGIC            'SHMC'
-#define SHMCON_VERSION          2
-#define CBUF_IN                 0
-#define CBUF_OUT                1
-#define INBUF_SIZE              (panic_size / 16)
-#define FULL_ALIGNMENT          (64)
-
-#define FLAG_CACHELINE_32       1
-#define FLAG_CACHELINE_64       2
-
-/* Defines to clarify the master/slave fields' use as circular buffer pointers */
-#define head_in         sidx[CBUF_IN]
-#define tail_in         midx[CBUF_IN]
-#define head_out        midx[CBUF_OUT]
-#define tail_out        sidx[CBUF_OUT]
-
-/* TODO: get from device tree/target */
-#define NUM_CHILDREN            5
-
-#define WRAP_INCR(len, x) do{ (x)++; if((x) >= (len)) (x) = 0; } while(0)
-#define ROUNDUP(a, b) (((a) + ((b) - 1)) & (~((b) - 1)))
-
-#define MAX(a, b) ((a) > (b) ? (a) : (b))
-#define MIN(a, b) ((a) < (b) ? (a) : (b))
-
-#define shmcon_barrier() do {__asm__ volatile("dmb ish" : : : "memory");} while(0)
-
-struct shm_buffer_info {
-	uint64_t        base;
-	uint32_t        unused;
-	uint32_t        magic;
-};
-
-struct shmcon_header {
-	uint32_t        magic;
-	uint8_t         version;
-	uint8_t         children;       /* number of child entries in child_ent */
-	uint16_t        flags;
-	uint64_t        buf_paddr[2];   /* Physical address for buffers (in, out) */
-	uint32_t        buf_len[2];
-	uint8_t         name[8];
-
-	/* Slave-modified data - invalidate before read */
-	uint32_t        sidx[2] __attribute__((aligned(FULL_ALIGNMENT)));       /* In head, out tail */
-
-	/* Master-modified data - clean after write */
-	uint32_t        midx[2] __attribute__((aligned(FULL_ALIGNMENT)));       /* In tail, out head */
-
-	uint64_t        child[0];       /* Physical address of child header pointers */
-};
-
-static volatile struct shmcon_header *shmcon = NULL;
-static volatile uint8_t *shmbuf[2];
-#ifdef SHMCON_THROTTLED
-static uint64_t grace = 0;
-static uint64_t full_timeout = 0;
-#endif
-
-static void
-shmcon_set_baud_rate(__unused int unit, __unused uint32_t baud_rate)
-{
-	return;
-}
-
-static int
-shmcon_tr0(void)
-{
-#ifdef SHMCON_THROTTLED
-	uint32_t head = shmcon->head_out;
-	uint32_t tail = shmcon->tail_out;
-	uint32_t len = shmcon->buf_len[CBUF_OUT];
-
-	WRAP_INCR(len, head);
-	if (head != tail) {
-		full_timeout = 0;
-		return 1;
-	}
-
-	/* Full.  Is this buffer being serviced? */
-	if (full_timeout == 0) {
-		full_timeout = mach_absolute_time() + grace;
-		return 0;
-	}
-	if (full_timeout > mach_absolute_time()) {
-		return 0;
-	}
-
-	/* Timeout - slave not really there or not keeping up */
-	tail += (len / 4);
-	if (tail >= len) {
-		tail -= len;
-	}
-	shmcon_barrier();
-	shmcon->tail_out = tail;
-	full_timeout = 0;
-#endif
-	return 1;
-}
-
-static void
-shmcon_td0(int c)
-{
-	uint32_t head = shmcon->head_out;
-	uint32_t len = shmcon->buf_len[CBUF_OUT];
-
-	shmbuf[CBUF_OUT][head] = (uint8_t)c;
-	WRAP_INCR(len, head);
-	shmcon_barrier();
-	shmcon->head_out = head;
-}
-
-static int
-shmcon_rr0(void)
-{
-	if (shmcon->tail_in == shmcon->head_in) {
-		return 0;
-	}
-	return 1;
-}
-
-static int
-shmcon_rd0(void)
-{
-	int c;
-	uint32_t tail = shmcon->tail_in;
-	uint32_t len = shmcon->buf_len[CBUF_IN];
-
-	c = shmbuf[CBUF_IN][tail];
-	WRAP_INCR(len, tail);
-	shmcon_barrier();
-	shmcon->tail_in = tail;
-	return c;
-}
-
-static void
-shmcon_init(void)
-{
-	DTEntry                         entry;
-	uintptr_t const                 *reg_prop;
-	volatile struct shm_buffer_info *end;
-	size_t                          i, header_size;
-	unsigned int                    size;
-	vm_offset_t                     pa_panic_base, panic_size, va_buffer_base, va_buffer_end;
-
-	if (kSuccess != SecureDTLookupEntry(0, "pram", &entry)) {
-		return;
-	}
-
-	if (kSuccess != SecureDTGetProperty(entry, "reg", (void const **)&reg_prop, &size)) {
-		return;
-	}
-
-	pa_panic_base = reg_prop[0];
-	panic_size = reg_prop[1];
-
-	shmcon = (struct shmcon_header *)ml_map_high_window(pa_panic_base, panic_size);
-	header_size = sizeof(*shmcon) + (NUM_CHILDREN * sizeof(shmcon->child[0]));
-	va_buffer_base = ROUNDUP((uintptr_t)(shmcon) + header_size, CPU_CACHELINE_SIZE);
-	va_buffer_end  = (uintptr_t)shmcon + panic_size - (sizeof(*end));
-
-	if ((shmcon->magic == SHMCON_MAGIC) && (shmcon->version == SHMCON_VERSION)) {
-		vm_offset_t pa_buffer_base, pa_buffer_end;
-
-		pa_buffer_base = ml_vtophys(va_buffer_base);
-		pa_buffer_end  = ml_vtophys(va_buffer_end);
-
-		/* Resume previous console session */
-		for (i = 0; i < 2; i++) {
-			vm_offset_t pa_buf;
-			uint32_t len;
-
-			pa_buf = (uintptr_t)shmcon->buf_paddr[i];
-			len = shmcon->buf_len[i];
-			/* Validate buffers */
-			if ((pa_buf < pa_buffer_base) ||
-			    (pa_buf >= pa_buffer_end) ||
-			    ((pa_buf + len) > pa_buffer_end) ||
-			    (shmcon->midx[i] >= len) ||     /* Index out of bounds */
-			    (shmcon->sidx[i] >= len) ||
-			    (pa_buf != ROUNDUP(pa_buf, CPU_CACHELINE_SIZE)) ||     /* Unaligned pa_buffer */
-			    (len < 1024) ||
-			    (len > (pa_buffer_end - pa_buffer_base)) ||
-			    (shmcon->children != NUM_CHILDREN)) {
-				goto validation_failure;
-			}
-			/* Compute the VA offset of the buffer */
-			shmbuf[i] = (uint8_t *)(uintptr_t)shmcon + ((uintptr_t)pa_buf - (uintptr_t)pa_panic_base);
-		}
-		/* Check that buffers don't overlap */
-		if ((uintptr_t)shmbuf[0] < (uintptr_t)shmbuf[1]) {
-			if ((uintptr_t)(shmbuf[0] + shmcon->buf_len[0]) > (uintptr_t)shmbuf[1]) {
-				goto validation_failure;
-			}
-		} else {
-			if ((uintptr_t)(shmbuf[1] + shmcon->buf_len[1]) > (uintptr_t)shmbuf[0]) {
-				goto validation_failure;
-			}
-		}
-		shmcon->tail_in = shmcon->head_in; /* Clear input buffer */
-		shmcon_barrier();
-	} else {
-validation_failure:
-		shmcon->magic = 0;
-		shmcon_barrier();
-		shmcon->buf_len[CBUF_IN] = (uint32_t)INBUF_SIZE;
-		shmbuf[CBUF_IN]  = (uint8_t *)va_buffer_base;
-		shmbuf[CBUF_OUT] = (uint8_t *)ROUNDUP(va_buffer_base + INBUF_SIZE, CPU_CACHELINE_SIZE);
-		for (i = 0; i < 2; i++) {
-			shmcon->midx[i] = 0;
-			shmcon->sidx[i] = 0;
-			shmcon->buf_paddr[i] = (uintptr_t)ml_vtophys((vm_offset_t)shmbuf[i]);
-		}
-		shmcon->buf_len[CBUF_OUT] = (uint32_t)(va_buffer_end - (uintptr_t)shmbuf[CBUF_OUT]);
-		shmcon->version = SHMCON_VERSION;
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wcast-qual"
-		memset((void *)shmcon->name, ' ', sizeof(shmcon->name));
-		memcpy((void *)shmcon->name, SHMCON_NAME, MIN(sizeof(shmcon->name), strlen(SHMCON_NAME)));
-#pragma clang diagnostic pop
-		for (i = 0; i < NUM_CHILDREN; i++) {
-			shmcon->child[0] = 0;
-		}
-		shmcon_barrier();
-		shmcon->magic = SHMCON_MAGIC;
-	}
-	end =  (volatile struct shm_buffer_info *)va_buffer_end;
-	end->base = pa_panic_base;
-	end->unused = 0;
-	shmcon_barrier();
-	end->magic = SHMCON_MAGIC;
-#ifdef SHMCON_THROTTLED
-	grace = gPEClockFrequencyInfo.timebase_frequency_hz;
-#endif
-
-	PE_consistent_debug_register(kDbgIdConsoleHeaderAP, pa_panic_base, panic_size);
-}
-
-SECURITY_READ_ONLY_LATE(static struct pe_serial_functions) shmcon_serial_functions =
-{
-	.uart_init = shmcon_init,
-	.uart_set_baud_rate = shmcon_set_baud_rate,
-	.tr0 = shmcon_tr0,
-	.td0 = shmcon_td0,
-	.rr0 = shmcon_rr0,
-	.rd0 = shmcon_rd0
-};
-
-int
-pe_shmcon_set_child(uint64_t paddr, uint32_t entry)
-{
-	if (shmcon == NULL) {
-		return -1;
-	}
-
-	if (shmcon->children >= entry) {
-		return -1;
-	}
-
-	shmcon->child[entry] = paddr;
-	return 0;
-}
-
-#endif /* SHMCON */
+#endif /* APPLE_UART */
 
 /*****************************************************************************/
 
 #ifdef DOCKCHANNEL_UART
-#define DOCKCHANNEL_WR_MAX_STALL_US     (30*1000)
+#define DOCKCHANNEL_WR_MAX_STALL_US (30*1000)
 
 static vm_offset_t      dock_agent_base;
 static uint32_t         max_dockchannel_drain_period;
+static uint64_t         dockchannel_drain_deadline;  // Deadline for external agent to drain before a software drain occurs
 static bool             use_sw_drain;
 static uint32_t         dock_wstat_mask;
-static uint64_t         prev_dockchannel_drained_time;  // Last time we've seen the DockChannel drained by an external agent
 static uint64_t         prev_dockchannel_spaces;        // Previous w_stat level of the DockChannel.
 static uint64_t         dockchannel_stall_grace;
-static vm_offset_t      dockchannel_uart_base = 0;
+MARK_AS_HIBERNATE_DATA static bool     use_sw_drain;
+MARK_AS_HIBERNATE_DATA static uint32_t dock_wstat_mask;
+
+// forward reference
+static struct pe_serial_functions dockchannel_serial_functions;
 
 //=======================
 // Local funtions
@@ -537,7 +373,7 @@ dockchannel_drain_on_stall()
 	// Check if the DockChannel reader has stalled. If so, empty the DockChannel ourselves.
 	// Return number of bytes drained.
 
-	if ((mach_absolute_time() - prev_dockchannel_drained_time) >= dockchannel_stall_grace) {
+	if (mach_absolute_time() >= dockchannel_drain_deadline) {
 		// It's been more than DOCKCHANEL_WR_MAX_STALL_US and nobody read from the FIFO
 		// Drop a character.
 		(void)rDOCKCHANNELS_DOCK_RDATA1(DOCKCHANNEL_UART_CHANNEL);
@@ -547,49 +383,8 @@ dockchannel_drain_on_stall()
 	return 0;
 }
 
-static int
-dockchannel_uart_tr0(void)
-{
-	if (use_sw_drain) {
-		uint32_t spaces = rDOCKCHANNELS_DEV_WSTAT(DOCKCHANNEL_UART_CHANNEL) & dock_wstat_mask;
-		if (spaces > prev_dockchannel_spaces) {
-			// More spaces showed up. That can only mean someone read the FIFO.
-			// Note that if the DockFIFO is empty we cannot tell if someone is listening,
-			// we can only give them the benefit of the doubt.
-			prev_dockchannel_drained_time = mach_absolute_time();
-		}
-		prev_dockchannel_spaces = spaces;
-
-		return spaces || dockchannel_drain_on_stall();
-	} else {
-		// Returns spaces in dockchannel fifo
-		return rDOCKCHANNELS_DEV_WSTAT(DOCKCHANNEL_UART_CHANNEL) & dock_wstat_mask;
-	}
-}
-
 static void
-dockchannel_uart_td0(int c)
-{
-	rDOCKCHANNELS_DEV_WDATA1(DOCKCHANNEL_UART_CHANNEL) = (unsigned)(c & 0xff);
-	if (use_sw_drain) {
-		os_atomic_dec(&prev_dockchannel_spaces, relaxed); // After writing a byte we have one fewer space than previously expected.
-	}
-}
-
-static int
-dockchannel_uart_rr0(void)
-{
-	return rDOCKCHANNELS_DEV_RDATA0(DOCKCHANNEL_UART_CHANNEL) & 0x7f;
-}
-
-static int
-dockchannel_uart_rd0(void)
-{
-	return (int)((rDOCKCHANNELS_DEV_RDATA1(DOCKCHANNEL_UART_CHANNEL) >> 8) & 0xff);
-}
-
-static void
-dockchannel_uart_clear_intr(void)
+dockchannel_clear_intr(void)
 {
 	rDOCKCHANNELS_AGENT_AP_INTR_CTRL &= ~(0x3);
 	rDOCKCHANNELS_AGENT_AP_INTR_STATUS |= 0x3;
@@ -597,15 +392,88 @@ dockchannel_uart_clear_intr(void)
 	rDOCKCHANNELS_AGENT_AP_ERR_INTR_STATUS |= 0x3;
 }
 
+static bool
+dockchannel_disable_irq(void)
+{
+	const uint32_t ap_intr_ctrl = rDOCKCHANNELS_AGENT_AP_INTR_CTRL;
+	const bool irqs_were_enabled = ap_intr_ctrl & 0x1;
+	if (irqs_were_enabled) {
+		rDOCKCHANNELS_AGENT_AP_INTR_CTRL = ap_intr_ctrl & ~(0x1);
+	}
+	return irqs_were_enabled;
+}
+
 static void
-dockchannel_uart_init(void)
+dockchannel_enable_irq(void)
+{
+	// set interrupt to be when fifo has 255 empty
+	rDOCKCHANNELS_DEV_WR_WATERMARK(DOCKCHANNEL_UART_CHANNEL) = 0xFF;
+	rDOCKCHANNELS_AGENT_AP_INTR_CTRL |= 0x1;
+}
+
+static bool
+dockchannel_ack_irq(void)
+{
+	/* First check if the IRQ is for the kernel */
+	if (rDOCKCHANNELS_AGENT_AP_INTR_STATUS & 0x1) {
+		rDOCKCHANNELS_AGENT_AP_INTR_STATUS |= 0x1;
+		return true;
+	}
+	return false;
+}
+
+MARK_AS_HIBERNATE_TEXT static void
+dockchannel_transmit_data(uint8_t c)
+{
+	rDOCKCHANNELS_DEV_WDATA1(DOCKCHANNEL_UART_CHANNEL) = (unsigned)c;
+
+	if (use_sw_drain && !uart_hibernation) {
+		os_atomic_dec(&prev_dockchannel_spaces, relaxed); // After writing a byte we have one fewer space than previously expected.
+	}
+}
+
+static unsigned int
+dockchannel_receive_ready(void)
+{
+	return rDOCKCHANNELS_DEV_RDATA0(DOCKCHANNEL_UART_CHANNEL) & 0x7f;
+}
+
+static uint8_t
+dockchannel_receive_data(void)
+{
+	return (uint8_t)((rDOCKCHANNELS_DEV_RDATA1(DOCKCHANNEL_UART_CHANNEL) >> 8) & 0xff);
+}
+
+MARK_AS_HIBERNATE_TEXT static unsigned int
+dockchannel_transmit_ready(void)
+{
+	uint32_t spaces = rDOCKCHANNELS_DEV_WSTAT(DOCKCHANNEL_UART_CHANNEL) & dock_wstat_mask;
+
+	if (!uart_hibernation) {
+		if (use_sw_drain) {
+			if (spaces > prev_dockchannel_spaces) {
+				// More spaces showed up. That can only mean someone read the FIFO.
+				// Note that if the DockFIFO is empty we cannot tell if someone is listening,
+				// we can only give them the benefit of the doubt.
+				dockchannel_drain_deadline = mach_absolute_time() + dockchannel_stall_grace;
+			}
+			prev_dockchannel_spaces = spaces;
+			return spaces || dockchannel_drain_on_stall();
+		}
+	}
+
+	return spaces;
+}
+
+static void
+dockchannel_init(void)
 {
 	if (use_sw_drain) {
 		nanoseconds_to_absolutetime(DOCKCHANNEL_WR_MAX_STALL_US * NSEC_PER_USEC, &dockchannel_stall_grace);
 	}
 
 	// Clear all interrupt enable and status bits
-	dockchannel_uart_clear_intr();
+	dockchannel_clear_intr();
 
 	// Setup DRAIN timer
 	rDOCKCHANNELS_DEV_DRAIN_CFG(DOCKCHANNEL_UART_CHANNEL) = max_dockchannel_drain_period;
@@ -615,44 +483,48 @@ dockchannel_uart_init(void)
 	rDOCKCHANNELS_DOCK_RDATA1(DOCKCHANNEL_UART_CHANNEL);
 }
 
-SECURITY_READ_ONLY_LATE(static struct pe_serial_functions) dockchannel_uart_serial_functions =
+MARK_AS_HIBERNATE_DATA_CONST_LATE
+static struct pe_serial_functions dockchannel_serial_functions =
 {
-	.uart_init = dockchannel_uart_init,
-	.uart_set_baud_rate = NULL,
-	.tr0 = dockchannel_uart_tr0,
-	.td0 = dockchannel_uart_td0,
-	.rr0 = dockchannel_uart_rr0,
-	.rd0 = dockchannel_uart_rd0
+	.init = dockchannel_init,
+	.transmit_ready = dockchannel_transmit_ready,
+	.transmit_data = dockchannel_transmit_data,
+	.receive_ready = dockchannel_receive_ready,
+	.receive_data = dockchannel_receive_data,
+	.enable_irq = dockchannel_enable_irq,
+	.disable_irq = dockchannel_disable_irq,
+	.acknowledge_irq = dockchannel_ack_irq,
+	.device = SERIAL_DOCKCHANNEL
 };
 
 #endif /* DOCKCHANNEL_UART */
 
 /****************************************************************************/
-#ifdef  PI3_UART
-static vm_offset_t pi3_gpio_base_vaddr = 0;
-static vm_offset_t pi3_aux_base_vaddr = 0;
-static int
+#ifdef PI3_UART
+vm_offset_t pi3_gpio_base_vaddr = 0;
+vm_offset_t pi3_aux_base_vaddr = 0;
+static unsigned int
 pi3_uart_tr0(void)
 {
-	return (int) BCM2837_GET32(BCM2837_AUX_MU_LSR_REG_V) & 0x20;
+	return (unsigned int) BCM2837_GET32(BCM2837_AUX_MU_LSR_REG_V) & 0x20;
 }
 
 static void
-pi3_uart_td0(int c)
+pi3_uart_td0(uint8_t c)
 {
 	BCM2837_PUT32(BCM2837_AUX_MU_IO_REG_V, (uint32_t) c);
 }
 
-static int
+static unsigned int
 pi3_uart_rr0(void)
 {
-	return (int) BCM2837_GET32(BCM2837_AUX_MU_LSR_REG_V) & 0x01;
+	return (unsigned int) BCM2837_GET32(BCM2837_AUX_MU_LSR_REG_V) & 0x01;
 }
 
-static int
+static uint8_t
 pi3_uart_rd0(void)
 {
-	return (int) BCM2837_GET32(BCM2837_AUX_MU_IO_REG_V) & 0xff;
+	return (uint8_t) BCM2837_GET32(BCM2837_AUX_MU_IO_REG_V);
 }
 
 static void
@@ -707,12 +579,12 @@ pi3_uart_init(void)
 
 SECURITY_READ_ONLY_LATE(static struct pe_serial_functions) pi3_uart_serial_functions =
 {
-	.uart_init = pi3_uart_init,
-	.uart_set_baud_rate = NULL,
-	.tr0 = pi3_uart_tr0,
-	.td0 = pi3_uart_td0,
-	.rr0 = pi3_uart_rr0,
-	.rd0 = pi3_uart_rd0
+	.init = pi3_uart_init,
+	.transmit_ready = pi3_uart_tr0,
+	.transmit_data = pi3_uart_td0,
+	.receive_ready = pi3_uart_rr0,
+	.receive_data = pi3_uart_rd0,
+	.device = SERIAL_PI3_UART
 };
 
 #endif /* PI3_UART */
@@ -748,28 +620,28 @@ static vm_offset_t vmapple_uart0_base_vaddr = 0;
 #define VMAPPLE_UART0_TIMSC      *((volatile uint32_t *) (vmapple_uart0_base_vaddr + 0x38))
 #define VMAPPLE_UART0_ICR        *((volatile uint32_t *) (vmapple_uart0_base_vaddr + 0x44))
 
-static int
+static unsigned int
 vmapple_uart_transmit_ready(void)
 {
-	return (int) !(VMAPPLE_UART0_FR & 0x20);
+	return (unsigned int) !(VMAPPLE_UART0_FR & 0x20);
 }
 
 static void
-vmapple_uart_transmit_data(int c)
+vmapple_uart_transmit_data(uint8_t c)
 {
 	VMAPPLE_UART0_DR = (uint32_t) c;
 }
 
-static int
+static unsigned int
 vmapple_uart_receive_ready(void)
 {
-	return (int) !(VMAPPLE_UART0_FR & 0x10);
+	return (unsigned int) !(VMAPPLE_UART0_FR & 0x10);
 }
 
-static int
+static uint8_t
 vmapple_uart_receive_data(void)
 {
-	return (int) (VMAPPLE_UART0_DR & 0xff);
+	return (uint8_t) (VMAPPLE_UART0_DR & 0xff);
 }
 
 static void
@@ -797,17 +669,26 @@ vmapple_uart_init(void)
 
 SECURITY_READ_ONLY_LATE(static struct pe_serial_functions) vmapple_uart_serial_functions =
 {
-	.uart_init = vmapple_uart_init,
-	.uart_set_baud_rate = NULL,
-	.tr0 = vmapple_uart_transmit_ready,
-	.td0 = vmapple_uart_transmit_data,
-	.rr0 = vmapple_uart_receive_ready,
-	.rd0 = vmapple_uart_receive_data
+	.init = vmapple_uart_init,
+	.transmit_ready = vmapple_uart_transmit_ready,
+	.transmit_data = vmapple_uart_transmit_data,
+	.receive_ready = vmapple_uart_receive_ready,
+	.receive_data = vmapple_uart_receive_data,
+	.device = SERIAL_VMAPPLE_UART
 };
 
 #endif /* VMAPPLE_UART */
 
 /*****************************************************************************/
+
+/**
+ * Output @str onto every registered serial interface by polling.
+ *
+ * @param str The stringto output.
+ */
+static void uart_sends_force_poll(
+	const char *str
+	);
 
 static void
 register_serial_functions(struct pe_serial_functions *fns)
@@ -815,6 +696,47 @@ register_serial_functions(struct pe_serial_functions *fns)
 	fns->next = gPESF;
 	gPESF = fns;
 }
+
+#if HIBERNATION
+/**
+ * Transitions the serial driver into a mode that can be run in the hibernation
+ * resume context. In this mode, the serial driver runs at a barebones level
+ * without making sure the serial devices are properly initialized or utilizing
+ * features such as the software drain timer for dockchannels.
+ *
+ * Upon the next call to serial_init (once the hibernation image has been
+ * loaded), this mode is exited and we return to the normal operation of the
+ * driver.
+ */
+MARK_AS_HIBERNATE_TEXT void
+serial_hibernation_init(void)
+{
+	uart_hibernation = true;
+#if defined(APPLE_UART)
+	apple_uart_registers = (apple_uart_registers_t *)gHibernateGlobals.hibUartRegPhysBase;
+#endif /* defined(APPLE_UART) */
+#if defined(DOCKCHANNEL_UART)
+	dockchannel_uart_base = gHibernateGlobals.dockChannelRegPhysBase;
+#endif /* defined(DOCKCHANNEL_UART) */
+}
+
+/**
+ * Transitions the serial driver back to non-hibernation mode so it can resume
+ * normal operations. Should only be called from serial_init on a hibernation
+ * resume.
+ */
+MARK_AS_HIBERNATE_TEXT static void
+serial_hibernation_cleanup(void)
+{
+	uart_hibernation = false;
+#if defined(APPLE_UART)
+	apple_uart_registers = (apple_uart_registers_t *)gHibernateGlobals.hibUartRegVirtBase;
+#endif /* defined(APPLE_UART) */
+#if defined(DOCKCHANNEL_UART)
+	dockchannel_uart_base = gHibernateGlobals.dockChannelRegVirtBase;
+#endif /* defined(DOCKCHANNEL_UART) */
+}
+#endif /* HIBERNATION */
 
 int
 serial_init(void)
@@ -824,36 +746,36 @@ serial_init(void)
 	vm_offset_t     soc_base;
 	uintptr_t const *reg_prop;
 	uint32_t const  *prop_value __unused = NULL;
-	char const      *serial_compat __unused = 0;
-	uint32_t        dccmode;
 
 	struct pe_serial_functions *fns = gPESF;
 
+	/**
+	 * Even if the serial devices have already been initialized on cold boot,
+	 * when coming out of a sleep/wake, they'll need to be re-initialized. Since
+	 * the uart_initted value is kept across a sleep/wake, always re-initialize
+	 * to be safe.
+	 */
 	if (uart_initted) {
+#if HIBERNATION
+		if (uart_hibernation) {
+			serial_hibernation_cleanup();
+		}
+#endif /* HIBERNATION */
 		while (fns != NULL) {
-			fns->uart_init();
+			fns->init();
 			fns = fns->next;
 		}
-		kprintf("reinit serial\n");
+
 		return 1;
 	}
-
-	dccmode = 0;
-	if (PE_parse_boot_argn("dcc", &dccmode, sizeof(dccmode))) {
-		register_serial_functions(&dcc_serial_functions);
-	}
-#ifdef SHMCON
-	uint32_t jconmode = 0;
-	if (PE_parse_boot_argn("jcon", &jconmode, sizeof jconmode)) {
-		register_serial_functions(&shmcon_serial_functions);
-	}
-#endif /* SHMCON */
 
 	soc_base = pe_arm_get_soc_base_phys();
 
 	if (soc_base == 0) {
 		return 0;
 	}
+
+	PE_parse_boot_argn("disable-uart-irq", &disable_uart_irq, sizeof(disable_uart_irq));
 
 #ifdef PI3_UART
 	if (SecureDTFindEntry("name", "gpio", &entryP) == kSuccess) {
@@ -893,7 +815,7 @@ serial_init(void)
 		PE_parse_boot_argn("no-dockfifo-uart", &no_dockchannel_uart, sizeof(no_dockchannel_uart));
 		// Keep the old name for boot-arg
 		if (no_dockchannel_uart == 0) {
-			register_serial_functions(&dockchannel_uart_serial_functions);
+			register_serial_functions(&dockchannel_serial_functions);
 			SecureDTGetProperty(entryP, "max-aop-clk", (void const **)&prop_value, &prop_size);
 			max_dockchannel_drain_period = (uint32_t)((prop_value)?  (*prop_value * 0.03) : DOCKCHANNEL_DRAIN_PERIOD);
 			prop_value = NULL;
@@ -902,8 +824,17 @@ serial_init(void)
 			prop_value = NULL;
 			SecureDTGetProperty(entryP, "dock-wstat-mask", (void const **)&prop_value, &prop_size);
 			dock_wstat_mask = (prop_value)?  *prop_value : 0x1ff;
+			prop_value = NULL;
+			SecureDTGetProperty(entryP, "interrupts", (void const **)&prop_value, &prop_size);
+			if (prop_value) {
+				dockchannel_serial_functions.has_irq = true;
+			}
+
+			/* Set sane defaults for dockchannel globals. */
+			prev_dockchannel_spaces = rDOCKCHANNELS_DEV_WSTAT(DOCKCHANNEL_UART_CHANNEL) & dock_wstat_mask;
+			dockchannel_drain_deadline = mach_absolute_time() + dockchannel_stall_grace;
 		} else {
-			dockchannel_uart_clear_intr();
+			dockchannel_clear_intr();
 		}
 		// If no dockchannel-uart is found in the device tree, fall back
 		// to looking for the traditional UART serial console.
@@ -911,37 +842,32 @@ serial_init(void)
 
 #endif /* DOCKCHANNEL_UART */
 
+#ifdef APPLE_UART
+	char const *serial_compat = 0;
+	uint32_t use_legacy_uart = 0;
+
+	/* Check if we should enable this deprecated serial device. */
+	PE_parse_boot_argn("use-legacy-uart", &use_legacy_uart, sizeof(use_legacy_uart));
+
 	/*
 	 * The boot serial port should have a property named "boot-console".
 	 * If we don't find it there, look for "uart0" and "uart1".
 	 */
-
 	if (SecureDTFindEntry("boot-console", NULL, &entryP) == kSuccess) {
 		SecureDTGetProperty(entryP, "reg", (void const **)&reg_prop, &prop_size);
-		uart_base = ml_io_map(soc_base + *reg_prop, *(reg_prop + 1));
-		if (serial_compat == 0) {
-			SecureDTGetProperty(entryP, "compatible", (void const **)&serial_compat, &prop_size);
-		}
+		apple_uart_registers = (apple_uart_registers_t *)ml_io_map(soc_base + *reg_prop, *(reg_prop + 1));
+		SecureDTGetProperty(entryP, "compatible", (void const **)&serial_compat, &prop_size);
 	} else if (SecureDTFindEntry("name", "uart0", &entryP) == kSuccess) {
 		SecureDTGetProperty(entryP, "reg", (void const **)&reg_prop, &prop_size);
-		uart_base = ml_io_map(soc_base + *reg_prop, *(reg_prop + 1));
-		if (serial_compat == 0) {
-			SecureDTGetProperty(entryP, "compatible", (void const **)&serial_compat, &prop_size);
-		}
+		apple_uart_registers = (apple_uart_registers_t *)ml_io_map(soc_base + *reg_prop, *(reg_prop + 1));
+		SecureDTGetProperty(entryP, "compatible", (void const **)&serial_compat, &prop_size);
 	} else if (SecureDTFindEntry("name", "uart1", &entryP) == kSuccess) {
 		SecureDTGetProperty(entryP, "reg", (void const **)&reg_prop, &prop_size);
-		uart_base = ml_io_map(soc_base + *reg_prop, *(reg_prop + 1));
-		if (serial_compat == 0) {
-			SecureDTGetProperty(entryP, "compatible", (void const **)&serial_compat, &prop_size);
-		}
+		apple_uart_registers = (apple_uart_registers_t *)ml_io_map(soc_base + *reg_prop, *(reg_prop + 1));
+		SecureDTGetProperty(entryP, "compatible", (void const **)&serial_compat, &prop_size);
 	}
-#ifdef  S3CUART
-	if (NULL != entryP) {
-		SecureDTGetProperty(entryP, "pclk", (void const **)&prop_value, &prop_size);
-		if (prop_value) {
-			dt_pclk = *prop_value;
-		}
 
+	if (NULL != entryP) {
 		prop_value = NULL;
 		SecureDTGetProperty(entryP, "sampling", (void const **)&prop_value, &prop_size);
 		if (prop_value) {
@@ -953,20 +879,23 @@ serial_init(void)
 		if (prop_value) {
 			dt_ubrdiv = *prop_value;
 		}
-	}
 
-	if (serial_compat) {
-		if (!strcmp(serial_compat, "uart,16550")) {
-			register_serial_functions(&ln2410_serial_functions);
-		} else if (!strcmp(serial_compat, "uart-16550")) {
-			register_serial_functions(&ln2410_serial_functions);
-		} else if (!strcmp(serial_compat, "uart,s5i3000")) {
-			register_serial_functions(&ln2410_serial_functions);
-		} else if (!strcmp(serial_compat, "uart-1,samsung")) {
-			register_serial_functions(&ln2410_serial_functions);
+		SecureDTGetProperty(entryP, "interrupts", (void const **)&prop_value, &prop_size);
+		if (prop_value) {
+			apple_serial_functions.has_irq = true;
+		}
+
+		/* Workaround to enable legacy serial for fastsim targets until clients migrate to dockchannels. */
+		SecureDTGetProperty(entryP, "enable-legacy-serial", (void const **)&prop_value, &prop_size);
+		if (prop_value) {
+			use_legacy_uart = 1;
 		}
 	}
-#endif /* S3CUART */
+
+	if (use_legacy_uart && serial_compat && !strcmp(serial_compat, "uart-1,samsung")) {
+		register_serial_functions(&apple_serial_functions);
+	}
+#endif /* APPLE_UART */
 
 	if (gPESF == NULL) {
 		return 0;
@@ -974,51 +903,287 @@ serial_init(void)
 
 	fns = gPESF;
 	while (fns != NULL) {
-		fns->uart_init();
+		serial_do_transmit = 1;
+		fns->init();
+		if (fns->has_irq) {
+			serial_irq_status |= fns->device; // serial_device_t is one-hot
+		}
 		fns = fns->next;
 	}
 
 #if HIBERNATION
 	/* hibernation needs to know the UART register addresses since it can't directly use this serial driver */
 	if (dockchannel_uart_base) {
-		gHibernateGlobals.dockChannelRegBase = ml_vtophys(dockchannel_uart_base);
+		gHibernateGlobals.dockChannelRegPhysBase = ml_vtophys(dockchannel_uart_base);
+		gHibernateGlobals.dockChannelRegVirtBase = dockchannel_uart_base;
 		gHibernateGlobals.dockChannelWstatMask = dock_wstat_mask;
 	}
-	if (uart_base) {
-		gHibernateGlobals.hibUartRegBase = ml_vtophys(uart_base);
+	if (apple_uart_registers) {
+		gHibernateGlobals.hibUartRegPhysBase = ml_vtophys((vm_offset_t)apple_uart_registers);
+		gHibernateGlobals.hibUartRegVirtBase = (vm_offset_t)apple_uart_registers;
 	}
 #endif /* HIBERNATION */
 
-	uart_initted = 1;
-
+	/* Complete. */
+	uart_initted = true;
 	return 1;
 }
 
+/**
+ * Forbid or allow transmission over each serial until they receive data.
+ */
 void
-uart_putc(char c)
+serial_set_on_demand(bool on_demand)
+{
+	/* Enable or disable transmission. */
+	serial_do_transmit = !on_demand;
+
+	/* If on-demand is enabled, report it. */
+	if (on_demand) {
+		uart_sends_force_poll(
+			"On-demand serial mode selected.\n"
+			"Waiting for user input to send logs.\n"
+			);
+	}
+}
+
+/**
+ * Returns a deadline for the longest time the serial driver should wait for an
+ * interrupt for. This serves as a timeout for the IRQ to allow for the software
+ * drain timer that dockchannels supports.
+ *
+ * @param fns serial functions representing the device to find the deadline for
+ *
+ * @returns absolutetime deadline for this device's IRQ.
+ */
+static uint64_t
+serial_interrupt_deadline(__unused struct pe_serial_functions *fns)
+{
+#if defined(DOCKCHANNEL_UART)
+	if (fns->device == SERIAL_DOCKCHANNEL && use_sw_drain) {
+		return dockchannel_drain_deadline;
+	}
+#endif
+
+	/**
+	 *  Default to 1.5ms for all other devices. 1.5ms was chosen as the baudrate
+	 * of the AppleSerialDevice is 115200, meaning that it should only take
+	 * ~1.5ms to drain the 16 character buffer completely.
+	 */
+	uint64_t timeout_interval;
+	nanoseconds_to_absolutetime(1500 * NSEC_PER_USEC, &timeout_interval);
+	return mach_absolute_time() + timeout_interval;
+}
+
+/**
+ * Goes to sleep waiting for an interrupt from a specificed serial device.
+ *
+ * @param fns serial functions representing the device to wait for
+ */
+static void
+serial_wait_for_interrupt(struct pe_serial_functions *fns)
+{
+	assert_wait_deadline(fns, THREAD_UNINT, serial_interrupt_deadline(fns));
+	if (!fns->transmit_ready()) {
+		fns->enable_irq();
+		thread_block(THREAD_CONTINUE_NULL);
+	} else {
+		clear_wait(current_thread(), THREAD_AWAKENED);
+	}
+}
+
+/**
+ * Output a character onto every registered serial interface.
+ *
+ * @param c The character to output.
+ * @param poll Whether the driver should poll to send the character or if it can
+ *             wait for an interrupt.
+ * @param force : send even if transmission is disabled on the serial.
+ */
+MARK_AS_HIBERNATE_TEXT void
+static
+uart_putc_options_(char c, bool poll, bool force)
 {
 	struct pe_serial_functions *fns = gPESF;
+
 	while (fns != NULL) {
-		while (!fns->tr0()) {
-#if __arm64__                           /* on arm64, we have a WFE timeout, so no need to hot-poll here */
-			__builtin_arm_wfe()
-#endif
-			;               /* Wait until THR is empty. */
+		if (force || serial_do_transmit) {
+			while (!fns->transmit_ready()) {
+				if (!uart_hibernation) {
+					if (!poll && irq_available_and_ready(fns)) {
+						serial_wait_for_interrupt(fns);
+					} else {
+						serial_poll();
+					}
+				}
+			}
+			fns->transmit_data((uint8_t)c);
 		}
-		fns->td0(c);
 		fns = fns->next;
 	}
 }
 
+/**
+ * Output a character onto every registered serial interface whose
+ * transmission is enabled..
+ *
+ * @param c The character to output.
+ * @param poll Whether the driver should poll to send the character or if it can
+ *             wait for an interrupt
+ */
+MARK_AS_HIBERNATE_TEXT void
+uart_putc_options(char c, bool poll)
+{
+	uart_putc_options_(c, poll, 0);
+}
+
+/**
+ * Output a character onto every registered serial interface whose
+ * transmission is enabled by polling.
+ *
+ * @param c The character to output.
+ */
+void
+uart_putc(char c)
+{
+	uart_putc_options(c, true);
+}
+
+/**
+ * Output @str onto every registered serial interface by polling.
+ *
+ * @param str The stringto output.
+ */
+static void
+uart_sends_force_poll(
+	const char *str)
+{
+	char c;
+	while ((c = *(str++))) {
+		uart_putc_options_(c, true, true);
+	}
+}
+
+/**
+ * Read a character from the first registered serial interface that has data
+ * available.
+ *
+ * @return The character if any interfaces have data available, otherwise -1.
+ */
 int
 uart_getc(void)
-{                               /* returns -1 if no data available */
+{
 	struct pe_serial_functions *fns = gPESF;
 	while (fns != NULL) {
-		if (fns->rr0()) {
-			return fns->rd0();
+		if (fns->receive_ready()) {
+			serial_do_transmit = 1;
+			return (int)fns->receive_data();
 		}
 		fns = fns->next;
 	}
 	return -1;
+}
+
+/**
+ * Enables IRQs for a specific serial device and returns whether or not IRQs for
+ * that device where enabled successfully. For a serial driver to have irqs
+ * enabled, it must have the enable_irq, disable_irq, and acknowledge_irq
+ * functions defined and the has_irq flag set.
+ *
+ * @param device Serial device to enable irqs on
+ * @note This function should only be called from the AppleSerialShim kext
+ */
+kern_return_t
+serial_irq_enable(serial_device_t device)
+{
+	struct pe_serial_functions *fns = get_serial_functions(device);
+
+	if (!fns || !fns->has_irq || disable_uart_irq) {
+		return KERN_FAILURE;
+	}
+
+	serial_irq_status &= ~device;
+
+	return KERN_SUCCESS;
+}
+
+/**
+ * Performs any actions needed to handle this IRQ. Wakes up the thread waiting
+ * on the interrupt if one exists.
+ *
+ * @param device Serial device that generated the IRQ.
+ * @note Interrupts will have already been cleared and disabled by serial_irq_filter.
+ * @note This function should only be called from the AppleSerialShim kext.
+ */
+kern_return_t
+serial_irq_action(serial_device_t device)
+{
+	struct pe_serial_functions *fns = get_serial_functions(device);
+
+	if (!fns || !fns->has_irq) {
+		return KERN_FAILURE;
+	}
+
+	/**
+	 * Because IRQs are enabled only when we know a thread is about to sleep, we
+	 * can call wake up and reasonably expect there to be a thread waiting.
+	 */
+	thread_wakeup(fns);
+
+	return KERN_SUCCESS;
+}
+
+/**
+ * Returns true if the pending IRQ for device is one that can be handled by the
+ * platform serial driver.
+ *
+ * @param device Serial device that generated the IRQ.
+ * @note This function is called from a primary interrupt context and should be
+ *       kept lightweight.
+ * @note This function should only be called from the AppleSerialShim kext
+ */
+bool
+serial_irq_filter(serial_device_t device)
+{
+	struct pe_serial_functions *fns = get_serial_functions(device);
+
+	if (!fns || !fns->has_irq) {
+		return false;
+	}
+
+	/**
+	 * Disable IRQs until next time a thread waits for an interrupt to prevent an interrupt storm.
+	 */
+	const bool had_irqs_enabled = fns->disable_irq();
+	const bool was_our_interrupt = fns->acknowledge_irq();
+
+	/* Re-enable IRQs if the interrupt wasn't for us. */
+	if (had_irqs_enabled && !was_our_interrupt) {
+		fns->enable_irq();
+	}
+
+	return was_our_interrupt;
+}
+
+/**
+ * Prepares all serial devices to go to sleep by draining the hardware FIFOs
+ * and disabling interrupts.
+ */
+void
+serial_go_to_sleep(void)
+{
+	struct pe_serial_functions *fns = gPESF;
+	while (fns != NULL) {
+		if (irq_available_and_ready(fns)) {
+			fns->disable_irq();
+		}
+		fns = fns->next;
+	}
+
+#ifdef APPLE_UART
+	/* APPLE_UART needs to drain FIFO before sleeping */
+	if (get_serial_functions(SERIAL_APPLE_UART)) {
+		apple_uart_drain_fifo();
+	}
+#endif /* APPLE_UART */
 }

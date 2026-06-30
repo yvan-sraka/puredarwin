@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2000-2020 Apple Inc. All rights reserved.
+ * Copyright (c) 2000-2021 Apple Inc. All rights reserved.
  *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
  *
@@ -131,7 +131,7 @@ static int in_ifinit(struct ifnet *, struct in_ifaddr *,
 static void in_iahash_remove(struct in_ifaddr *);
 static void in_iahash_insert(struct in_ifaddr *);
 static void in_iahash_insert_ptp(struct in_ifaddr *);
-static struct in_ifaddr *in_ifaddr_alloc(int);
+static struct in_ifaddr *in_ifaddr_alloc(zalloc_flags_t);
 static void in_ifaddr_attached(struct ifaddr *);
 static void in_ifaddr_detached(struct ifaddr *);
 static void in_ifaddr_free(struct ifaddr *);
@@ -193,21 +193,16 @@ struct in_ifaddr_dbg {
 
 /* List of trash in_ifaddr entries protected by inifa_trash_lock */
 static TAILQ_HEAD(, in_ifaddr_dbg) inifa_trash_head;
-static decl_lck_mtx_data(, inifa_trash_lock);
+static LCK_MTX_DECLARE_ATTR(inifa_trash_lock, &ifa_mtx_grp, &ifa_mtx_attr);
 
 #if DEBUG
-static unsigned int inifa_debug = 1;            /* debugging (enabled) */
+static TUNABLE(bool, inifa_debug, "ifa_debug", true); /* debugging (enabled) */
 #else
-static unsigned int inifa_debug;                /* debugging (disabled) */
+static TUNABLE(bool, inifa_debug, "ifa_debug", false); /* debugging (disabled) */
 #endif /* !DEBUG */
-static unsigned int inifa_size;                 /* size of zone element */
 static struct zone *inifa_zone;                 /* zone for in_ifaddr */
 
 #define INIFA_ZONE_NAME         "in_ifaddr"     /* zone name */
-
-static const unsigned int in_extra_size = sizeof(struct in_ifextra);
-static const unsigned int in_extra_bufsize = in_extra_size +
-    sizeof(void *) + sizeof(uint64_t);
 
 /*
  * Return 1 if the address is
@@ -268,31 +263,31 @@ in_localaddr(struct in_addr in)
 	}
 
 	if (subnetsarelocal) {
-		lck_rw_lock_shared(in_ifaddr_rwlock);
+		lck_rw_lock_shared(&in_ifaddr_rwlock);
 		for (ia = in_ifaddrhead.tqh_first; ia != NULL;
 		    ia = ia->ia_link.tqe_next) {
 			IFA_LOCK(&ia->ia_ifa);
 			if ((i & ia->ia_netmask) == ia->ia_net) {
 				IFA_UNLOCK(&ia->ia_ifa);
-				lck_rw_done(in_ifaddr_rwlock);
+				lck_rw_done(&in_ifaddr_rwlock);
 				return 1;
 			}
 			IFA_UNLOCK(&ia->ia_ifa);
 		}
-		lck_rw_done(in_ifaddr_rwlock);
+		lck_rw_done(&in_ifaddr_rwlock);
 	} else {
-		lck_rw_lock_shared(in_ifaddr_rwlock);
+		lck_rw_lock_shared(&in_ifaddr_rwlock);
 		for (ia = in_ifaddrhead.tqh_first; ia != NULL;
 		    ia = ia->ia_link.tqe_next) {
 			IFA_LOCK(&ia->ia_ifa);
 			if ((i & ia->ia_subnetmask) == ia->ia_subnet) {
 				IFA_UNLOCK(&ia->ia_ifa);
-				lck_rw_done(in_ifaddr_rwlock);
+				lck_rw_done(&in_ifaddr_rwlock);
 				return 1;
 			}
 			IFA_UNLOCK(&ia->ia_ifa);
 		}
-		lck_rw_done(in_ifaddr_rwlock);
+		lck_rw_done(&in_ifaddr_rwlock);
 	}
 	return 0;
 }
@@ -343,51 +338,32 @@ static int in_interfaces;       /* number of external internet interfaces */
 static int
 in_domifattach(struct ifnet *ifp)
 {
-	int error;
+	int error = 0;
 
 	VERIFY(ifp != NULL);
 
 	if ((error = proto_plumb(PF_INET, ifp)) && error != EEXIST) {
 		log(LOG_ERR, "%s: proto_plumb returned %d if=%s\n",
 		    __func__, error, if_name(ifp));
-	} else if (error == 0 && ifp->if_inetdata == NULL) {
-		void **pbuf, *base;
-		struct in_ifextra *ext;
-		int errorx;
-
-		if ((ext = (struct in_ifextra *)_MALLOC(in_extra_bufsize,
-		    M_IFADDR, M_WAITOK | M_ZERO)) == NULL) {
-			error = ENOMEM;
-			errorx = proto_unplumb(PF_INET, ifp);
-			if (errorx != 0) {
-				log(LOG_ERR,
-				    "%s: proto_unplumb returned %d if=%s%d\n",
-				    __func__, errorx, ifp->if_name,
-				    ifp->if_unit);
-			}
-			goto done;
-		}
-
-		/* Align on 64-bit boundary */
-		base = (void *)P2ROUNDUP((intptr_t)ext + sizeof(uint64_t),
-		    sizeof(uint64_t));
-		VERIFY(((intptr_t)base + in_extra_size) <=
-		    ((intptr_t)ext + in_extra_bufsize));
-		pbuf = (void **)((intptr_t)base - sizeof(void *));
-		*pbuf = ext;
-		ifp->if_inetdata = base;
-		IN_IFEXTRA(ifp)->ii_llt = in_lltattach(ifp);
-		VERIFY(IS_P2ALIGNED(ifp->if_inetdata, sizeof(uint64_t)));
+		return error;
 	}
-done:
-	if (error == 0 && ifp->if_inetdata != NULL) {
+
+	if (ifp->if_inetdata == NULL) {
+		ifp->if_inetdata = zalloc_permanent_type(struct in_ifextra);
+		IN_IFEXTRA(ifp)->ii_llt = in_lltattach(ifp);
+		error = 0;
+	} else if (error != EEXIST) {
 		/*
 		 * Since the structure is never freed, we need to
 		 * zero out its contents to avoid reusing stale data.
 		 * A little redundant with allocation above, but it
 		 * keeps the code simpler for all cases.
 		 */
-		bzero(ifp->if_inetdata, in_extra_size);
+		IN_IFEXTRA(ifp)->netsig_len = 0;
+		bzero(IN_IFEXTRA(ifp)->netsig, sizeof(IN_IFEXTRA(ifp)->netsig));
+		if (LLTABLE(ifp)) {
+			lltable_purge(LLTABLE(ifp));
+		}
 	}
 	return error;
 }
@@ -829,7 +805,7 @@ inctl_ifaddr(struct ifnet *ifp, struct in_ifaddr *ia, u_long cmd,
 		ev_msg.dv[1].data_length = 0;
 
 		ifa = &ia->ia_ifa;
-		lck_rw_lock_exclusive(in_ifaddr_rwlock);
+		lck_rw_lock_exclusive(&in_ifaddr_rwlock);
 		/* Release ia_link reference */
 		IFA_REMREF(ifa);
 		TAILQ_REMOVE(&in_ifaddrhead, ia, ia_link);
@@ -838,7 +814,7 @@ inctl_ifaddr(struct ifnet *ifp, struct in_ifaddr *ia, u_long cmd,
 			in_iahash_remove(ia);
 		}
 		IFA_UNLOCK(ifa);
-		lck_rw_done(in_ifaddr_rwlock);
+		lck_rw_done(&in_ifaddr_rwlock);
 
 		/*
 		 * in_ifscrub kills the interface route.
@@ -1019,12 +995,12 @@ inctl_ifdstaddr(struct ifnet *ifp, struct in_ifaddr *ia, u_long cmd,
 		if (ia->ia_flags & IFA_ROUTE) {
 			ia->ia_ifa.ifa_dstaddr = (struct sockaddr *)&dstaddr;
 			IFA_UNLOCK(&ia->ia_ifa);
-			rtinit_locked(&(ia->ia_ifa), (int)RTM_DELETE, RTF_HOST);
+			rtinit_locked(&(ia->ia_ifa), RTM_DELETE, RTF_HOST);
 			IFA_LOCK(&ia->ia_ifa);
 			ia->ia_ifa.ifa_dstaddr =
 			    (struct sockaddr *)&ia->ia_dstaddr;
 			IFA_UNLOCK(&ia->ia_ifa);
-			rtinit_locked(&(ia->ia_ifa), (int)RTM_ADD,
+			rtinit_locked(&(ia->ia_ifa), RTM_ADD,
 			    RTF_HOST | RTF_UP);
 		} else {
 			IFA_UNLOCK(&ia->ia_ifa);
@@ -1369,7 +1345,7 @@ in_control(struct socket *so, u_long cmd, caddr_t data, struct ifnet *ifp,
 		 * therefore requires IFA_REMREF.  Jump to "done" label
 		 * instead of calling return if "ia" is valid.
 		 */
-		lck_rw_lock_shared(in_ifaddr_rwlock);
+		lck_rw_lock_shared(&in_ifaddr_rwlock);
 		TAILQ_FOREACH(iap, INADDR_HASH(sa->sin_addr.s_addr), ia_hash) {
 			IFA_LOCK(&iap->ia_ifa);
 			if (iap->ia_ifp == ifp &&
@@ -1382,7 +1358,7 @@ in_control(struct socket *so, u_long cmd, caddr_t data, struct ifnet *ifp,
 			}
 			IFA_UNLOCK(&iap->ia_ifa);
 		}
-		lck_rw_done(in_ifaddr_rwlock);
+		lck_rw_done(&in_ifaddr_rwlock);
 
 		if (ia == NULL) {
 			ifnet_lock_shared(ifp);
@@ -1429,7 +1405,7 @@ in_control(struct socket *so, u_long cmd, caddr_t data, struct ifnet *ifp,
 		if (addr.sin_family == AF_INET) {
 			struct in_ifaddr *oia;
 
-			lck_rw_lock_shared(in_ifaddr_rwlock);
+			lck_rw_lock_shared(&in_ifaddr_rwlock);
 			for (oia = ia; ia; ia = ia->ia_link.tqe_next) {
 				IFA_LOCK(&ia->ia_ifa);
 				if (ia->ia_ifp == ifp &&
@@ -1441,7 +1417,7 @@ in_control(struct socket *so, u_long cmd, caddr_t data, struct ifnet *ifp,
 				}
 				IFA_UNLOCK(&ia->ia_ifa);
 			}
-			lck_rw_done(in_ifaddr_rwlock);
+			lck_rw_done(&in_ifaddr_rwlock);
 			if (oia != NULL) {
 				IFA_REMREF(&oia->ia_ifa);
 			}
@@ -1508,8 +1484,17 @@ in_control(struct socket *so, u_long cmd, caddr_t data, struct ifnet *ifp,
 			error = EINVAL;
 			goto done;
 		}
+
+		if ((cmd == SIOCAIFADDR || cmd == SIOCSIFADDR) &&
+		    (IN_MULTICAST(ntohl(addr.sin_addr.s_addr)) ||
+		    addr.sin_addr.s_addr == INADDR_BROADCAST ||
+		    addr.sin_addr.s_addr == INADDR_ANY)) {
+			error = EINVAL;
+			goto done;
+		}
+
 		if (ia == NULL) {
-			ia = in_ifaddr_alloc(M_WAITOK);
+			ia = in_ifaddr_alloc(Z_WAITOK);
 			if (ia == NULL) {
 				error = ENOBUFS;
 				goto done;
@@ -1545,11 +1530,11 @@ in_control(struct socket *so, u_long cmd, caddr_t data, struct ifnet *ifp,
 			}
 			IFA_UNLOCK(ifa);
 			ifnet_lock_done(ifp);
-			lck_rw_lock_exclusive(in_ifaddr_rwlock);
+			lck_rw_lock_exclusive(&in_ifaddr_rwlock);
 			/* Hold a reference for ia_link */
 			IFA_ADDREF(ifa);
 			TAILQ_INSERT_TAIL(&in_ifaddrhead, ia, ia_link);
-			lck_rw_done(in_ifaddr_rwlock);
+			lck_rw_done(&in_ifaddr_rwlock);
 			/* discard error */
 			(void) in_domifattach(ifp);
 			error = 0;
@@ -1621,9 +1606,9 @@ in_ifscrub(struct ifnet *ifp, struct in_ifaddr *ia, int locked)
 		lck_mtx_lock(rnh_lock);
 	}
 	if (ifp->if_flags & (IFF_LOOPBACK | IFF_POINTOPOINT)) {
-		rtinit_locked(&(ia->ia_ifa), (int)RTM_DELETE, RTF_HOST);
+		rtinit_locked(&(ia->ia_ifa), RTM_DELETE, RTF_HOST);
 	} else {
-		rtinit_locked(&(ia->ia_ifa), (int)RTM_DELETE, 0);
+		rtinit_locked(&(ia->ia_ifa), RTM_DELETE, 0);
 	}
 	IFA_LOCK(&ia->ia_ifa);
 	ia->ia_flags &= ~IFA_ROUTE;
@@ -1639,11 +1624,11 @@ in_ifscrub(struct ifnet *ifp, struct in_ifaddr *ia, int locked)
 static void
 in_iahash_remove(struct in_ifaddr *ia)
 {
-	LCK_RW_ASSERT(in_ifaddr_rwlock, LCK_RW_ASSERT_EXCLUSIVE);
+	LCK_RW_ASSERT(&in_ifaddr_rwlock, LCK_RW_ASSERT_EXCLUSIVE);
 	IFA_LOCK_ASSERT_HELD(&ia->ia_ifa);
 
 	if (!IA_IS_HASHED(ia)) {
-		panic("attempt to remove wrong ia %p from hash table\n", ia);
+		panic("attempt to remove wrong ia %p from hash table", ia);
 		/* NOTREACHED */
 	}
 	TAILQ_REMOVE(INADDR_HASH(ia->ia_addr.sin_addr.s_addr), ia, ia_hash);
@@ -1661,14 +1646,14 @@ in_iahash_remove(struct in_ifaddr *ia)
 static void
 in_iahash_insert(struct in_ifaddr *ia)
 {
-	LCK_RW_ASSERT(in_ifaddr_rwlock, LCK_RW_ASSERT_EXCLUSIVE);
+	LCK_RW_ASSERT(&in_ifaddr_rwlock, LCK_RW_ASSERT_EXCLUSIVE);
 	IFA_LOCK_ASSERT_HELD(&ia->ia_ifa);
 
 	if (ia->ia_addr.sin_family != AF_INET) {
-		panic("attempt to insert wrong ia %p into hash table\n", ia);
+		panic("attempt to insert wrong ia %p into hash table", ia);
 		/* NOTREACHED */
 	} else if (IA_IS_HASHED(ia)) {
-		panic("attempt to double-insert ia %p into hash table\n", ia);
+		panic("attempt to double-insert ia %p into hash table", ia);
 		/* NOTREACHED */
 	}
 	TAILQ_INSERT_HEAD(INADDR_HASH(ia->ia_addr.sin_addr.s_addr),
@@ -1691,14 +1676,14 @@ in_iahash_insert_ptp(struct in_ifaddr *ia)
 	struct in_ifaddr *tmp_ifa;
 	struct ifnet *tmp_ifp;
 
-	LCK_RW_ASSERT(in_ifaddr_rwlock, LCK_RW_ASSERT_EXCLUSIVE);
+	LCK_RW_ASSERT(&in_ifaddr_rwlock, LCK_RW_ASSERT_EXCLUSIVE);
 	IFA_LOCK_ASSERT_HELD(&ia->ia_ifa);
 
 	if (ia->ia_addr.sin_family != AF_INET) {
-		panic("attempt to insert wrong ia %p into hash table\n", ia);
+		panic("attempt to insert wrong ia %p into hash table", ia);
 		/* NOTREACHED */
 	} else if (IA_IS_HASHED(ia)) {
-		panic("attempt to double-insert ia %p into hash table\n", ia);
+		panic("attempt to double-insert ia %p into hash table", ia);
 		/* NOTREACHED */
 	}
 	IFA_UNLOCK(&ia->ia_ifa);
@@ -1744,7 +1729,7 @@ in_ifinit(struct ifnet *ifp, struct in_ifaddr *ia, struct sockaddr_in *sin,
 	/* Take an extra reference for this routine */
 	IFA_ADDREF(&ia->ia_ifa);
 
-	lck_rw_lock_exclusive(in_ifaddr_rwlock);
+	lck_rw_lock_exclusive(&in_ifaddr_rwlock);
 	IFA_LOCK(&ia->ia_ifa);
 	oldaddr = ia->ia_addr;
 	if (IA_IS_HASHED(ia)) {
@@ -1765,7 +1750,7 @@ in_ifinit(struct ifnet *ifp, struct in_ifaddr *ia, struct sockaddr_in *sin,
 		in_iahash_insert(ia);
 	}
 	IFA_UNLOCK(&ia->ia_ifa);
-	lck_rw_done(in_ifaddr_rwlock);
+	lck_rw_done(&in_ifaddr_rwlock);
 
 	/*
 	 * Give the interface a chance to initialize if this is its first
@@ -1804,7 +1789,7 @@ in_ifinit(struct ifnet *ifp, struct in_ifaddr *ia, struct sockaddr_in *sin,
 	IFA_REMREF(ifa0);
 
 	if (error) {
-		lck_rw_lock_exclusive(in_ifaddr_rwlock);
+		lck_rw_lock_exclusive(&in_ifaddr_rwlock);
 		IFA_LOCK(&ia->ia_ifa);
 		if (IA_IS_HASHED(ia)) {
 			in_iahash_remove(ia);
@@ -1818,7 +1803,7 @@ in_ifinit(struct ifnet *ifp, struct in_ifaddr *ia, struct sockaddr_in *sin,
 			}
 		}
 		IFA_UNLOCK(&ia->ia_ifa);
-		lck_rw_done(in_ifaddr_rwlock);
+		lck_rw_done(&in_ifaddr_rwlock);
 		/* Release extra reference taken above */
 		IFA_REMREF(&ia->ia_ifa);
 		return error;
@@ -1884,7 +1869,7 @@ in_ifinit(struct ifnet *ifp, struct in_ifaddr *ia, struct sockaddr_in *sin,
 	}
 	IFA_UNLOCK(&ia->ia_ifa);
 
-	if ((error = rtinit_locked(&(ia->ia_ifa), (int)RTM_ADD, flags)) == 0) {
+	if ((error = rtinit_locked(&(ia->ia_ifa), RTM_ADD, flags)) == 0) {
 		IFA_LOCK(&ia->ia_ifa);
 		ia->ia_flags |= IFA_ROUTE;
 		IFA_UNLOCK(&ia->ia_ifa);
@@ -2056,28 +2041,23 @@ in_purgeaddrs(struct ifnet *ifp)
 void
 in_ifaddr_init(void)
 {
-	in_multi_init();
-
-	PE_parse_boot_argn("ifa_debug", &inifa_debug, sizeof(inifa_debug));
-
-	inifa_size = (inifa_debug == 0) ? sizeof(struct in_ifaddr) :
+	size_t inifa_size = (inifa_debug == 0) ? sizeof(struct in_ifaddr) :
 	    sizeof(struct in_ifaddr_dbg);
+
+	in_multi_init();
 
 	inifa_zone = zone_create(INIFA_ZONE_NAME, inifa_size, ZC_NONE);
 
-	lck_mtx_init(&inifa_trash_lock, ifa_mtx_grp, ifa_mtx_attr);
 	TAILQ_INIT(&inifa_trash_head);
 }
 
 static struct in_ifaddr *
-in_ifaddr_alloc(int how)
+in_ifaddr_alloc(zalloc_flags_t how)
 {
 	struct in_ifaddr *inifa;
 
-	inifa = (how == M_WAITOK) ? zalloc(inifa_zone) :
-	    zalloc_noblock(inifa_zone);
+	inifa = zalloc_flags(inifa_zone, Z_ZERO | how);
 	if (inifa != NULL) {
-		bzero(inifa, inifa_size);
 		inifa->ia_ifa.ifa_free = in_ifaddr_free;
 		inifa->ia_ifa.ifa_debug |= IFD_ALLOC;
 		inifa->ia_ifa.ifa_del_wc = &inifa->ia_ifa.ifa_debug;
@@ -2379,7 +2359,8 @@ in_lltable_destroy_lle_unlocked(struct llentry *lle)
 {
 	LLE_LOCK_DESTROY(lle);
 	LLE_REQ_DESTROY(lle);
-	FREE(lle, M_LLTABLE);
+	struct in_llentry *in_lle = (struct in_llentry *)lle;
+	kfree_type(struct in_llentry, in_lle);
 }
 
 /*
@@ -2399,7 +2380,7 @@ in_lltable_new(struct in_addr addr4, uint16_t flags)
 #pragma unused(flags)
 	struct in_llentry *lle;
 
-	MALLOC(lle, struct in_llentry *, sizeof(struct in_llentry), M_LLTABLE, M_NOWAIT | M_ZERO);
+	lle = kalloc_type(struct in_llentry, Z_NOWAIT | Z_ZERO);
 	if (lle == NULL) {              /* NB: caller generates msg */
 		return NULL;
 	}
@@ -2783,4 +2764,214 @@ inifa_ifpclatv4(struct ifnet * ifp)
 	ifnet_lock_done(ifp);
 
 	return (struct in_ifaddr *)ifa;
+}
+
+/*
+ * IPPROTO_xxx.
+ *
+ * The switch statement below does nothing at runtime, as it serves as a
+ * compile time check to ensure that all of the IPPROTO_xxx constants are
+ * unique.  This works as long as this routine gets updated each time a
+ * new IPPROTO_xxx constant gets added.
+ *
+ * Any failures at compile time indicates duplicated IPPROTO_xxx values.
+ */
+static __attribute__((unused)) void
+ipproto_cassert(void)
+{
+	/*
+	 * This is equivalent to _CASSERT() and the compiler wouldn't
+	 * generate any instructions, thus for compile time only.
+	 */
+	switch ((u_int16_t)0) {
+	/* bsd/netinet/in.h */
+	case IPPROTO_IP:
+//	case IPPROTO_HOPOPTS: // same value as IPPROTO_IP
+	case IPPROTO_ICMP:
+	case IPPROTO_IGMP:
+	case IPPROTO_GGP:
+	case IPPROTO_IPV4:
+	// #define IPPROTO_IPIP            IPPROTO_IPV4
+	case IPPROTO_TCP:
+	case IPPROTO_ST:
+	case IPPROTO_EGP:
+	case IPPROTO_PIGP:
+	case IPPROTO_RCCMON:
+	case IPPROTO_NVPII:
+	case IPPROTO_PUP:
+	case IPPROTO_ARGUS:
+	case IPPROTO_EMCON:
+	case IPPROTO_XNET:
+	case IPPROTO_CHAOS:
+	case IPPROTO_UDP:
+	case IPPROTO_MUX:
+	case IPPROTO_MEAS:
+	case IPPROTO_HMP:
+	case IPPROTO_PRM:
+	case IPPROTO_IDP:
+	case IPPROTO_TRUNK1:
+	case IPPROTO_TRUNK2:
+	case IPPROTO_LEAF1:
+	case IPPROTO_LEAF2:
+	case IPPROTO_RDP:
+	case IPPROTO_IRTP:
+	case IPPROTO_TP:
+	case IPPROTO_BLT:
+	case IPPROTO_NSP:
+	case IPPROTO_INP:
+	case IPPROTO_SEP:
+	case IPPROTO_3PC:
+	case IPPROTO_IDPR:
+	case IPPROTO_XTP:
+	case IPPROTO_DDP:
+	case IPPROTO_CMTP:
+	case IPPROTO_TPXX:
+	case IPPROTO_IL:
+	case IPPROTO_IPV6:
+	case IPPROTO_SDRP:
+	case IPPROTO_ROUTING:
+	case IPPROTO_FRAGMENT:
+	case IPPROTO_IDRP:
+	case IPPROTO_RSVP:
+	case IPPROTO_GRE:
+	case IPPROTO_MHRP:
+	case IPPROTO_BHA:
+	case IPPROTO_ESP:
+	case IPPROTO_AH:
+	case IPPROTO_INLSP:
+	case IPPROTO_SWIPE:
+	case IPPROTO_NHRP:
+	case IPPROTO_ICMPV6:
+	case IPPROTO_NONE:
+	case IPPROTO_DSTOPTS:
+	case IPPROTO_AHIP:
+	case IPPROTO_CFTP:
+	case IPPROTO_HELLO:
+	case IPPROTO_SATEXPAK:
+	case IPPROTO_KRYPTOLAN:
+	case IPPROTO_RVD:
+	case IPPROTO_IPPC:
+	case IPPROTO_ADFS:
+	case IPPROTO_SATMON:
+	case IPPROTO_VISA:
+	case IPPROTO_IPCV:
+	case IPPROTO_CPNX:
+	case IPPROTO_CPHB:
+	case IPPROTO_WSN:
+	case IPPROTO_PVP:
+	case IPPROTO_BRSATMON:
+	case IPPROTO_ND:
+	case IPPROTO_WBMON:
+	case IPPROTO_WBEXPAK:
+	case IPPROTO_EON:
+	case IPPROTO_VMTP:
+	case IPPROTO_SVMTP:
+	case IPPROTO_VINES:
+	case IPPROTO_TTP:
+	case IPPROTO_IGP:
+	case IPPROTO_DGP:
+	case IPPROTO_TCF:
+	case IPPROTO_IGRP:
+	case IPPROTO_OSPFIGP:
+	case IPPROTO_SRPC:
+	case IPPROTO_LARP:
+	case IPPROTO_MTP:
+	case IPPROTO_AX25:
+	case IPPROTO_IPEIP:
+	case IPPROTO_MICP:
+	case IPPROTO_SCCSP:
+	case IPPROTO_ETHERIP:
+	case IPPROTO_ENCAP:
+	case IPPROTO_APES:
+	case IPPROTO_GMTP:
+	case IPPROTO_PIM:
+	case IPPROTO_IPCOMP:
+	case IPPROTO_PGM:
+	case IPPROTO_SCTP:
+	case IPPROTO_DIVERT:
+	case IPPROTO_RAW:
+	case IPPROTO_MAX:
+	case IPPROTO_DONE:
+
+	/* bsd/netinet/in_private.h */
+	case IPPROTO_QUIC:
+		;
+	}
+}
+
+static __attribute__((unused)) void
+ipsockopt_cassert(void)
+{
+	switch ((int)0) {
+	case 0:
+
+	/* bsd/netinet/in.h */
+	case IP_OPTIONS:
+	case IP_HDRINCL:
+	case IP_TOS:
+	case IP_TTL:
+	case IP_RECVOPTS:
+	case IP_RECVRETOPTS:
+	case IP_RECVDSTADDR:
+	case IP_RETOPTS:
+	case IP_MULTICAST_IF:
+	case IP_MULTICAST_TTL:
+	case IP_MULTICAST_LOOP:
+	case IP_ADD_MEMBERSHIP:
+	case IP_DROP_MEMBERSHIP:
+	case IP_MULTICAST_VIF:
+	case IP_RSVP_ON:
+	case IP_RSVP_OFF:
+	case IP_RSVP_VIF_ON:
+	case IP_RSVP_VIF_OFF:
+	case IP_PORTRANGE:
+	case IP_RECVIF:
+	case IP_IPSEC_POLICY:
+	case IP_FAITH:
+#ifdef __APPLE__
+	case IP_STRIPHDR:
+#endif
+	case IP_RECVTTL:
+	case IP_BOUND_IF:
+	case IP_PKTINFO:
+// #define IP_RECVPKTINFO          IP_PKTINFO
+	case IP_RECVTOS:
+	case IP_DONTFRAG:
+	case IP_FW_ADD:
+	case IP_FW_DEL:
+	case IP_FW_FLUSH:
+	case IP_FW_ZERO:
+	case IP_FW_GET:
+	case IP_FW_RESETLOG:
+	case IP_OLD_FW_ADD:
+	case IP_OLD_FW_DEL:
+	case IP_OLD_FW_FLUSH:
+	case IP_OLD_FW_ZERO:
+	case IP_OLD_FW_GET:
+	case IP_NAT__XXX:
+	case IP_OLD_FW_RESETLOG:
+	case IP_DUMMYNET_CONFIGURE:
+	case IP_DUMMYNET_DEL:
+	case IP_DUMMYNET_FLUSH:
+	case IP_DUMMYNET_GET:
+	case IP_TRAFFIC_MGT_BACKGROUND:
+	case IP_MULTICAST_IFINDEX:
+	case IP_ADD_SOURCE_MEMBERSHIP:
+	case IP_DROP_SOURCE_MEMBERSHIP:
+	case IP_BLOCK_SOURCE:
+	case IP_UNBLOCK_SOURCE:
+	case IP_MSFILTER:
+	case MCAST_JOIN_GROUP:
+	case MCAST_LEAVE_GROUP:
+	case MCAST_JOIN_SOURCE_GROUP:
+	case MCAST_LEAVE_SOURCE_GROUP:
+	case MCAST_BLOCK_SOURCE:
+	case MCAST_UNBLOCK_SOURCE:
+
+	/* bsd/netinet/in_private.h */
+	case IP_NO_IFT_CELLULAR:
+// #define IP_NO_IFT_PDP           IP_NO_IFT_CELLULAR /* deprecated */
+	case IP_OUT_IF:
+		;
+	}
 }

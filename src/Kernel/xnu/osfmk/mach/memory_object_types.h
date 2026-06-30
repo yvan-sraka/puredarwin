@@ -164,24 +164,33 @@ typedef const struct memory_object_pager_ops {
 		memory_object_t mem_obj,
 		memory_object_offset_t offset,
 		memory_object_cluster_size_t size);
+#if XNU_KERNEL_PRIVATE
+	void *__obsolete_memory_object_data_unlock;
+	void *__obsolete_memory_object_synchronize;
+#else
 	kern_return_t (*memory_object_data_unlock)(
 		memory_object_t mem_obj,
 		memory_object_offset_t offset,
 		memory_object_size_t size,
-		vm_prot_t desired_access);
+		vm_prot_t desired_access); /* obsolete */
 	kern_return_t (*memory_object_synchronize)(
 		memory_object_t mem_obj,
 		memory_object_offset_t offset,
 		memory_object_size_t size,
-		vm_sync_t sync_flags);
+		vm_sync_t sync_flags); /* obsolete */
+#endif /* !XNU_KERNEL_PRIVATE */
 	kern_return_t (*memory_object_map)(
 		memory_object_t mem_obj,
 		vm_prot_t prot);
 	kern_return_t (*memory_object_last_unmap)(
 		memory_object_t mem_obj);
+#if XNU_KERNEL_PRIVATE
+	void *__obsolete_memory_object_data_reclaim;
+#else
 	kern_return_t (*memory_object_data_reclaim)(
 		memory_object_t mem_obj,
-		boolean_t reclaim_backing_store);
+		boolean_t reclaim_backing_store); /* obsolete */
+#endif /* !XNU_KERNEL_PRIVATE */
 	boolean_t (*memory_object_backing_object)(
 		memory_object_t mem_obj,
 		memory_object_offset_t mem_obj_offset,
@@ -332,9 +341,6 @@ extern boolean_t memory_object_backing_object(
 	memory_object_offset_t offset,
 	vm_object_t *backing_object,
 	vm_object_offset_t *backing_offset);
-
-extern void memory_object_default_reference(memory_object_default_t);
-extern void memory_object_default_deallocate(memory_object_default_t);
 
 extern void memory_object_control_reference(memory_object_control_t control);
 extern void memory_object_control_deallocate(memory_object_control_t control);
@@ -757,35 +763,17 @@ typedef uint64_t upl_control_flags_t;
 	((upl)->upl_reprio_info[(index)]) = (((uint64_t)(blkno) & UPL_REPRIO_INFO_MASK) | \
 	(((uint64_t)(len) & UPL_REPRIO_INFO_MASK) << UPL_REPRIO_INFO_SHIFT))
 
-/* The call prototyped below is used strictly by UPL_GET_INTERNAL_PAGE_LIST */
-
-extern vm_size_t        upl_offset_to_pagelist;
-extern vm_size_t        upl_get_internal_pagelist_offset(void);
-extern void*            upl_get_internal_vectorupl(upl_t);
-extern upl_page_info_t*         upl_get_internal_vectorupl_pagelist(upl_t);
-
-/*Use this variant to get the UPL's page list iff:*/
-/*- the upl being passed in is already part of a vector UPL*/
-/*- the page list you want is that of this "sub-upl" and not that of the entire vector-upl*/
-
-#define UPL_GET_INTERNAL_PAGE_LIST_SIMPLE(upl) \
-	((upl_page_info_t *)((upl_offset_to_pagelist == 0) ?  \
-	(uintptr_t)upl + (unsigned int)(upl_offset_to_pagelist = upl_get_internal_pagelist_offset()): \
-	(uintptr_t)upl + (unsigned int)upl_offset_to_pagelist))
-
 /* UPL_GET_INTERNAL_PAGE_LIST is only valid on internal objects where the */
 /* list request was made with the UPL_INTERNAL flag */
 
-
-#define UPL_GET_INTERNAL_PAGE_LIST(upl) \
-	((upl_get_internal_vectorupl(upl) != NULL ) ? (upl_get_internal_vectorupl_pagelist(upl)) : \
-	((upl_page_info_t *)((upl_offset_to_pagelist == 0) ?  \
-	(uintptr_t)upl + (unsigned int)(upl_offset_to_pagelist = upl_get_internal_pagelist_offset()): \
-	(uintptr_t)upl + (unsigned int)upl_offset_to_pagelist)))
+#define UPL_GET_INTERNAL_PAGE_LIST(upl) upl_get_internal_page_list(upl)
 
 __BEGIN_DECLS
 
-extern ppnum_t  upl_phys_page(upl_page_info_t *upl, int index);
+extern void            *upl_get_internal_vectorupl(upl_t);
+extern upl_page_info_t *upl_get_internal_vectorupl_pagelist(upl_t);
+extern upl_page_info_t *upl_get_internal_page_list(upl_t upl);
+extern ppnum_t          upl_phys_page(upl_page_info_t *upl, int index);
 extern boolean_t        upl_device_page(upl_page_info_t *upl);
 extern boolean_t        upl_speculative_page(upl_page_info_t *upl, int index);
 extern void     upl_clear_dirty(upl_t upl, boolean_t value);

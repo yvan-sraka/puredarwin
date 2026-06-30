@@ -56,40 +56,18 @@
 #include <vm/vm_protos.h>
 #include <vm/vm_purgeable_internal.h>
 
+#include <sys/kdebug_triage.h>
 
 /* BSD VM COMPONENT INTERFACES */
 int
 get_map_nentries(
 	vm_map_t);
 
-vm_offset_t
-get_map_start(
-	vm_map_t);
-
-vm_offset_t
-get_map_end(
-	vm_map_t);
-
-/*
- *
- */
 int
 get_map_nentries(
 	vm_map_t map)
 {
 	return map->hdr.nentries;
-}
-
-mach_vm_offset_t
-mach_get_vm_start(vm_map_t map)
-{
-	return vm_map_first_entry(map)->vme_start;
-}
-
-mach_vm_offset_t
-mach_get_vm_end(vm_map_t map)
-{
-	return vm_map_last_entry(map)->vme_end;
 }
 
 /*
@@ -104,11 +82,8 @@ const struct memory_object_pager_ops vnode_pager_ops = {
 	.memory_object_data_request = vnode_pager_data_request,
 	.memory_object_data_return = vnode_pager_data_return,
 	.memory_object_data_initialize = vnode_pager_data_initialize,
-	.memory_object_data_unlock = vnode_pager_data_unlock,
-	.memory_object_synchronize = vnode_pager_synchronize,
 	.memory_object_map = vnode_pager_map,
 	.memory_object_last_unmap = vnode_pager_last_unmap,
-	.memory_object_data_reclaim = NULL,
 	.memory_object_backing_object = NULL,
 	.memory_object_pager_name = "vnode pager"
 };
@@ -157,8 +132,8 @@ struct vnode *
 vnode_pager_lookup_vnode(               /* forward */
 	memory_object_t);
 
-ZONE_DECLARE(vnode_pager_zone, "vnode pager structures",
-    sizeof(struct vnode_pager), ZC_NOENCRYPT);
+ZONE_DEFINE_TYPE(vnode_pager_zone, "vnode pager structures",
+    struct vnode_pager, ZC_NOENCRYPT);
 
 #define VNODE_PAGER_NULL        ((vnode_pager_t) 0)
 
@@ -452,16 +427,6 @@ vnode_pager_data_initialize(
 	return KERN_FAILURE;
 }
 
-kern_return_t
-vnode_pager_data_unlock(
-	__unused memory_object_t                mem_obj,
-	__unused memory_object_offset_t offset,
-	__unused memory_object_size_t           size,
-	__unused vm_prot_t              desired_access)
-{
-	return KERN_FAILURE;
-}
-
 void
 vnode_pager_dirtied(
 	memory_object_t         mem_obj,
@@ -697,20 +662,6 @@ vnode_pager_terminate(
  *
  */
 kern_return_t
-vnode_pager_synchronize(
-	__unused memory_object_t        mem_obj,
-	__unused memory_object_offset_t offset,
-	__unused memory_object_size_t   length,
-	__unused vm_sync_t              sync_flags)
-{
-	panic("vnode_pager_synchronize: memory_object_synchronize no longer supported\n");
-	return KERN_FAILURE;
-}
-
-/*
- *
- */
-kern_return_t
 vnode_pager_map(
 	memory_object_t         mem_obj,
 	vm_prot_t               prot)
@@ -893,6 +844,7 @@ vnode_pager_cluster_read(
 			 */
 		}
 
+		ktriage_record(thread_tid(current_thread()), KDBG_TRIAGE_EVENTID(KDBG_TRIAGE_SUBSYS_VM, KDBG_TRIAGE_RESERVED, KDBG_TRIAGE_VM_VNODEPAGER_CLREAD_NO_UPL), 0 /* arg */);
 		return KERN_FAILURE;
 	}
 
@@ -908,10 +860,7 @@ vnode_object_create(
 {
 	vnode_pager_t  vnode_object;
 
-	vnode_object = (struct vnode_pager *) zalloc(vnode_pager_zone);
-	if (vnode_object == VNODE_PAGER_NULL) {
-		return VNODE_PAGER_NULL;
-	}
+	vnode_object = zalloc_flags(vnode_pager_zone, Z_WAITOK | Z_NOFAIL);
 
 	/*
 	 * The vm_map call takes both named entry ports and raw memory
@@ -996,7 +945,7 @@ fill_procregioninfo(task_t task, uint64_t arg, struct proc_regioninfo_internal *
 
 	start = address;
 
-	if (!vm_map_lookup_entry(map, start, &tmp_entry)) {
+	if (!vm_map_lookup_entry_allow_pgz(map, start, &tmp_entry)) {
 		if ((entry = tmp_entry->vme_next) == vm_map_to_entry(map)) {
 			if (do_region_footprint &&
 			    address == tmp_entry->vme_end) {
@@ -1149,7 +1098,7 @@ fill_procregioninfo_onlymappedvnodes(task_t task, uint64_t arg, struct proc_regi
 
 	vm_map_lock_read(map);
 
-	if (!vm_map_lookup_entry(map, address, &tmp_entry)) {
+	if (!vm_map_lookup_entry_allow_pgz(map, address, &tmp_entry)) {
 		if ((entry = tmp_entry->vme_next) == vm_map_to_entry(map)) {
 			vm_map_unlock_read(map);
 			vm_map_deallocate(map);
@@ -1227,7 +1176,7 @@ find_region_details(task_t task, vm_map_offset_t offset,
 	task_unlock(task);
 
 	vm_map_lock_read(map);
-	if (!vm_map_lookup_entry(map, offset, &tmp_entry)) {
+	if (!vm_map_lookup_entry_allow_pgz(map, offset, &tmp_entry)) {
 		if ((entry = tmp_entry->vme_next) == vm_map_to_entry(map)) {
 			rc = 0;
 			goto ret;
@@ -1302,7 +1251,8 @@ fill_vnodeinfoforaddr(
 		return 0;
 	} else if (!object->pager_ready ||
 	    object->terminating ||
-	    !object->alive) {
+	    !object->alive ||
+	    object->pager == NULL) {
 		vm_object_unlock(object);
 		return 0;
 	} else {
@@ -1394,8 +1344,12 @@ find_vnode_object(
 				vm_object_unlock(object);
 			}
 
-			if (object && !object->internal && object->pager_ready && !object->terminating &&
-			    object->alive) {
+			if (object &&
+			    !object->internal &&
+			    object->pager_ready &&
+			    !object->terminating &&
+			    object->alive &&
+			    object->pager != NULL) {
 				memory_object = object->pager;
 				pager_ops = memory_object->mo_pager_ops;
 

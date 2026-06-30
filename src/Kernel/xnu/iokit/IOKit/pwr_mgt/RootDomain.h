@@ -408,6 +408,11 @@ public:
 
 	IOReturn    setWakeTime(uint64_t wakeContinuousTime);
 
+#if XNU_KERNEL_PRIVATE
+	IOReturn acquireDriverKitMatchingAssertion();
+	void releaseDriverKitMatchingAssertion();
+#endif
+
 private:
 	unsigned long getRUN_STATE(void);
 
@@ -666,7 +671,7 @@ private:
 // Pref: idle time before idle sleep
 	bool                    idleSleepEnabled;
 	uint32_t                sleepSlider;
-	uint32_t                idleSeconds;
+	uint32_t                idleMilliSeconds;
 
 // Difference between sleepSlider and longestNonSleepSlider
 	uint32_t                extraSleepDelay;
@@ -845,7 +850,6 @@ public:
 private:
 	uint8_t              _aotNow;
 	uint8_t              _aotTasksSuspended;
-	uint8_t              _aotExit;
 	uint8_t              _aotTimerScheduled;
 	uint8_t              _aotReadyToFullWake;
 	uint64_t             _aotLastWakeTime;
@@ -854,6 +858,9 @@ private:
 	uint64_t             _aotWakePostWindow;
 	uint64_t             _aotLingerTime;
 
+	size_t               _driverKitMatchingAssertionCount;
+	IOPMDriverAssertionID _driverKitMatchingAssertion;
+
 	bool        aotShouldExit(bool checkTimeSet, bool software);
 	void        aotExit(bool cps);
 	void        aotEvaluate(IOTimerEventSource * timer);
@@ -861,8 +868,12 @@ public:
 	bool        isAOTMode(void);
 private:
 	// -- AOT
-
-	void        updateTasksSuspend(void);
+	enum {
+		kTasksSuspendUnsuspended = 0,
+		kTasksSuspendSuspended   = 1,
+		kTasksSuspendNoChange    = -1,
+	};
+	bool        updateTasksSuspend(int newTasksSuspended, int newAOTTasksSuspended);
 	int         findSuspendedPID(uint32_t pid, uint32_t *outRefCount);
 
 // IOPMrootDomain internal sleep call
@@ -893,7 +904,7 @@ private:
 
 	IOReturn    setPMSetting(const OSSymbol *, OSObject *);
 
-	void        startIdleSleepTimer( uint32_t inSeconds );
+	void        startIdleSleepTimer( uint32_t inMilliSeconds );
 	void        cancelIdleSleepTimer( void );
 	uint32_t    getTimeToIdleSleep( void );
 

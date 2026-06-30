@@ -82,7 +82,7 @@
 #define X86_64_MP_SPIN_TRIES                    1000
 
 #ifdef KERNEL_PRIVATE
-extern vm_address_t x86_64_sharedpage_rw_addr;
+extern vm_address_t x86_64_commpage_rw_addr;
 extern uint64_t _get_x86_64_cpu_capabilities(void);
 #endif
 
@@ -140,13 +140,17 @@ typedef struct {
 /* f8 */ uint64_t unused;
 /* 100 */ uint64_t dyld_system_flags;
 
-/* 108 */ uint8_t unused2[3800];
+/* 108 */ uint8_t unused2[3792];
+/* 0xFD8 */ uint64_t arm_cpu_capabilities;
 /* 0xFE0 */ uint8_t cp_aprr_shadow_supported;
-/* 0xFE1 */ uint8_t unused3[7];
+/* 0xFE1 */ uint8_t user_timebase_type;
+/* 0xFE2 */ uint8_t unused3[6];
 /* 0xFE8 */ uint64_t cp_aprr_shadow_jit_rw;
-/* 0xFF0*/ uint64_t cp_aprr_shadow_jit_rx;
+/* 0xFF0 */ uint64_t cp_aprr_shadow_jit_rx;
 /* 0xFF8 */ uint32_t unused4;
-/* ffc */ uint32_t arm_cpufamily;
+/* 0xFFC */ uint32_t arm_cpufamily;
+/* 0x1000 */ uint64_t cp_aprr_shadow_tpro_rw;
+/* 0x1008 */ uint64_t cp_aprr_shadow_tpro_ro;
 } x86_64_commpage_t;
 
 #endif /* _ARM_CPU_X86_64_CAPABILITIES_H */

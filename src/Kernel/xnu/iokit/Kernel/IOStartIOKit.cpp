@@ -133,35 +133,8 @@ void (*record_startup_extensions_function)(void) = NULL;
 void
 InitIOKit(void *dtTop)
 {
-	int                         debugFlags = 0;
-
-	if (PE_parse_boot_argn( "io", &debugFlags, sizeof(debugFlags))) {
-		gIOKitDebug = debugFlags;
-	}
-	// Enable IOWaitQuiet panics on arm64 macOS except on KASAN.
-	// existing 3rd party KEXTs may hold the registry busy on x86 RELEASE kernels.
-	// Enabling this on other platforms is tracked in rdar://66364108
-#if XNU_TARGET_OS_OSX && defined(__arm64__) && !KASAN
-	else {
-		gIOKitDebug |= kIOWaitQuietPanics;
-	}
-#endif
-
-	if (PE_parse_boot_argn( "iotrace", &debugFlags, sizeof(debugFlags))) {
-		gIOKitTrace = debugFlags;
-	}
-
 	// Compat for boot-args
 	gIOKitTrace |= (gIOKitDebug & kIOTraceCompatBootArgs);
-
-	if (PE_parse_boot_argn( "pmtimeout", &debugFlags, sizeof(debugFlags))) {
-		gCanSleepTimeout = debugFlags;
-	}
-
-	if (PE_parse_boot_argn( "dk", &debugFlags, sizeof(debugFlags))) {
-		gIODKDebug = debugFlags;
-	}
-
 
 	//
 	// Have to start IOKit environment before we attempt to start
@@ -207,6 +180,7 @@ ConfigureIOKit(void)
 void
 StartIOKitMatching(void)
 {
+	SOCD_TRACE_XNU(START_IOKIT);
 	assert(gRootNub != NULL);
 	bool ok = gRootNub->startIOServiceMatching();
 	if (__improbable(!ok)) {
@@ -214,12 +188,14 @@ StartIOKitMatching(void)
 	}
 
 #if !NO_KEXTD
-	/* Add a busy count to keep the registry busy until kextd has
-	 * completely finished launching. This is decremented when kextd
-	 * messages the kernel after the in-kernel linker has been
-	 * removed and personalities have been sent.
-	 */
-	IOService::getServiceRoot()->adjustBusy(1);
+	if (OSKext::iokitDaemonAvailable()) {
+		/* Add a busy count to keep the registry busy until the IOKit daemon has
+		 * completely finished launching. This is decremented when the IOKit daemon
+		 * messages the kernel after the in-kernel linker has been
+		 * removed and personalities have been sent.
+		 */
+		IOService::getServiceRoot()->adjustBusy(1);
+	}
 #endif
 }
 

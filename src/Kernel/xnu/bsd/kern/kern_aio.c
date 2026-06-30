@@ -48,7 +48,7 @@
 #include <sys/filedesc.h>
 #include <sys/kernel.h>
 #include <sys/vnode_internal.h>
-#include <sys/malloc.h>
+#include <sys/kauth.h>
 #include <sys/mount_internal.h>
 #include <sys/param.h>
 #include <sys/proc_internal.h>
@@ -174,7 +174,7 @@ struct aio_workq_entry {
 	struct proc                    *procp;          /* user proc that queued this request */
 	user_addr_t                     uaiocbp;        /* pointer passed in from user land */
 	struct user_aiocb               aiocb;          /* copy of aiocb from user land */
-	thread_t                        thread;         /* thread that queued this request */
+	struct vfs_context              context;        /* context which enqueued the request */
 
 	/* Initialized, and possibly freed by aio_work_thread() or at free if cancelled */
 	vm_map_t                        aio_map;        /* user land map we have a reference to */
@@ -216,7 +216,7 @@ typedef struct aio_anchor_cb aio_anchor_cb;
 
 #define ASSERT_AIO_FROM_PROC(aiop, theproc)     \
 	if ((aiop)->procp != (theproc)) {       \
-	        panic("AIO on a proc list that does not belong to that proc.\n"); \
+	        panic("AIO on a proc list that does not belong to that proc."); \
 	}
 
 /*
@@ -294,8 +294,7 @@ static LCK_GRP_DECLARE(aio_proc_lock_grp, "aio_proc");
 static LCK_GRP_DECLARE(aio_queue_lock_grp, "aio_queue");
 static LCK_MTX_DECLARE(aio_proc_mtx, &aio_proc_lock_grp);
 
-static ZONE_DECLARE(aio_workq_zonep, "aiowq", sizeof(aio_workq_entry),
-    ZC_ZFREE_CLEARMEM);
+static KALLOC_TYPE_DEFINE(aio_workq_zonep, aio_workq_entry, KT_DEFAULT);
 
 /* Hash */
 static aio_workq_t
@@ -309,7 +308,7 @@ aio_workq_init(aio_workq_t wq)
 {
 	TAILQ_INIT(&wq->aioq_entries);
 	lck_spin_init(&wq->aioq_lock, &aio_queue_lock_grp, LCK_ATTR_NULL);
-	waitq_init(&wq->aioq_waitq, SYNC_POLICY_FIFO);
+	waitq_init(&wq->aioq_waitq, WQT_QUEUE, SYNC_POLICY_FIFO);
 }
 
 
@@ -322,7 +321,7 @@ aio_workq_remove_entry_locked(aio_workq_t queue, aio_workq_entry *entryp)
 	ASSERT_AIO_WORKQ_LOCK_OWNED(queue);
 
 	if (entryp->aio_workq_link.tqe_prev == NULL) {
-		panic("Trying to remove an entry from a work queue, but it is not on a queue\n");
+		panic("Trying to remove an entry from a work queue, but it is not on a queue");
 	}
 
 	TAILQ_REMOVE(&queue->aioq_entries, entryp, aio_workq_link);
@@ -395,7 +394,7 @@ aio_proc_remove_done_locked(proc_t procp, aio_workq_entry *entryp)
 	TAILQ_REMOVE(&procp->p_aio_doneq, entryp, aio_proc_link);
 	entryp->aio_proc_link.tqe_prev = NULL;
 	if (os_atomic_dec_orig(&aio_anchor.aio_total_count, relaxed) <= 0) {
-		panic("Negative total AIO count!\n");
+		panic("Negative total AIO count!");
 	}
 	if (procp->p_aio_total_count-- <= 0) {
 		panic("proc %p: p_aio_total_count accounting mismatch", procp);
@@ -931,7 +930,7 @@ again:
 			/* mark the entry as blocking close or exit/exec */
 			entryp->flags |= reason;
 			if ((entryp->flags & AIO_EXIT_WAIT) && (entryp->flags & AIO_CLOSE_WAIT)) {
-				panic("Close and exit flags set at the same time\n");
+				panic("Close and exit flags set at the same time");
 			}
 		}
 
@@ -1083,7 +1082,7 @@ aio_suspend_nocancel(proc_t p, struct aio_suspend_nocancel_args *uap, int *retva
 		clock_absolutetime_interval_to_deadline(abstime, &abstime);
 	}
 
-	aiocbpp = kheap_alloc(KHEAP_TEMP, aiocbpp_size, Z_WAITOK);
+	aiocbpp = (user_addr_t *)kalloc_data(aiocbpp_size, Z_WAITOK);
 	if (aiocbpp == NULL || aio_copy_in_list(p, uap->aiocblist, aiocbpp, uap->nent)) {
 		error = EAGAIN;
 		goto ExitThisRoutine;
@@ -1145,7 +1144,7 @@ check_for_our_aiocbp:
 
 ExitThisRoutine:
 	if (aiocbpp != NULL) {
-		kheap_free(KHEAP_TEMP, aiocbpp, aiocbpp_size);
+		kfree_data(aiocbpp, aiocbpp_size);
 	}
 
 	KERNEL_DEBUG(BSDDBG_CODE(DBG_BSD_AIO, AIO_suspend) | DBG_FUNC_END,
@@ -1348,7 +1347,7 @@ aio_try_enqueue_work_locked(proc_t procp, aio_workq_entry *entryp,
 	aio_workq_lock_spin(queue);
 	aio_workq_add_entry_locked(queue, entryp);
 	waitq_wakeup64_one(&queue->aioq_waitq, CAST_EVENT64_T(queue),
-	    THREAD_AWAKENED, WAITQ_ALL_PRIORITIES);
+	    THREAD_AWAKENED, WAITQ_WAKEUP_DEFAULT);
 	aio_workq_unlock(queue);
 
 	KERNEL_DEBUG_CONSTANT(BSDDBG_CODE(DBG_BSD_AIO, AIO_work_queued) | DBG_FUNC_START,
@@ -1536,9 +1535,9 @@ aio_work_thread(void *arg __unused, wait_result_t wr __unused)
 		 * of the IO.  Note: don't need to have the entryp locked,
 		 * because the proc and map don't change until it's freed.
 		 */
-		currentmap = get_task_map((current_proc())->task);
+		currentmap = get_task_map(proc_task(current_proc()));
 		if (currentmap != entryp->aio_map) {
-			uthreadp = (struct uthread *) get_bsdthread_info(current_thread());
+			uthreadp = (struct uthread *) current_uthread();
 			oldaiotask = uthreadp->uu_aio_task;
 			/*
 			 * workq entries at this stage cause _aio_exec() and _aio_exit() to
@@ -1546,7 +1545,7 @@ aio_work_thread(void *arg __unused, wait_result_t wr __unused)
 			 * which means that it is safe to dereference p->task without
 			 * holding a lock or taking references.
 			 */
-			uthreadp->uu_aio_task = p->task;
+			uthreadp->uu_aio_task = proc_task(p);
 			oldmap = vm_map_switch(entryp->aio_map);
 		}
 
@@ -1708,12 +1707,13 @@ aio_create_queue_entry(proc_t procp, user_addr_t aiocbp, aio_entry_flags_t flags
 	}
 
 	/* get a reference to the user land map in order to keep it around */
-	entryp->aio_map = get_task_map(procp->task);
+	entryp->aio_map = get_task_map(proc_task(procp));
 	vm_map_reference(entryp->aio_map);
 
 	/* get a reference on the current_thread, which is passed in vfs_context. */
-	entryp->thread = current_thread();
-	thread_reference(entryp->thread);
+	entryp->context = *vfs_context_current();
+	thread_reference(entryp->context.vc_thread);
+	kauth_cred_ref(entryp->context.vc_ucred);
 	return entryp;
 
 error_exit:
@@ -1779,9 +1779,10 @@ aio_free_request(aio_workq_entry *entryp)
 	}
 
 	/* remove our reference to thread which enqueued the request */
-	if (NULL != entryp->thread) {
-		thread_deallocate(entryp->thread);
+	if (entryp->context.vc_thread) {
+		thread_deallocate(entryp->context.vc_thread);
 	}
+	kauth_cred_unref(&entryp->context.vc_ucred);
 
 	zfree(aio_workq_zonep, entryp);
 }
@@ -1970,12 +1971,7 @@ do_aio_read(aio_workq_entry *entryp)
 	}
 
 	if (fp->fp_glob->fg_flag & FREAD) {
-		struct vfs_context context = {
-			.vc_thread = entryp->thread,     /* XXX */
-			.vc_ucred = fp->fp_glob->fg_cred,
-		};
-
-		error = dofileread(&context, fp,
+		error = dofileread(&entryp->context, fp,
 		    entryp->aiocb.aio_buf,
 		    entryp->aiocb.aio_nbytes,
 		    entryp->aiocb.aio_offset, FOF_OFFSET,
@@ -2004,18 +2000,14 @@ do_aio_write(aio_workq_entry *entryp)
 	}
 
 	if (fp->fp_glob->fg_flag & FWRITE) {
-		struct vfs_context context = {
-			.vc_thread = entryp->thread,     /* XXX */
-			.vc_ucred = fp->fp_glob->fg_cred,
-		};
-		int flags = FOF_PCRED;
+		int flags = 0;
 
 		if ((fp->fp_glob->fg_flag & O_APPEND) == 0) {
 			flags |= FOF_OFFSET;
 		}
 
 		/* NB: tell dofilewrite the offset, and to use the proc cred */
-		error = dofilewrite(&context,
+		error = dofilewrite(&entryp->context,
 		    fp,
 		    entryp->aiocb.aio_buf,
 		    entryp->aiocb.aio_nbytes,
@@ -2096,15 +2088,10 @@ do_aio_fsync(aio_workq_entry *entryp)
 		entryp->returnval = -1;
 		return error;
 	}
-	vp = fp->fp_glob->fg_data;
+	vp = fp_get_data(fp);
 
 	if ((error = vnode_getwithref(vp)) == 0) {
-		struct vfs_context context = {
-			.vc_thread = entryp->thread,     /* XXX */
-			.vc_ucred = fp->fp_glob->fg_cred,
-		};
-
-		error = VNOP_FSYNC(vp, sync_flag, &context);
+		error = VNOP_FSYNC(vp, sync_flag, &entryp->context);
 
 		(void)vnode_put(vp);
 	} else {
@@ -2192,7 +2179,7 @@ _aio_create_worker_threads(int num)
 task_t
 get_aiotask(void)
 {
-	return ((struct uthread *)get_bsdthread_info(current_thread()))->uu_aio_task;
+	return current_uthread()->uu_aio_task;
 }
 
 

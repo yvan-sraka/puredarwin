@@ -1,4 +1,6 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python
+from __future__ import absolute_import, print_function
+
 
 helpdoc = """
 A simple utility that verifies the syntax for python scripts.
@@ -6,14 +8,18 @@ The checks it does are :
   * Check for 'tab' characters in .py files
   * Compile errors in py sources
 Usage:
-  python syntax_checker.py <python_source_file> [<python_source_file> ..]
+  python syntax_checker.py <python_source_file> [<python_source_file> ..] 
 """
-import py_compile
 import sys
 import os
 import re
 
 tabs_search_rex = re.compile("^\s*\t+",re.MULTILINE|re.DOTALL)
+
+def find_non_ascii(s):
+    for c in s:
+        if ord(c) >= 0x80: return True
+    return False
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
@@ -30,20 +36,24 @@ if __name__ == "__main__":
         fh = open(fname)
         strdata = fh.readlines()
         lineno = 0
-        tab_check_status = True
+        syntax_fail = False
         for linedata in strdata:
             lineno += 1
             if len(tabs_search_rex.findall(linedata)) > 0 :
                 print("Error: Found a TAB character at %s:%d" % (fname, lineno), file=sys.stderr)
-                tab_check_status = False
-        if tab_check_status == False:
+                syntax_fail = True
+        if find_non_ascii(linedata):
+            print("Error: Found a non ascii character at %s:%d" % (fname, lineno), file=sys.stderr)
+            syntax_fail = True
+        if syntax_fail:
             print("Error: Syntax check failed. Please fix the errors and try again.", file=sys.stderr)
             sys.exit(1)
         #now check for error in compilation
         try:
-            compile_result = py_compile.compile(fname, cfile="tmp.pyc", doraise=True)
-            os.remove("tmp.pyc")
-        except py_compile.PyCompileError as exc:
+            with open(fname, 'r') as file:
+                source = file.read() + '\n'
+                compile_result = compile(source, fname, 'exec')
+        except Exception as exc:
             print(str(exc), file=sys.stderr)
             print("Error: Compilation failed. Please fix the errors and try again.", file=sys.stderr)
             sys.exit(1)

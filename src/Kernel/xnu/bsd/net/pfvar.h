@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2007-2019 Apple Inc. All rights reserved.
+ * Copyright (c) 2007-2021 Apple Inc. All rights reserved.
  *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
  *
@@ -93,6 +93,10 @@ extern "C" {
 #include <sys/systm.h>
 #include <net/pf_pbuf.h>
 
+#if SKYWALK
+#include <netinet/in_pcb.h>
+#include <skywalk/namespace/netns.h>
+#endif
 
 #if BYTE_ORDER == BIG_ENDIAN
 #define htobe64(x)      (x)
@@ -102,8 +106,8 @@ extern "C" {
 
 #define be64toh(x)      htobe64(x)
 
-extern lck_rw_t *pf_perim_lock;
-extern lck_mtx_t *pf_lock;
+extern lck_rw_t pf_perim_lock;
+extern lck_mtx_t pf_lock;
 
 struct pool {
 	struct zone     *pool_zone;     /* pointer to backend zone */
@@ -1059,6 +1063,9 @@ struct pf_state {
 	u_int8_t                 allow_opts;
 	u_int8_t                 timeout;
 	u_int8_t                 sync_flags;
+#if SKYWALK
+	netns_token              nstoken;
+#endif
 };
 #endif /* KERNEL */
 
@@ -1198,6 +1205,7 @@ struct pf_ruleset {
 			struct pf_rulequeue     *ptr;
 			struct pf_rule          **ptr_array;
 			u_int32_t                rcount;
+			u_int32_t                rsize;
 			u_int32_t                ticket;
 			int                      open;
 		}                        active, inactive;
@@ -1469,7 +1477,8 @@ struct pf_pdesc {
 #define PFRES_SRCLIMIT  13              /* Source node/conn limit */
 #define PFRES_SYNPROXY  14              /* SYN proxy */
 #define PFRES_DUMMYNET  15              /* Dummynet */
-#define PFRES_MAX       16              /* total+1 */
+#define PFRES_INVPORT   16              /* Invalid TCP/UDP port */
+#define PFRES_MAX       17              /* total+1 */
 
 #define PFRES_NAMES { \
 	"match", \
@@ -1488,6 +1497,7 @@ struct pf_pdesc {
 	"src-limit", \
 	"synproxy", \
 	"dummynet", \
+	"invalid-port", \
 	NULL \
 }
 
@@ -2197,14 +2207,10 @@ struct ip_fw_args;
 extern boolean_t is_nlc_enabled_glb;
 
 #if INET
-__private_extern__ int pf_test(int, struct ifnet *, pbuf_t **,
-    struct ether_header *, struct ip_fw_args *);
 __private_extern__ int pf_test_mbuf(int, struct ifnet *, struct mbuf **,
     struct ether_header *, struct ip_fw_args *);
 #endif /* INET */
 
-__private_extern__ int pf_test6(int, struct ifnet *, pbuf_t **,
-    struct ether_header *, struct ip_fw_args *);
 __private_extern__ int pf_test6_mbuf(int, struct ifnet *, struct mbuf **,
     struct ether_header *, struct ip_fw_args *);
 __private_extern__ void pf_poolmask(struct pf_addr *, struct pf_addr *,
@@ -2256,6 +2262,7 @@ __private_extern__ int pf_rtlabel_match(struct pf_addr *, sa_family_t,
 __private_extern__ int pf_socket_lookup(int, struct pf_pdesc *);
 __private_extern__ struct pf_state_key *pf_alloc_state_key(struct pf_state *,
     struct pf_state_key *);
+__private_extern__ void pf_detach_state(struct pf_state *, int);
 __private_extern__ void pfr_initialize(void);
 __private_extern__ int pfr_match_addr(struct pfr_ktable *, struct pf_addr *,
     sa_family_t);
@@ -2325,7 +2332,7 @@ __private_extern__ int pfi_set_flags(const char *, int);
 __private_extern__ int pfi_clear_flags(const char *, int);
 
 __private_extern__ u_int16_t pf_tagname2tag(char *);
-__private_extern__ void pf_tag2tagname(u_int16_t, char *);
+__private_extern__ u_int16_t pf_tagname2tag_ext(char *);
 __private_extern__ void pf_tag_ref(u_int16_t);
 __private_extern__ void pf_tag_unref(u_int16_t);
 __private_extern__ int pf_tag_packet(pbuf_t *, struct pf_mtag *,
@@ -2365,7 +2372,6 @@ extern int16_t pf_nat64_configured;
 #define PF_IS_ENABLED (pf_is_enabled != 0)
 extern u_int32_t pf_hash_seed;
 
-/* these ruleset functions can be linked into userland programs (pfctl) */
 __private_extern__ int pf_get_ruleset_number(u_int8_t);
 __private_extern__ void pf_init_ruleset(struct pf_ruleset *);
 __private_extern__ int pf_anchor_setup(struct pf_rule *,
@@ -2375,6 +2381,9 @@ __private_extern__ int pf_anchor_copyout(const struct pf_ruleset *,
 __private_extern__ void pf_anchor_remove(struct pf_rule *);
 __private_extern__ void pf_remove_if_empty_ruleset(struct pf_ruleset *);
 __private_extern__ struct pf_anchor *pf_find_anchor(const char *);
+__private_extern__ int pf_reference_anchor(struct pf_anchor *a);
+__private_extern__ int pf_release_anchor(struct pf_anchor *a);
+__private_extern__ int pf_release_ruleset(struct pf_ruleset *r);
 __private_extern__ struct pf_ruleset *pf_find_ruleset(const char *);
 __private_extern__ struct pf_ruleset *pf_find_ruleset_with_owner(const char *,
     const char *, int, int *);
@@ -2399,6 +2408,13 @@ __private_extern__ struct pf_fragment_tag * pf_find_fragment_tag_pbuf(pbuf_t *);
 __private_extern__ struct pf_fragment_tag * pf_find_fragment_tag(struct mbuf *);
 __private_extern__ struct pf_fragment_tag * pf_copy_fragment_tag(struct mbuf *,
     struct pf_fragment_tag *, int);
+#if SKYWALK && defined(XNU_TARGET_OS_OSX)
+#define PF_COMPATIBLE_FLAGS_PF_ENABLED 0x00000001
+#define PF_COMPATIBLE_FLAGS_CUSTOM_ANCHORS_PRESENT 0x00000002
+#define PF_COMPATIBLE_FLAGS_CUSTOM_RULES_PRESENT 0x00000004
+
+__private_extern__ uint32_t pf_check_compatible_rules(void);
+#endif // SKYWALK && defined(XNU_TARGET_OS_OSX)
 #else /* !KERNEL */
 extern struct pf_anchor_global pf_anchors;
 extern struct pf_anchor pf_main_anchor;

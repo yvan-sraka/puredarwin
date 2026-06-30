@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2000-2020 Apple Inc. All rights reserved.
+ * Copyright (c) 2000-2021 Apple Inc. All rights reserved.
  *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
  *
@@ -118,6 +118,7 @@ struct  ip6q {
 	uint32_t        ip6q_csum_flags; /* checksum flags */
 	uint32_t        ip6q_csum;      /* partial checksum value */
 	uint32_t        ip6q_flags;
+	uint32_t        ip6q_dst_ifscope, ip6q_src_ifscope;
 #define IP6QF_DIRTY    0x00000001
 };
 
@@ -363,7 +364,7 @@ struct  ip6stat {
 
 enum ip6s_sources_rule_index {
 	IP6S_SRCRULE_0, IP6S_SRCRULE_1, IP6S_SRCRULE_2, IP6S_SRCRULE_3, IP6S_SRCRULE_4,
-	IP6S_SRCRULE_5, IP6S_SRCRULE_6, IP6S_SRCRULE_7,
+	IP6S_SRCRULE_5, IP6S_SRCRULE_5_5, IP6S_SRCRULE_6, IP6S_SRCRULE_7,
 	IP6S_SRCRULE_7x, IP6S_SRCRULE_8
 };
 
@@ -433,25 +434,27 @@ struct ip6_out_args {
 	unsigned int    ip6oa_boundif;  /* bound outgoing interface */
 	struct flowadv  ip6oa_flowadv;  /* flow advisory code */
 	u_int32_t       ip6oa_flags;    /* IP6OAF flags (see below) */
-#define IP6OAF_SELECT_SRCIF     0x00000001      /* src interface selection */
-#define IP6OAF_BOUND_IF         0x00000002      /* boundif value is valid */
-#define IP6OAF_BOUND_SRCADDR    0x00000004      /* bound to src address */
-#define IP6OAF_NO_CELLULAR      0x00000010      /* skip IFT_CELLULAR */
-#define IP6OAF_NO_EXPENSIVE     0x00000020      /* skip IFEF_EXPENSIVE */
-#define IP6OAF_AWDL_UNRESTRICTED 0x00000040     /* privileged AWDL */
-#define IP6OAF_QOSMARKING_ALLOWED 0x00000080    /* policy allows Fastlane DSCP marking */
-#define IP6OAF_INTCOPROC_ALLOWED 0x00000100     /* access to internal coproc interfaces */
-#define IP6OAF_NO_LOW_POWER     0x00000200      /* skip low power */
-#define IP6OAF_NO_CONSTRAINED   0x00000400      /* skip IFXF_CONSTRAINED */
-#define IP6OAF_SKIP_PF          0x00000800      /* skip PF */
-#define IP6OAF_DONT_FRAG        0x00001000      /* Don't fragment */
+#define IP6OAF_SELECT_SRCIF             0x00000001      /* src interface selection */
+#define IP6OAF_BOUND_IF                 0x00000002      /* boundif value is valid */
+#define IP6OAF_BOUND_SRCADDR            0x00000004      /* bound to src address */
+#define IP6OAF_NO_CELLULAR              0x00000010      /* skip IFT_CELLULAR */
+#define IP6OAF_NO_EXPENSIVE             0x00000020      /* skip IFEF_EXPENSIVE */
+#define IP6OAF_AWDL_UNRESTRICTED        0x00000040      /* privileged AWDL */
+#define IP6OAF_QOSMARKING_ALLOWED       0x00000080      /* policy allows Fastlane DSCP marking */
+#define IP6OAF_INTCOPROC_ALLOWED        0x00000100      /* access to internal coproc interfaces */
+#define IP6OAF_NO_LOW_POWER             0x00000200      /* skip low power */
+#define IP6OAF_NO_CONSTRAINED           0x00000400      /* skip IFXF_CONSTRAINED */
+#define IP6OAF_SKIP_PF                  0x00000800      /* skip PF */
+#define IP6OAF_DONT_FRAG                0x00001000      /* Don't fragment */
 #define IP6OAF_REDO_QOSMARKING_POLICY   0x00002000      /* Re-evaluate QOS marking policy */
-	u_int32_t       ip6oa_retflags; /* IP6OARF return flags (see below) */
-#define IP6OARF_IFDENIED        0x00000001      /* denied access to interface */
+#define IP6OAF_R_IFDENIED               0x00004000      /* return flag: denied access to interface */
+#define IP6OAF_MANAGEMENT_ALLOWED       0x00004000      /* access to management to interface */
 	int             ip6oa_sotc;             /* traffic class for Fastlane DSCP mapping */
 	int             ip6oa_netsvctype;
 	int32_t         qos_marking_gencount;
 };
+
+#define IP6OAF_RET_MASK (IP6OAF_R_IFDENIED)
 
 extern struct ip6stat ip6stat;  /* statistics */
 extern int ip6_defhlim;         /* default hop limit */
@@ -523,6 +526,13 @@ extern void ip6_setsrcifaddr_info(struct mbuf *, uint32_t, struct in6_ifaddr *);
 extern void ip6_setdstifaddr_info(struct mbuf *, uint32_t, struct in6_ifaddr *);
 extern int ip6_getsrcifaddr_info(struct mbuf *, uint32_t *, uint32_t *);
 extern int ip6_getdstifaddr_info(struct mbuf *, uint32_t *, uint32_t *);
+extern uint32_t ip6_input_getsrcifscope(struct mbuf *);
+extern uint32_t ip6_input_getdstifscope(struct mbuf *);
+extern void ip6_output_setsrcifscope(struct mbuf *, uint32_t, struct in6_ifaddr *);
+extern void ip6_output_setdstifscope(struct mbuf *, uint32_t, struct in6_ifaddr *);
+extern uint32_t ip6_output_getsrcifscope(struct mbuf *);
+extern uint32_t ip6_output_getdstifscope(struct mbuf *);
+
 extern void ip6_freepcbopts(struct ip6_pktopts *);
 extern int ip6_unknown_opt(u_int8_t *, struct mbuf *, size_t);
 extern char *ip6_get_prevhdr(struct mbuf *, int);
@@ -558,7 +568,7 @@ extern int ip6_raw_ctloutput(struct socket *, struct sockopt *);
 extern void ip6_initpktopts(struct ip6_pktopts *);
 extern int ip6_setpktoptions(struct mbuf *, struct ip6_pktopts *, int, int);
 extern void ip6_clearpktopts(struct ip6_pktopts *, int);
-extern struct ip6_pktopts *ip6_copypktopts(struct ip6_pktopts *, int);
+extern struct ip6_pktopts *ip6_copypktopts(struct ip6_pktopts *, zalloc_flags_t);
 extern int ip6_optlen(struct inpcb *);
 extern void ip6_drain(void);
 extern int ip6_do_fragmentation(struct mbuf **, uint32_t, struct ifnet *, uint32_t,
@@ -585,7 +595,7 @@ extern int dest6_input(struct mbuf **, int *, int);
 extern struct ifaddr * in6_selectsrc_core_ifa(struct sockaddr_in6 *, struct ifnet *, int);
 extern struct in6_addr * in6_selectsrc_core(struct sockaddr_in6 *,
     uint32_t, struct ifnet *, int,
-    struct in6_addr *, struct ifnet **, int *, struct ifaddr **);
+    struct in6_addr *, struct ifnet **, int *, struct ifaddr **, struct route_in6 *);
 extern struct in6_addr *in6_selectsrc(struct sockaddr_in6 *,
     struct ip6_pktopts *, struct inpcb *, struct route_in6 *,
     struct ifnet **, struct in6_addr *, unsigned int, int *);

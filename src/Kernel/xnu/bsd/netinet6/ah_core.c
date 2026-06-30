@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2008-2016 Apple Inc. All rights reserved.
+ * Copyright (c) 2008-2021 Apple Inc. All rights reserved.
  *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
  *
@@ -105,6 +105,13 @@
 #include <net/net_osdep.h>
 
 #define HMACSIZE        16
+#define KEYED_MD5_DATA_SIZE     sizeof(MD5_CTX)
+#define KEYED_SHA1_DATA_SIZE    sizeof(SHA1_CTX)
+#define HMAC_MD5_DATA_SIZE      (64 + 64 + sizeof(MD5_CTX))
+#define HMAC_SHA1_DATA_SIZE     (64 + 64 + sizeof(SHA1_CTX))
+#define HMAC_SHA2_256_DATA_SIZE (64 + 64 + sizeof(SHA256_CTX))
+#define HMAC_SHA2_384_DATA_SIZE (128 + 128 + sizeof(SHA384_CTX))
+#define HMAC_SHA2_512_DATA_SIZE (128 + 128 + sizeof(SHA512_CTX))
 
 static int ah_sumsiz_1216(struct secasvar *);
 static int ah_sumsiz_zero(struct secasvar *);
@@ -152,6 +159,10 @@ static void ah_hmac_sha2_512_result(struct ah_algorithm_state *, caddr_t, size_t
 static void ah_update_mbuf(struct mbuf *, int, int,
     const struct ah_algorithm *, struct ah_algorithm_state *);
 
+/*
+ * If any algorithm requires more than 2048 bits (256 bytes) of key material,
+ * update IPSEC_KEY_AUTH_MAX_BYTES in ipsec.h
+ */
 const struct ah_algorithm *
 ah_algorithm_lookup(int idx)
 {
@@ -296,7 +307,7 @@ ah_keyed_md5_init(struct ah_algorithm_state *state, struct secasvar *sav)
 	}
 
 	state->sav = sav;
-	state->foo = (void *)_MALLOC(sizeof(MD5_CTX), M_TEMP, M_NOWAIT);
+	state->foo = (void *)kalloc_data(KEYED_MD5_DATA_SIZE, Z_NOWAIT);
 	if (state->foo == NULL) {
 		return ENOBUFS;
 	}
@@ -369,7 +380,7 @@ ah_keyed_md5_result(struct ah_algorithm_state *state, caddr_t addr, size_t l)
 		    (u_int)_KEYLEN(state->sav->key_auth));
 	}
 	MD5Final(&digest[0], (MD5_CTX *)state->foo);
-	FREE(state->foo, M_TEMP);
+	kfree_data(state->foo, KEYED_MD5_DATA_SIZE);
 	bcopy(&digest[0], (void *)addr, sizeof(digest) > l ? l : sizeof(digest));
 }
 
@@ -413,7 +424,7 @@ ah_keyed_sha1_init(struct ah_algorithm_state *state, struct secasvar *sav)
 	}
 
 	state->sav = sav;
-	state->foo = (void *)_MALLOC(sizeof(SHA1_CTX), M_TEMP, M_NOWAIT);
+	state->foo = (void *)kalloc_data(KEYED_SHA1_DATA_SIZE, Z_NOWAIT);
 	if (!state->foo) {
 		return ENOBUFS;
 	}
@@ -490,7 +501,7 @@ ah_keyed_sha1_result(struct ah_algorithm_state *state, caddr_t addr, size_t l)
 	SHA1Final((caddr_t)&digest[0], ctxt);
 	bcopy(&digest[0], (void *)addr, sizeof(digest) > l ? l : sizeof(digest));
 
-	FREE(state->foo, M_TEMP);
+	kfree_data(state->foo, KEYED_SHA1_DATA_SIZE);
 }
 
 static int
@@ -536,7 +547,7 @@ ah_hmac_md5_init(struct ah_algorithm_state *state, struct secasvar *sav)
 	}
 
 	state->sav = sav;
-	state->foo = (void *)_MALLOC(64 + 64 + sizeof(MD5_CTX), M_TEMP, M_NOWAIT);
+	state->foo = (void *)kalloc_data(HMAC_MD5_DATA_SIZE, Z_NOWAIT);
 	if (!state->foo) {
 		return ENOBUFS;
 	}
@@ -611,7 +622,7 @@ ah_hmac_md5_result(struct ah_algorithm_state *state, caddr_t addr, size_t l)
 
 	bcopy(&digest[0], (void *)addr, sizeof(digest) > l ? l : sizeof(digest));
 
-	FREE(state->foo, M_TEMP);
+	kfree_data(state->foo, HMAC_MD5_DATA_SIZE);
 }
 
 static int
@@ -657,8 +668,7 @@ ah_hmac_sha1_init(struct ah_algorithm_state *state, struct secasvar *sav)
 	}
 
 	state->sav = sav;
-	state->foo = (void *)_MALLOC(64 + 64 + sizeof(SHA1_CTX),
-	    M_TEMP, M_NOWAIT);
+	state->foo = (void *)kalloc_data(HMAC_SHA1_DATA_SIZE, Z_NOWAIT);
 	if (!state->foo) {
 		return ENOBUFS;
 	}
@@ -733,7 +743,7 @@ ah_hmac_sha1_result(struct ah_algorithm_state *state, caddr_t addr, size_t l)
 
 	bcopy(&digest[0], (void *)addr, sizeof(digest) > l ? l : sizeof(digest));
 
-	FREE(state->foo, M_TEMP);
+	kfree_data(state->foo, HMAC_SHA1_DATA_SIZE);
 }
 
 #if AH_ALL_CRYPTO
@@ -792,8 +802,7 @@ ah_hmac_sha2_256_init(struct ah_algorithm_state *state, struct secasvar *sav)
 	}
 
 	state->sav = sav;
-	state->foo = (void *)_MALLOC(64 + 64 + sizeof(SHA256_CTX),
-	    M_TEMP, M_NOWAIT);
+	state->foo = (void *)kalloc_data(HMAC_SHA2_256_DATA_SIZE, Z_NOWAIT);
 	if (!state->foo) {
 		return ENOBUFS;
 	}
@@ -875,7 +884,7 @@ ah_hmac_sha2_256_result(struct ah_algorithm_state *state,
 
 	bcopy(&digest[0], (void *)addr, sizeof(digest) > l ? l : sizeof(digest));
 
-	FREE(state->foo, M_TEMP);
+	kfree_data(state->foo, HMAC_SHA2_256_DATA_SIZE);
 }
 
 static int
@@ -933,8 +942,8 @@ ah_hmac_sha2_384_init(struct ah_algorithm_state *state, struct secasvar *sav)
 	}
 
 	state->sav = sav;
-	state->foo = (void *)_MALLOC(128 + 128 + sizeof(SHA384_CTX),
-	    M_TEMP, M_NOWAIT | M_ZERO);
+	state->foo = (void *)kalloc_data(HMAC_SHA2_384_DATA_SIZE,
+	    Z_NOWAIT | Z_ZERO);
 	if (!state->foo) {
 		return ENOBUFS;
 	}
@@ -1016,7 +1025,7 @@ ah_hmac_sha2_384_result(struct ah_algorithm_state *state,
 
 	bcopy(&digest[0], (void *)addr, sizeof(digest) > l ? l : sizeof(digest));
 
-	FREE(state->foo, M_TEMP);
+	kfree_data(state->foo, HMAC_SHA2_384_DATA_SIZE);
 }
 
 static int
@@ -1074,8 +1083,8 @@ ah_hmac_sha2_512_init(struct ah_algorithm_state *state, struct secasvar *sav)
 	}
 
 	state->sav = sav;
-	state->foo = (void *)_MALLOC(128 + 128 + sizeof(SHA512_CTX),
-	    M_TEMP, M_NOWAIT | M_ZERO);
+	state->foo = (void *)kalloc_data(HMAC_SHA2_512_DATA_SIZE,
+	    Z_NOWAIT | Z_ZERO);
 	if (!state->foo) {
 		return ENOBUFS;
 	}
@@ -1157,7 +1166,7 @@ ah_hmac_sha2_512_result(struct ah_algorithm_state *state,
 
 	bcopy(&digest[0], (void *)addr, sizeof(digest) > l ? l : sizeof(digest));
 
-	FREE(state->foo, M_TEMP);
+	kfree_data(state->foo, HMAC_SHA2_512_DATA_SIZE);
 }
 #endif /* AH_ALL_CRYPTO */
 

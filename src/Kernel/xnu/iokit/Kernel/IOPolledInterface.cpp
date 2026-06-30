@@ -109,7 +109,11 @@ IOPolledFilePollers::copyPollers(IOService * media)
 	IORegistryEntry * child;
 
 	if ((obj = media->copyProperty(kIOPolledInterfaceStackKey))) {
-		return OSDynamicCast(IOPolledFilePollers, obj);
+		IOPolledFilePollers * ioPFPObj = OSDynamicCast(IOPolledFilePollers, obj);
+		if (!ioPFPObj) {
+			OSSafeReleaseNULL(obj);
+		}
+		return ioPFPObj;
 	}
 
 	do{
@@ -447,7 +451,7 @@ file_extent_callback(void * ref, uint64_t start, uint64_t length)
 
 	extent.start  = start;
 	extent.length = length;
-	ctx->extents->appendBytes(&extent, sizeof(extent));
+	ctx->extents->appendValue(extent);
 	ctx->size += length;
 }
 
@@ -617,11 +621,7 @@ IOPolledFileOpen(const char * filename,
 	AbsoluteTime         startTime, endTime;
 	uint64_t             nsec;
 
-	vars = IONew(IOPolledFileIOVars, 1);
-	if (!vars) {
-		return kIOReturnNoMemory;
-	}
-	bzero(vars, sizeof(*vars));
+	vars = IOMallocType(IOPolledFileIOVars);
 	vars->allocated = true;
 
 	do{
@@ -750,21 +750,19 @@ IOPolledFileOpen(const char * filename,
 #endif
 			if (kIOReturnSuccess != err) {
 				HIBLOG("error 0x%x getting path\n", err);
+				OSSafeReleaseNULL(keyUUID);
 				break;
 			}
 			*imagePath = data;
 		}
 
 		// Release key UUID if we have one
-		if (keyUUID) {
-			keyUUID->release();
-			keyUUID = NULL; // Just in case
-		}
+		OSSafeReleaseNULL(keyUUID);
 	}while (false);
 
 	if (kIOReturnSuccess != err) {
 		HIBLOG("error 0x%x opening polled file\n", err);
-		IOPolledFileClose(&vars, 0, NULL, 0, 0, 0);
+		IOPolledFileClose(&vars, 0, NULL, 0, 0, 0, false);
 		if (extentsData) {
 			extentsData->release();
 		}
@@ -798,7 +796,7 @@ IOPolledFileOpen(const char * filename,
 IOReturn
 IOPolledFileClose(IOPolledFileIOVars ** pVars,
     off_t write_offset, void * addr, size_t write_length,
-    off_t discard_offset, off_t discard_end)
+    off_t discard_offset, off_t discard_end, bool unlink)
 {
 	IOPolledFileIOVars * vars;
 
@@ -809,7 +807,7 @@ IOPolledFileClose(IOPolledFileIOVars ** pVars,
 
 	if (vars->fileRef) {
 		kern_close_file_for_direct_io(vars->fileRef, write_offset, addr, write_length,
-		    discard_offset, discard_end);
+		    discard_offset, discard_end, unlink);
 		vars->fileRef = NULL;
 	}
 	if (vars->fileExtents) {
@@ -822,7 +820,7 @@ IOPolledFileClose(IOPolledFileIOVars ** pVars,
 	}
 
 	if (vars->allocated) {
-		IODelete(vars, IOPolledFileIOVars, 1);
+		IOFreeType(vars, IOPolledFileIOVars);
 	} else {
 		bzero(vars, sizeof(IOPolledFileIOVars));
 	}

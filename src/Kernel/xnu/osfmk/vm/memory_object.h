@@ -59,8 +59,6 @@
 #ifndef _VM_MEMORY_OBJECT_H_
 #define _VM_MEMORY_OBJECT_H_
 
-#include <mach_pagemap.h>
-
 #include <mach/boolean.h>
 #include <mach/mach_types.h>
 #include <mach/memory_object_types.h>
@@ -90,31 +88,19 @@ __private_extern__
 vm_object_t             memory_object_to_vm_object(
 	memory_object_t mem_obj);
 
-extern
-mach_port_t             convert_mo_control_to_port(
-	memory_object_control_t control);
-
 extern void memory_object_control_disable(
 	memory_object_control_t *control);
 
-extern
-memory_object_control_t convert_port_to_mo_control(
-	mach_port_t             port);
-
-extern
-mach_port_t             convert_memory_object_to_port(
+extern mach_port_t convert_memory_object_to_port(
 	memory_object_t         object);
 
-extern
-memory_object_t         convert_port_to_memory_object(
+extern memory_object_t convert_port_to_memory_object(
 	mach_port_t             port);
 
 extern upl_t convert_port_to_upl(
 	ipc_port_t      port);
 
 extern ipc_port_t convert_upl_to_port( upl_t );
-
-__private_extern__ void upl_no_senders(ipc_port_t, mach_port_mscount_t);
 
 extern kern_return_t    memory_object_pages_resident(
 	memory_object_control_t         control,
@@ -148,5 +134,9 @@ extern void             memory_object_mark_eligible_for_secluded(
 	memory_object_control_t         control,
 	boolean_t                       eligible_for_secluded);
 #endif /* CONFIG_SECLUDED_MEMORY */
+
+extern void             memory_object_mark_for_realtime(
+	memory_object_control_t         control,
+	bool                            for_realtime);
 
 #endif  /* _VM_MEMORY_OBJECT_H_ */

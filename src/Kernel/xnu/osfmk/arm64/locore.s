@@ -65,25 +65,6 @@
 
 #endif /* XNU_MONITOR */
 
-#define	CBF_DISABLE	0
-#define	CBF_ENABLE	1
-
-.macro COMPARE_BRANCH_FUSION
-#if	defined(APPLE_ARM64_ARCH_FAMILY)
-	mrs             $1, HID1
-	.if $0 == CBF_DISABLE
-	orr		$1, $1, ARM64_REG_HID1_disCmpBrFusion
-	.else
-	mov		$2, ARM64_REG_HID1_disCmpBrFusion
-	bic		$1, $1, $2
-	.endif
-	msr             HID1, $1
-	.if $0 == CBF_DISABLE
-	isb             sy
-	.endif
-#endif
-.endmacro
-
 /*
  * MAP_KERNEL
  *
@@ -522,6 +503,10 @@ check_ktrr_sctlr_trap:
 	.text
 	.align 2
 fleh_dispatch64:
+#if HAS_APPLE_PAC
+	pacib	x1, sp
+#endif
+
 	/* Save arm_saved_state64 */
 	SPILL_REGISTERS KERNEL_MODE
 
@@ -572,19 +557,23 @@ fleh_dispatch64:
 	mov		x26, #0
 #endif
 
-#if	!CONFIG_SKIP_PRECISE_USER_KERNEL_TIME || HAS_FAST_CNTVCT
+#if PRECISE_USER_KERNEL_TIME
 	tst		x23, PSR64_MODE_EL_MASK				// If any EL MODE bits are set, we're coming from
 	b.ne	1f									// kernel mode, so skip precise time update
 	PUSH_FRAME
-	bl		EXT(timer_state_event_user_to_kernel)
+	bl		EXT(recount_leave_user)
 	POP_FRAME
 	mov		x0, x21								// Reload arm_context_t pointer
 1:
-#endif  /* !CONFIG_SKIP_PRECISE_USER_KERNEL_TIME || HAS_FAST_CNTVCT */
+#endif /* PRECISE_USER_KERNEL_TIME */
 
 	/* Dispatch to FLEH */
 
+#if HAS_APPLE_PAC
+	brab	x22,sp
+#else
 	br		x22
+#endif
 
 
 	.text
@@ -640,7 +629,7 @@ UNWIND_EPILOGUE
 .macro BEGIN_INTERRUPT_HANDLER
 	mrs		x22, TPIDR_EL1
 	ldr		x23, [x22, ACT_CPUDATAP]			// Get current cpu
-	/* Update IRQ count */
+	/* Update IRQ count; CPU_STAT_IRQ.* is required to be accurate for the WFE idle sequence  */
 	ldr		w1, [x23, CPU_STAT_IRQ]
 	add		w1, w1, #1							// Increment count
 	str		w1, [x23, CPU_STAT_IRQ]				// Update  IRQ count
@@ -679,12 +668,16 @@ UNWIND_EPILOGUE
 	/* Switch back to kernel stack */
 	ldr		x0, [x22, TH_KSTACKPTR]
 	mov		sp, x0
+	/* Generate a CPU-local event to terminate a post-IRQ WFE */
+	sevl
 .endmacro
 
 	.text
 	.align 2
 	.global EXT(fleh_irq)
 LEXT(fleh_irq)
+UNWIND_PROLOGUE
+UNWIND_DIRECTIVES
 	BEGIN_INTERRUPT_HANDLER
 	PUSH_FRAME
 	bl		EXT(sleh_irq)
@@ -697,6 +690,7 @@ LEXT(fleh_irq)
 
 	mov		x28, #1			// Set a bit to check PFZ if there are ASTs
 	b		exception_return_dispatch
+UNWIND_EPILOGUE
 
 	.text
 	.align 2
@@ -708,6 +702,8 @@ LEXT(fleh_fiq_generic)
 	.align 2
 	.global EXT(fleh_fiq)
 LEXT(fleh_fiq)
+UNWIND_PROLOGUE
+UNWIND_DIRECTIVES
 	BEGIN_INTERRUPT_HANDLER
 	PUSH_FRAME
 	bl		EXT(sleh_fiq)
@@ -720,11 +716,14 @@ LEXT(fleh_fiq)
 
 	mov		x28, #1			// Set a bit to check PFZ if there are ASTs
 	b		exception_return_dispatch
+UNWIND_EPILOGUE
 
 	.text
 	.align 2
 	.global EXT(fleh_serror)
 LEXT(fleh_serror)
+UNWIND_PROLOGUE
+UNWIND_DIRECTIVES
 	mrs		x1, ESR_EL1							// Load exception syndrome
 	mrs		x2, FAR_EL1							// Load fault address
 
@@ -738,6 +737,7 @@ LEXT(fleh_serror)
 
 	mov		x28, xzr		// Don't need to check PFZ If there are ASTs
 	b		exception_return_dispatch
+UNWIND_EPILOGUE
 
 /*
  * Register state saved before we get here.
@@ -799,6 +799,7 @@ exception_return_dispatch:
 	b.ne		EXT(return_to_kernel) // return to kernel if M[3:2] > 0
 	b		return_to_user
 
+
 	.text
 	.align 2
 	.global EXT(return_to_kernel)
@@ -809,8 +810,8 @@ LEXT(return_to_kernel)
 	msr		DAIFSet, #DAIFSC_ALL                    // Disable exceptions
 	cbnz	x1, exception_return_unint_tpidr_x3     // If preemption disabled, skip AST check
 	ldr		x1, [x3, ACT_CPUDATAP]                  // Get current CPU data pointer
-	ldr		x2, [x1, CPU_PENDING_AST]               // Get ASTs
-	tst		x2, AST_URGENT                          // If no urgent ASTs, skip ast_taken
+	ldr		w2, [x1, CPU_PENDING_AST]               // Get ASTs
+	tst		w2, AST_URGENT                          // If no urgent ASTs, skip ast_taken
 	b.eq	exception_return_unint_tpidr_x3
 	mov		sp, x21                                 // Switch to thread stack for preemption
 	PUSH_FRAME
@@ -824,6 +825,11 @@ LEXT(thread_bootstrap_return)
 #if CONFIG_DTRACE
 	bl		EXT(dtrace_thread_bootstrap)
 #endif
+#if KASAN_TBI
+	PUSH_FRAME
+	bl		EXT(__asan_handle_no_return)
+	POP_FRAME
+#endif /* KASAN_TBI */
 	b		EXT(arm64_thread_exception_return)
 
 	.text
@@ -844,25 +850,25 @@ LEXT(arm64_thread_exception_return)
  * x28 is a bit indicating whether or not we should check if pc is in pfz */
 return_to_user:
 check_user_asts:
+#if KASAN_TBI
+	PUSH_FRAME
+	bl		EXT(__asan_handle_no_return)
+	POP_FRAME
+#endif /* KASAN_TBI */
 	mrs		x3, TPIDR_EL1					// Load thread pointer
 
 	movn		w2, #0
 	str		w2, [x3, TH_IOTIER_OVERRIDE]			// Reset IO tier override to -1 before returning to user
 
 #if MACH_ASSERT
-	ldr		w0, [x3, TH_RWLOCK_CNT]
-	cbnz		w0, rwlock_count_notzero			// Detect unbalanced RW lock/unlock
-
 	ldr		w0, [x3, ACT_PREEMPT_CNT]
 	cbnz		w0, preempt_count_notzero			// Detect unbalanced enable/disable preemption
 #endif
-	ldr		w0, [x3, TH_TMP_ALLOC_CNT]
-	cbnz		w0, tmp_alloc_count_nozero			// Detect KHEAP_TEMP leaks
 
 	msr		DAIFSet, #DAIFSC_ALL				// Disable exceptions
 	ldr		x4, [x3, ACT_CPUDATAP]				// Get current CPU data pointer
-	ldr		x0, [x4, CPU_PENDING_AST]			// Get ASTs
-	cbz		x0, no_asts							// If no asts, skip ahead
+	ldr		w0, [x4, CPU_PENDING_AST]			// Get ASTs
+	cbz		w0, no_asts							// If no asts, skip ahead
 
 	cbz		x28, user_take_ast					// If we don't need to check PFZ, just handle asts
 
@@ -893,13 +899,13 @@ restore_and_check_ast:
 no_asts:
 
 
-#if	!CONFIG_SKIP_PRECISE_USER_KERNEL_TIME || HAS_FAST_CNTVCT
+#if PRECISE_USER_KERNEL_TIME
 	mov		x19, x3						// Preserve thread pointer across function call
 	PUSH_FRAME
-	bl		EXT(timer_state_event_kernel_to_user)
+	bl		EXT(recount_enter_user)
 	POP_FRAME
 	mov		x3, x19
-#endif  /* !CONFIG_SKIP_PRECISE_USER_KERNEL_TIME || HAS_FAST_CNTVCT */
+#endif /* PRECISE_USER_KERNEL_TIME */
 
 #if (CONFIG_KERNEL_INTEGRITY && KERNEL_INTEGRITY_WT)
 	/* Watchtower
@@ -933,33 +939,18 @@ no_asts:
 	cmp		x0, x1
 	beq		L_skip_user_set_debug_state			// If active CPU debug state does not match thread debug state, apply thread state
 
-#if defined(APPLELIGHTNING)
-/* rdar://53177964 ([Cebu Errata SW WA][v8Debug] MDR NEX L3 clock turns OFF during restoreCheckpoint due to SWStep getting masked) */
-
-	ARM64_IS_PCORE x12                                  // if we're not a pCORE, also do nothing
-	cbz		x12, 1f
-
-	mrs		x12, HID1                         // if any debug session ever existed, set forceNexL3ClkOn
-	orr		x12, x12, ARM64_REG_HID1_forceNexL3ClkOn
-	msr		HID1, x12
-1:
-
-#endif
 
 	PUSH_FRAME
 	bl		EXT(arm_debug_set)					// Establish thread debug state in live regs
 	POP_FRAME
 	mrs		x3, TPIDR_EL1						// Reload thread pointer
+	ldr		x4, [x3, ACT_CPUDATAP]				// Reload CPU data pointer
 L_skip_user_set_debug_state:
+	ldrsh	x0, [x4, CPU_NUMBER_GS]
+	msr		TPIDR_EL0, x0
 
 
 	b		exception_return_unint_tpidr_x3
-
-	//
-	// Fall through from return_to_user to exception_return.
-	// Note that if we move exception_return or add a new routine below
-	// return_to_user, the latter will have to change.
-	//
 
 exception_return:
 	msr		DAIFSet, #DAIFSC_ALL				// Disable exceptions
@@ -968,10 +959,27 @@ exception_return_unint:
 exception_return_unint_tpidr_x3:
 	mov		sp, x21						// Reload the pcb pointer
 
-exception_return_unint_tpidr_x3_dont_trash_x18:
+#if !__ARM_KERNEL_PROTECT__
+	/*
+	 * Restore x18 only if the task has the entitlement that allows
+	 * usage. Those are very few, and can move to something else
+	 * once we use x18 for something more global.
+	 *
+	 * This is not done here on devices with __ARM_KERNEL_PROTECT__, as
+	 * that uses x18 as one of the global use cases (and will reset
+	 * x18 later down below).
+	 *
+	 * It's also unconditionally skipped for translated threads,
+	 * as those are another use case, one where x18 must be preserved.
+	 */
+	ldr		w0, [x3, TH_ARM_MACHINE_FLAGS]
+	mov		x18, #0
+	tbz		w0, ARM_MACHINE_THREAD_PRESERVE_X18_SHIFT, Lexception_return_restore_registers
 
+exception_return_unint_tpidr_x3_restore_x18:
+	ldr		x18, [sp, SS64_X18]
 
-#if __ARM_KERNEL_PROTECT__
+#else /* !__ARM_KERNEL_PROTECT__ */
 	/*
 	 * If we are going to eret to userspace, we must return through the EL0
 	 * eret mapping.
@@ -989,19 +997,20 @@ exception_return_unint_tpidr_x3_dont_trash_x18:
 	br		x0
 
 Lskip_el0_eret_mapping:
-#endif /* __ARM_KERNEL_PROTECT__ */
+#endif /* !__ARM_KERNEL_PROTECT__ */
 
 Lexception_return_restore_registers:
 	mov 	x0, sp								// x0 = &pcb
 	// Loads authed $x0->ss_64.pc into x1 and $x0->ss_64.cpsr into w2
-	AUTH_THREAD_STATE_IN_X0	x20, x21, x22, x23, x24, el0_state_allowed=1
+	AUTH_THREAD_STATE_IN_X0	x20, x21, x22, x23, x24, x25, el0_state_allowed=1
+
+	msr		ELR_EL1, x1							// Load the return address into ELR
+	msr		SPSR_EL1, x2						// Load the return CPSR into SPSR
 
 /* Restore special register state */
 	ldr		w3, [sp, NS64_FPSR]
 	ldr		w4, [sp, NS64_FPCR]
 
-	msr		ELR_EL1, x1							// Load the return address into ELR
-	msr		SPSR_EL1, x2						// Load the return CPSR into SPSR
 	msr		FPSR, x3
 	mrs		x5, FPCR
 	CMSR FPCR, x5, x4, 1
@@ -1037,7 +1046,8 @@ Lexception_return_restore_registers:
 	ldp		x12, x13, [x0, SS64_X12]
 	ldp		x14, x15, [x0, SS64_X14]
 	// Skip x16, x17 - already loaded + authed by AUTH_THREAD_STATE_IN_X0
-	ldp		x18, x19, [x0, SS64_X18]
+	// Skip x18 - already restored or trashed above (below with __ARM_KERNEL_PROTECT__)
+	ldr		x19, [x0, SS64_X19]
 	ldp		x20, x21, [x0, SS64_X20]
 	ldp		x22, x23, [x0, SS64_X22]
 	ldp		x24, x25, [x0, SS64_X24]
@@ -1105,19 +1115,6 @@ L_underflow_str:
 #if MACH_ASSERT
 	.text
 	.align 2
-rwlock_count_notzero:
-	mrs		x0, TPIDR_EL1
-	str		x0, [sp, #-16]!						// We'll print thread pointer
-	ldr		w0, [x0, TH_RWLOCK_CNT]
-	str		w0, [sp, #8]
-	adr		x0, L_rwlock_count_notzero_str				// Format string
-	CALL_EXTERN panic							// Game over
-
-L_rwlock_count_notzero_str:
-	.asciz "RW lock count not 0 on thread %p (%u)"
-
-	.text
-	.align 2
 preempt_count_notzero:
 	mrs		x0, TPIDR_EL1
 	str		x0, [sp, #-16]!						// We'll print thread pointer
@@ -1129,12 +1126,6 @@ preempt_count_notzero:
 L_preempt_count_notzero_str:
 	.asciz "preemption count not 0 on thread %p (%u)"
 #endif /* MACH_ASSERT */
-
-	.text
-	.align 2
-tmp_alloc_count_nozero:
-	mrs		x0, TPIDR_EL1
-	CALL_EXTERN kheap_temp_leak_panic
 
 #if __ARM_KERNEL_PROTECT__
 	/*
@@ -1154,6 +1145,8 @@ LEXT(ExceptionVectorsEnd)
  * Functions to preflight the fleh handlers when the PPL has taken an exception;
  * mostly concerned with setting up state for the normal fleh code.
  */
+	.text
+	.align 2
 fleh_synchronous_from_ppl:
 	/* Save x0. */
 	mov		x15, x0
@@ -1316,6 +1309,7 @@ Lppl_fail_dispatch:
 	b		ppl_return_to_kernel_mode
 
 Lppl_dispatch_exit:
+
 	/* Indicate that we are cleanly exiting the PPL. */
 	mov		x15, #PPL_EXIT_DISPATCH
 
@@ -1324,6 +1318,10 @@ Lppl_dispatch_exit:
 
 	/* Move the saved DAIF bits. */
 	mov		x10, x20
+
+	/* Clear the in-flight pmap pointer */
+	add		x13, x12, PMAP_CPU_DATA_INFLIGHT_PMAP
+	stlr		xzr, [x13]
 
 	/* Clear the old stack pointer. */
 	str		xzr, [x12, PMAP_CPU_DATA_KERN_SAVED_SP]
@@ -1352,12 +1350,17 @@ ppl_exit:
 	cmp		x15, #PPL_EXIT_EXCEPTION
 	b.eq	Ljump_to_fleh_handler
 
-	/* Restore the original AIF state. */
-	REENABLE_DAIF	x10
-
 	/* If this was a panic call from the PPL, reinvoke panic. */
 	cmp		x15, #PPL_EXIT_PANIC_CALL
 	b.eq	Ljump_to_panic_trap_to_debugger
+
+	/*
+	 * Stash off the original DAIF in the high bits of the exit code register.
+	 * We could keep this in a dedicated register, but that would require us to copy it to
+	 * an additional callee-save register below (e.g. x22), which in turn would require that
+	 * register to be saved/restored at PPL entry/exit.
+	 */
+	add		x15, x15, x10, lsl #32
 
 	/* Load the preemption count. */
 	mrs		x10, TPIDR_EL1
@@ -1370,24 +1373,55 @@ Lno_preempt_underflow:
 
 	/* Lower the preemption count. */
 	sub		w12, w12, #1
+
+#if SCHED_HYGIENE_DEBUG
+	/* Collect preemption disable measurement if necessary. */
+
+	/*
+	 * Only collect measurement if this reenabled preemption,
+	 * and SCHED_HYGIENE_MARKER is set.
+	 */
+	mov		x20, #SCHED_HYGIENE_MARKER
+	cmp		w12, w20
+	b.ne	Lskip_collect_measurement
+
+	/* Stash our return value and return reason. */
+	mov		x20, x0
+	mov		x21, x15
+
+	/* Collect measurement. */
+	bl		EXT(_collect_preemption_disable_measurement)
+
+	/* Restore the return value and the return reason. */
+	mov		x0, x20
+	mov		x15, x21
+	/* ... and w12, which is now 0. */
+	mov		w12, #0
+
+	/* Restore the thread pointer into x10. */
+	mrs		x10, TPIDR_EL1
+
+Lskip_collect_measurement:
+#endif /* SCHED_HYGIENE_DEBUG */
+
+	/* Save the lowered preemption count. */
 	str		w12, [x10, ACT_PREEMPT_CNT]
 
 	/* Skip ASTs if the peemption count is not zero. */
 	cbnz	x12, Lppl_skip_ast_taken
 
-	/* Skip the AST check if interrupts are disabled. */
-	mrs		x1, DAIF
-	tst	x1, #DAIF_IRQF
-	b.ne	Lppl_skip_ast_taken
-
-	/* Disable interrupts. */
-	msr		DAIFSet, #(DAIFSC_IRQF | DAIFSC_FIQF)
+	/*
+	 * Skip the AST check if interrupts were originally disabled.
+	 * The original DAIF state prior to PPL entry is stored in the upper
+	 * 32 bits of x15.
+	 */
+	tbnz		x15, #(DAIF_IRQF_SHIFT + 32), Lppl_skip_ast_taken
 
 	/* IF there is no urgent AST, skip the AST. */
 	ldr		x12, [x10, ACT_CPUDATAP]
-	ldr		x14, [x12, CPU_PENDING_AST]
-	tst		x14, AST_URGENT
-	b.eq	Lppl_defer_ast_taken
+	ldr		w14, [x12, CPU_PENDING_AST]
+	tst		w14, AST_URGENT
+	b.eq	Lppl_skip_ast_taken
 
 	/* Stash our return value and return reason. */
 	mov		x20, x0
@@ -1400,11 +1434,13 @@ Lno_preempt_underflow:
 	mov		x15, x21
 	mov		x0, x20
 
-Lppl_defer_ast_taken:
-	/* Reenable interrupts. */
-	msr		DAIFClr, #(DAIFSC_IRQF | DAIFSC_FIQF)
-
 Lppl_skip_ast_taken:
+
+	/* Extract caller DAIF from high-order bits of exit code */
+	ubfx	x10, x15, #32, #32
+	bfc		x15, #32, #32
+	msr		DAIF, x10
+
 	/* Pop the stack frame. */
 	ldp		x29, x30, [sp, #0x10]
 	ldp		x20, x21, [sp], #0x20
@@ -1441,7 +1477,7 @@ LEXT(ppl_dispatch)
 	stp		x12, x13, [sp, #-0x10]!
 
 	/* Restore the original AIF state. */
-	REENABLE_DAIF	x20
+	msr		DAIF, x20
 
 	/*
 	 * Note that if the method is NULL, we'll blow up with a prefetch abort,
@@ -1456,7 +1492,7 @@ LEXT(ppl_dispatch)
 #endif
 
 	/* Disable AIF. */
-	msr		DAIFSet, #(DAIFSC_ASYNCF | DAIFSC_IRQF | DAIFSC_FIQF)
+	msr		DAIFSet, #(DAIFSC_STANDARD_DISABLE)
 
 	/* Restore those important registers. */
 	ldp		x12, x13, [sp], #0x10
@@ -1484,6 +1520,12 @@ LEXT(ppl_bootstrap_dispatch)
 #else
 	blr		x10
 #endif
+	LOAD_PMAP_CPU_DATA	x9, x10, x11
+
+	/* Clear the in-flight pmap pointer */
+	add		x9, x9, PMAP_CPU_DATA_INFLIGHT_PMAP
+	stlr		xzr, [x9]
+
 	/* Stash off the return value */
 	mov		x20, x0
 	/* Drop the preemption count */
@@ -1515,7 +1557,7 @@ Lppl_fail_bootstrap_dispatch:
 	.globl EXT(ml_panic_trap_to_debugger)
 LEXT(ml_panic_trap_to_debugger)
 	mrs		x10, DAIF
-	msr		DAIFSet, #(DAIFSC_ASYNCF | DAIFSC_IRQF | DAIFSC_FIQF)
+	msr		DAIFSet, #(DAIFSC_STANDARD_DISABLE)
 
 	adrp		x12, EXT(pmap_ppl_locked_down)@page
 	ldr		w12, [x12, #EXT(pmap_ppl_locked_down)@pageoff]
@@ -1541,7 +1583,7 @@ LEXT(ml_panic_trap_to_debugger)
 	/* Now we are ready to exit the PPL. */
 	b		ppl_return_to_kernel_mode
 Lnot_in_ppl_dispatch:
-	REENABLE_DAIF	x10
+	msr		DAIF, x10
 	ret
 
 	.data
@@ -1554,6 +1596,7 @@ Lppl_bad_call_panic_str:
 LEXT(ml_panic_trap_to_debugger)
 	ret
 #endif /* XNU_MONITOR */
+
 
 /* ARM64_TODO Is globals_asm.h needed? */
 //#include	"globals_asm.h"

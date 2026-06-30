@@ -43,16 +43,10 @@
 #include <uuid/uuid.h>
 #ifdef BSD_KERNEL_PRIVATE
 #include <netkey/keydb.h>
+#include <netinet/in_var.h>
 #include <netinet/ip_var.h>
 
 #include <os/log.h>
-
-/* lock for IPsec stats */
-extern lck_grp_t         *sadb_stat_mutex_grp;
-extern lck_grp_attr_t    *sadb_stat_mutex_grp_attr;
-extern lck_attr_t        *sadb_stat_mutex_attr;
-extern lck_mtx_t         *sadb_stat_mutex;
-
 
 #define IPSEC_STAT_INCREMENT(x) \
 	OSIncrementAtomic64((SInt64 *)&x)
@@ -114,10 +108,10 @@ struct secpolicy {
 	 * "lifetime" is passed by sadb_lifetime.sadb_lifetime_addtime.
 	 * "validtime" is passed by sadb_lifetime.sadb_lifetime_usetime.
 	 */
-	long created;           /* time created the policy */
-	long lastused;          /* updated every when kernel sends a packet */
-	long lifetime;          /* duration of the lifetime of this policy */
-	long validtime;         /* duration this policy is valid without use */
+	u_int64_t created;      /* time created the policy */
+	u_int64_t lastused;     /* updated every when kernel sends a packet */
+	u_int64_t lifetime;     /* duration of the lifetime of this policy */
+	u_int64_t validtime;    /* duration this policy is valid without use */
 };
 
 /* Request for IPsec */
@@ -145,7 +139,7 @@ struct secspacq {
 
 	struct secpolicyindex spidx;
 
-	long created;           /* for lifetime */
+	u_int64_t created;      /* for lifetime */
 	int count;              /* for lifetime */
 	/* XXX: here is mbuf place holder to be sent ? */
 };
@@ -204,6 +198,15 @@ struct secspacq {
  * by only itself.
  */
 #define IPSEC_REPLAYWSIZE  32
+
+/*
+ * Maximum key sizes in bytes expected to be passed from userspace.
+ *
+ * These values are based on the NULL algorithms for AH and ESP,
+ * which both specify a keymax of 2048 bits.
+ */
+#define IPSEC_KEY_AUTH_MAX_BYTES    256
+#define IPSEC_KEY_ENCRYPT_MAX_BYTES 256
 
 /* statistics for ipsec processing */
 struct ipsecstat {
@@ -320,6 +323,7 @@ struct ipsec_output_state {
 	struct route_in6 ro;
 	struct sockaddr *dst;
 	u_int outgoing_if;
+	u_int32_t dscp_mapping;
 };
 
 struct ipsec_history {

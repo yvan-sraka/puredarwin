@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2011-2020 Apple Inc. All rights reserved.
+ * Copyright (c) 2011-2021 Apple Inc. All rights reserved.
  *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
  *
@@ -48,21 +48,57 @@
 
 #include <libkern/libkern.h>
 
+#if SKYWALK
+#include <skywalk/os_skywalk_private.h>
+#include <skywalk/nexus/netif/nx_netif.h>
+#endif /* SKYWALK */
 
 static errno_t ifclassq_dequeue_common(struct ifclassq *, mbuf_svc_class_t,
     u_int32_t, u_int32_t, classq_pkt_t *, classq_pkt_t *, u_int32_t *,
-    u_int32_t *, boolean_t);
+    u_int32_t *, boolean_t, u_int8_t);
 static void ifclassq_tbr_dequeue_common(struct ifclassq *, mbuf_svc_class_t,
-    boolean_t, classq_pkt_t *);
+    boolean_t, classq_pkt_t *, u_int8_t);
 
-static u_int64_t ifclassq_target_qdelay = 0;
-SYSCTL_QUAD(_net_classq, OID_AUTO, target_qdelay, CTLFLAG_RW | CTLFLAG_LOCKED,
-    &ifclassq_target_qdelay, "target queue delay in nanoseconds");
+static uint64_t ifclassq_def_c_target_qdelay = 0;
+SYSCTL_QUAD(_net_classq, OID_AUTO, def_c_target_qdelay, CTLFLAG_RW | CTLFLAG_LOCKED,
+    &ifclassq_def_c_target_qdelay, "def classic target queue delay in nanoseconds");
 
-static u_int64_t ifclassq_update_interval = 0;
-SYSCTL_QUAD(_net_classq, OID_AUTO, update_interval,
-    CTLFLAG_RW | CTLFLAG_LOCKED, &ifclassq_update_interval,
-    "update interval in nanoseconds");
+static uint64_t ifclassq_def_c_update_interval = 0;
+SYSCTL_QUAD(_net_classq, OID_AUTO, def_c_update_interval,
+    CTLFLAG_RW | CTLFLAG_LOCKED, &ifclassq_def_c_update_interval,
+    "def classic update interval in nanoseconds");
+
+static uint64_t ifclassq_def_l4s_target_qdelay = 0;
+SYSCTL_QUAD(_net_classq, OID_AUTO, def_l4s_target_qdelay, CTLFLAG_RW | CTLFLAG_LOCKED,
+    &ifclassq_def_l4s_target_qdelay, "def L4S target queue delay in nanoseconds");
+
+static uint64_t ifclassq_def_l4s_update_interval = 0;
+SYSCTL_QUAD(_net_classq, OID_AUTO, def_l4s_update_interval,
+    CTLFLAG_RW | CTLFLAG_LOCKED, &ifclassq_def_l4s_update_interval,
+    "def L4S update interval in nanoseconds");
+
+static uint64_t ifclassq_ll_c_target_qdelay = 0;
+SYSCTL_QUAD(_net_classq, OID_AUTO, ll_c_target_qdelay, CTLFLAG_RW | CTLFLAG_LOCKED,
+    &ifclassq_ll_c_target_qdelay, "low latency classic target queue delay in nanoseconds");
+
+static uint64_t ifclassq_ll_c_update_interval = 0;
+SYSCTL_QUAD(_net_classq, OID_AUTO, ll_c_update_interval,
+    CTLFLAG_RW | CTLFLAG_LOCKED, &ifclassq_ll_c_update_interval,
+    "low latency classic update interval in nanoseconds");
+
+static uint64_t ifclassq_ll_l4s_target_qdelay = 0;
+SYSCTL_QUAD(_net_classq, OID_AUTO, ll_l4s_target_qdelay, CTLFLAG_RW | CTLFLAG_LOCKED,
+    &ifclassq_ll_l4s_target_qdelay, "low latency L4S target queue delay in nanoseconds");
+
+static uint64_t ifclassq_ll_l4s_update_interval = 0;
+SYSCTL_QUAD(_net_classq, OID_AUTO, ll_l4s_update_interval,
+    CTLFLAG_RW | CTLFLAG_LOCKED, &ifclassq_ll_l4s_update_interval,
+    "low latency L4S update interval in nanoseconds");
+
+uint32_t ifclassq_enable_l4s = 0;
+SYSCTL_UINT(_net_classq, OID_AUTO, enable_l4s,
+    CTLFLAG_RW | CTLFLAG_LOCKED, &ifclassq_enable_l4s, 0,
+    "enable/disable L4S");
 
 #if DEBUG || DEVELOPMENT
 uint32_t ifclassq_flow_control_adv = 1; /* flow control advisory */
@@ -73,6 +109,10 @@ SYSCTL_UINT(_net_classq, OID_AUTO, flow_control_adv,
 uint16_t fq_codel_quantum = 0;
 #endif /* DEBUG || DEVELOPMENT */
 
+static KALLOC_TYPE_DEFINE(ifcq_zone, struct ifclassq, NET_KT_DEFAULT);
+LCK_ATTR_DECLARE(ifcq_lock_attr, 0, 0);
+static LCK_GRP_DECLARE(ifcq_lock_group, "ifclassq locks");
+
 void
 classq_init(void)
 {
@@ -82,19 +122,29 @@ classq_init(void)
 #if DEBUG || DEVELOPMENT
 	PE_parse_boot_argn("fq_codel_quantum", &fq_codel_quantum,
 	    sizeof(fq_codel_quantum));
-	PE_parse_boot_argn("ifclassq_target_qdelay", &ifclassq_target_qdelay,
-	    sizeof(ifclassq_target_qdelay));
-	PE_parse_boot_argn("ifclassq_update_interval",
-	    &ifclassq_update_interval, sizeof(ifclassq_update_interval));
+	PE_parse_boot_argn("ifclassq_def_c_target_qdelay", &ifclassq_def_c_target_qdelay,
+	    sizeof(ifclassq_def_c_target_qdelay));
+	PE_parse_boot_argn("ifclassq_def_c_update_interval",
+	    &ifclassq_def_c_update_interval, sizeof(ifclassq_def_c_update_interval));
+	PE_parse_boot_argn("ifclassq_def_l4s_target_qdelay", &ifclassq_def_l4s_target_qdelay,
+	    sizeof(ifclassq_def_l4s_target_qdelay));
+	PE_parse_boot_argn("ifclassq_def_l4s_update_interval",
+	    &ifclassq_def_l4s_update_interval, sizeof(ifclassq_def_l4s_update_interval));
+	PE_parse_boot_argn("ifclassq_ll_c_target_qdelay", &ifclassq_ll_c_target_qdelay,
+	    sizeof(ifclassq_ll_c_target_qdelay));
+	PE_parse_boot_argn("ifclassq_ll_c_update_interval",
+	    &ifclassq_ll_c_update_interval, sizeof(ifclassq_ll_c_update_interval));
+	PE_parse_boot_argn("ifclassq_ll_l4s_target_qdelay", &ifclassq_ll_l4s_target_qdelay,
+	    sizeof(ifclassq_ll_l4s_target_qdelay));
+	PE_parse_boot_argn("ifclassq_ll_l4s_update_interval",
+	    &ifclassq_ll_l4s_update_interval, sizeof(ifclassq_ll_l4s_update_interval));
 #endif /* DEBUG || DEVELOPMENT */
 	fq_codel_init();
 }
 
 int
-ifclassq_setup(struct ifnet *ifp, u_int32_t sflags, boolean_t reuse)
+ifclassq_setup(struct ifclassq *ifq, struct ifnet *ifp, uint32_t sflags)
 {
-#pragma unused(reuse)
-	struct ifclassq *ifq = &ifp->if_snd;
 	int err = 0;
 
 	IFCQ_LOCK(ifq);
@@ -138,22 +188,23 @@ ifclassq_setup(struct ifnet *ifp, u_int32_t sflags, boolean_t reuse)
 }
 
 void
-ifclassq_teardown(struct ifnet *ifp)
+ifclassq_teardown(struct ifclassq *ifq)
 {
-	struct ifclassq *ifq = &ifp->if_snd;
-
 	IFCQ_LOCK(ifq);
-
+	if (IFCQ_IS_DESTROYED(ifq)) {
+		ASSERT((ifq->ifcq_flags & ~IFCQF_DESTROYED) == 0);
+		goto done;
+	}
 	if (IFCQ_IS_READY(ifq)) {
 		if (IFCQ_TBR_IS_ENABLED(ifq)) {
-			struct tb_profile tb = { .rate = 0, .percent = 0, .depth = 0 };
+			struct tb_profile tb =
+			{ .rate = 0, .percent = 0, .depth = 0 };
 			(void) ifclassq_tbr_set(ifq, &tb, FALSE);
 		}
 		pktsched_teardown(ifq);
-		ifq->ifcq_flags = 0;
+		ifq->ifcq_flags &= ~IFCQF_READY;
 	}
 	ifq->ifcq_sflags = 0;
-
 	VERIFY(IFCQ_IS_EMPTY(ifq));
 	VERIFY(!IFCQ_TBR_IS_ENABLED(ifq));
 	VERIFY(ifq->ifcq_type == PKTSCHEDT_NONE);
@@ -165,7 +216,8 @@ ifclassq_teardown(struct ifnet *ifp)
 	IFCQ_MAXLEN(ifq) = 0;
 	bzero(&ifq->ifcq_xmitcnt, sizeof(ifq->ifcq_xmitcnt));
 	bzero(&ifq->ifcq_dropcnt, sizeof(ifq->ifcq_dropcnt));
-
+	ifq->ifcq_flags |= IFCQF_DESTROYED;
+done:
 	IFCQ_UNLOCK(ifq);
 }
 
@@ -178,6 +230,10 @@ ifclassq_pktsched_setup(struct ifclassq *ifq)
 
 	IFCQ_LOCK_ASSERT_HELD(ifq);
 	VERIFY(ifp->if_eflags & IFEF_TXSTART);
+#if SKYWALK
+	ptype = ((ifp->if_eflags & IFEF_SKYWALK_NATIVE) != 0) ? QP_PACKET :
+	    QP_MBUF;
+#endif /* SKYWALK */
 
 	err = pktsched_setup(ifq, PKTSCHEDT_FQ_CODEL, ifq->ifcq_sflags, ptype);
 
@@ -202,20 +258,23 @@ ifclassq_get_maxlen(struct ifclassq *ifq)
 }
 
 int
-ifclassq_get_len(struct ifclassq *ifq, mbuf_svc_class_t sc, u_int32_t *packets,
-    u_int32_t *bytes)
+ifclassq_get_len(struct ifclassq *ifq, mbuf_svc_class_t sc, u_int8_t grp_idx,
+    u_int32_t *packets, u_int32_t *bytes)
 {
 	int err = 0;
 
 	IFCQ_LOCK(ifq);
-	if (sc == MBUF_SC_UNSPEC) {
+	if ((ifq->ifcq_flags & (IFCQF_READY | IFCQF_ENABLED)) !=
+	    (IFCQF_READY | IFCQF_ENABLED)) {
+		return ENXIO;
+	}
+	if (sc == MBUF_SC_UNSPEC && grp_idx == IF_CLASSQ_ALL_GRPS) {
 		VERIFY(packets != NULL);
 		*packets = IFCQ_LEN(ifq);
 	} else {
-		cqrq_stat_sc_t req = { sc, 0, 0 };
+		cqrq_stat_sc_t req = { sc, grp_idx, 0, 0 };
 
-		VERIFY(MBUF_VALID_SC(sc));
-		VERIFY(packets != NULL && bytes != NULL);
+		VERIFY(MBUF_VALID_SC(sc) || sc == MBUF_SC_UNSPEC);
 
 		err = fq_if_request_classq(ifq, CLASSQRQ_STAT_SC, &req);
 		if (packets != NULL) {
@@ -227,6 +286,15 @@ ifclassq_get_len(struct ifclassq *ifq, mbuf_svc_class_t sc, u_int32_t *packets,
 	}
 	IFCQ_UNLOCK(ifq);
 
+#if SKYWALK
+	struct ifnet *ifp = ifq->ifcq_ifp;
+
+	if (__improbable(ifp->if_na_ops != NULL &&
+	    ifp->if_na_ops->ni_get_len != NULL)) {
+		err = ifp->if_na_ops->ni_get_len(ifp->if_na, sc, packets,
+		    bytes, err);
+	}
+#endif /* SKYWALK */
 
 	return err;
 }
@@ -248,6 +316,14 @@ ifclassq_set_packet_metadata(struct ifclassq *ifq, struct ifnet *ifp,
 		break;
 	}
 
+#if SKYWALK
+	case QP_PACKET:
+		/*
+		 * Support for equivalent of mbuf_get_unsent_data_bytes()
+		 * is not needed in the Skywalk architecture.
+		 */
+		break;
+#endif /* SKYWALK */
 
 	default:
 		VERIFY(0);
@@ -266,25 +342,26 @@ ifclassq_enqueue(struct ifclassq *ifq, classq_pkt_t *head, classq_pkt_t *tail,
 errno_t
 ifclassq_dequeue(struct ifclassq *ifq, u_int32_t pkt_limit,
     u_int32_t byte_limit, classq_pkt_t *head, classq_pkt_t *tail,
-    u_int32_t *cnt, u_int32_t *len)
+    u_int32_t *cnt, u_int32_t *len, u_int8_t grp_idx)
 {
 	return ifclassq_dequeue_common(ifq, MBUF_SC_UNSPEC, pkt_limit,
-	           byte_limit, head, tail, cnt, len, FALSE);
+	           byte_limit, head, tail, cnt, len, FALSE, grp_idx);
 }
 
 errno_t
 ifclassq_dequeue_sc(struct ifclassq *ifq, mbuf_svc_class_t sc,
     u_int32_t pkt_limit, u_int32_t byte_limit, classq_pkt_t *head,
-    classq_pkt_t *tail, u_int32_t *cnt, u_int32_t *len)
+    classq_pkt_t *tail, u_int32_t *cnt, u_int32_t *len, u_int8_t grp_idx)
 {
 	return ifclassq_dequeue_common(ifq, sc, pkt_limit, byte_limit,
-	           head, tail, cnt, len, TRUE);
+	           head, tail, cnt, len, TRUE, grp_idx);
 }
 
 static errno_t
 ifclassq_dequeue_common_default(struct ifclassq *ifq, mbuf_svc_class_t sc,
     u_int32_t pkt_limit, u_int32_t byte_limit, classq_pkt_t *head,
-    classq_pkt_t *tail, u_int32_t *cnt, u_int32_t *len, boolean_t drvmgt)
+    classq_pkt_t *tail, u_int32_t *cnt, u_int32_t *len, boolean_t drvmgt,
+    u_int8_t grp_idx)
 {
 	struct ifnet *ifp = ifq->ifcq_ifp;
 	u_int32_t i = 0, l = 0;
@@ -306,7 +383,7 @@ ifclassq_dequeue_common_default(struct ifclassq *ifq, mbuf_svc_class_t sc,
 
 		IFCQ_LOCK_SPIN(ifq);
 		err = fq_if_dequeue_sc_classq_multi(ifq, sc, pkt_limit,
-		    byte_limit, head, tail, cnt, len);
+		    byte_limit, head, tail, cnt, len, grp_idx);
 		IFCQ_UNLOCK(ifq);
 
 		if (err == 0 && head->cp_mbuf == NULL) {
@@ -318,7 +395,7 @@ ifclassq_dequeue_common_default(struct ifclassq *ifq, mbuf_svc_class_t sc,
 
 		IFCQ_LOCK_SPIN(ifq);
 		err = fq_if_dequeue_classq_multi(ifq, pkt_limit, byte_limit,
-		    head, tail, cnt, len);
+		    head, tail, cnt, len, grp_idx);
 		IFCQ_UNLOCK(ifq);
 
 		if (err == 0 && head->cp_mbuf == NULL) {
@@ -328,22 +405,14 @@ ifclassq_dequeue_common_default(struct ifclassq *ifq, mbuf_svc_class_t sc,
 	}
 
 dequeue_loop:
-
+	VERIFY(IFCQ_TBR_IS_ENABLED(ifq));
 	IFCQ_LOCK_SPIN(ifq);
 
 	while (i < pkt_limit && l < byte_limit) {
 		if (drvmgt) {
-			if (IFCQ_TBR_IS_ENABLED(ifq)) {
-				IFCQ_TBR_DEQUEUE_SC(ifq, sc, head);
-			} else {
-				fq_if_dequeue_sc_classq(ifq, sc, head);
-			}
+			IFCQ_TBR_DEQUEUE_SC(ifq, sc, head, grp_idx);
 		} else {
-			if (IFCQ_TBR_IS_ENABLED(ifq)) {
-				IFCQ_TBR_DEQUEUE(ifq, head);
-			} else {
-				fq_if_dequeue_classq(ifq, head);
-			}
+			IFCQ_TBR_DEQUEUE(ifq, head, grp_idx);
 		}
 
 		if (head->cp_mbuf == NULL) {
@@ -364,6 +433,16 @@ dequeue_loop:
 			}
 			break;
 
+#if SKYWALK
+		case QP_PACKET:
+			head->cp_kpkt->pkt_nextpkt = NULL;
+			l += head->cp_kpkt->pkt_length;
+			ifclassq_set_packet_metadata(ifq, ifp, head);
+			if (last.cp_kpkt != NULL) {
+				last.cp_kpkt->pkt_nextpkt = head->cp_kpkt;
+			}
+			break;
+#endif /* SKYWALK */
 
 		default:
 			VERIFY(0);
@@ -394,10 +473,30 @@ dequeue_loop:
 static errno_t
 ifclassq_dequeue_common(struct ifclassq *ifq, mbuf_svc_class_t sc,
     u_int32_t pkt_limit, u_int32_t byte_limit, classq_pkt_t *head,
-    classq_pkt_t *tail, u_int32_t *cnt, u_int32_t *len, boolean_t drvmgt)
+    classq_pkt_t *tail, u_int32_t *cnt, u_int32_t *len, boolean_t drvmgt,
+    u_int8_t grp_idx)
 {
+#if SKYWALK
+	struct ifnet *ifp = ifq->ifcq_ifp;
+
+	if (__improbable(ifp->if_na_ops != NULL &&
+	    ifp->if_na_ops->ni_dequeue != NULL)) {
+		/*
+		 * TODO:
+		 * We should be changing the pkt/byte limit to the
+		 * available space in the next filter. But this is not
+		 * useful until we can flow control the whole chain of
+		 * filters.
+		 */
+		errno_t err = ifclassq_dequeue_common_default(ifq, sc,
+		    pkt_limit, byte_limit, head, tail, cnt, len, drvmgt, grp_idx);
+
+		return ifp->if_na_ops->ni_dequeue(ifp->if_na, sc, pkt_limit,
+		           byte_limit, head, tail, cnt, len, drvmgt, err);
+	}
+#endif /* SKYWALK */
 	return ifclassq_dequeue_common_default(ifq, sc,
-	           pkt_limit, byte_limit, head, tail, cnt, len, drvmgt);
+	           pkt_limit, byte_limit, head, tail, cnt, len, drvmgt, grp_idx);
 }
 
 void
@@ -412,12 +511,9 @@ int
 ifclassq_attach(struct ifclassq *ifq, u_int32_t type, void *discipline)
 {
 	IFCQ_LOCK_ASSERT_HELD(ifq);
-
 	VERIFY(ifq->ifcq_disc == NULL);
-
 	ifq->ifcq_type = type;
 	ifq->ifcq_disc = discipline;
-
 	return 0;
 }
 
@@ -425,14 +521,12 @@ void
 ifclassq_detach(struct ifclassq *ifq)
 {
 	IFCQ_LOCK_ASSERT_HELD(ifq);
-
 	VERIFY(ifq->ifcq_disc == NULL);
-
 	ifq->ifcq_type = PKTSCHEDT_NONE;
 }
 
 int
-ifclassq_getqstats(struct ifclassq *ifq, u_int32_t qid, void *ubuf,
+ifclassq_getqstats(struct ifclassq *ifq, u_int8_t gid, u_int32_t qid, void *ubuf,
     u_int32_t *nbytes)
 {
 	struct if_ifclassq_stats *ifqs;
@@ -442,15 +536,13 @@ ifclassq_getqstats(struct ifclassq *ifq, u_int32_t qid, void *ubuf,
 		return EINVAL;
 	}
 
-	ifqs = _MALLOC(sizeof(*ifqs), M_TEMP, M_WAITOK | M_ZERO);
-	if (ifqs == NULL) {
-		return ENOMEM;
-	}
+	ifqs = kalloc_type(struct if_ifclassq_stats,
+	    Z_WAITOK | Z_ZERO | Z_NOFAIL);
 
 	IFCQ_LOCK(ifq);
 	if (!IFCQ_IS_READY(ifq)) {
 		IFCQ_UNLOCK(ifq);
-		_FREE(ifqs, M_TEMP);
+		kfree_type(struct if_ifclassq_stats, ifqs);
 		return ENXIO;
 	}
 
@@ -460,7 +552,7 @@ ifclassq_getqstats(struct ifclassq *ifq, u_int32_t qid, void *ubuf,
 	*(&ifqs->ifqs_dropcnt) = *(&ifq->ifcq_dropcnt);
 	ifqs->ifqs_scheduler = ifq->ifcq_type;
 
-	err = pktsched_getqstats(ifq, qid, ifqs);
+	err = pktsched_getqstats(ifq, gid, qid, ifqs);
 	IFCQ_UNLOCK(ifq);
 
 	if (err == 0 && (err = copyout((caddr_t)ifqs,
@@ -468,7 +560,7 @@ ifclassq_getqstats(struct ifclassq *ifq, u_int32_t qid, void *ubuf,
 		*nbytes = sizeof(*ifqs);
 	}
 
-	_FREE(ifqs, M_TEMP);
+	kfree_type(struct if_ifclassq_stats, ifqs);
 
 	return err;
 }
@@ -519,21 +611,21 @@ ifclassq_ev2str(cqev_t ev)
 #define TBR_UNSCALE(x)  ((x) >> TBR_SHIFT)
 
 void
-ifclassq_tbr_dequeue(struct ifclassq *ifq, classq_pkt_t *pkt)
+ifclassq_tbr_dequeue(struct ifclassq *ifq, classq_pkt_t *pkt, u_int8_t grp_idx)
 {
-	ifclassq_tbr_dequeue_common(ifq, MBUF_SC_UNSPEC, FALSE, pkt);
+	ifclassq_tbr_dequeue_common(ifq, MBUF_SC_UNSPEC, FALSE, pkt, grp_idx);
 }
 
 void
 ifclassq_tbr_dequeue_sc(struct ifclassq *ifq, mbuf_svc_class_t sc,
-    classq_pkt_t *pkt)
+    classq_pkt_t *pkt, u_int8_t grp_idx)
 {
-	ifclassq_tbr_dequeue_common(ifq, sc, TRUE, pkt);
+	ifclassq_tbr_dequeue_common(ifq, sc, TRUE, pkt, grp_idx);
 }
 
 static void
 ifclassq_tbr_dequeue_common(struct ifclassq *ifq, mbuf_svc_class_t sc,
-    boolean_t drvmgt, classq_pkt_t *pkt)
+    boolean_t drvmgt, classq_pkt_t *pkt, u_int8_t grp_idx)
 {
 	struct tb_regulator *tbr;
 	int64_t interval;
@@ -570,9 +662,9 @@ ifclassq_tbr_dequeue_common(struct ifclassq *ifq, mbuf_svc_class_t sc,
 	 * ifcq_drain count is adjusted by the caller.
 	 */
 	if (drvmgt) {
-		fq_if_dequeue_sc_classq(ifq, sc, pkt);
+		fq_if_dequeue_sc_classq(ifq, sc, pkt, grp_idx);
 	} else {
-		fq_if_dequeue_classq(ifq, pkt);
+		fq_if_dequeue_classq(ifq, pkt, grp_idx);
 	}
 
 	if (pkt->cp_mbuf != NULL) {
@@ -581,6 +673,12 @@ ifclassq_tbr_dequeue_common(struct ifclassq *ifq, mbuf_svc_class_t sc,
 			tbr->tbr_token -= TBR_SCALE(m_pktlen(pkt->cp_mbuf));
 			break;
 
+#if SKYWALK
+		case QP_PACKET:
+			tbr->tbr_token -=
+			    TBR_SCALE(pkt->cp_kpkt->pkt_length);
+			break;
+#endif /* SKYWALK */
 
 		default:
 			VERIFY(0);
@@ -729,13 +827,39 @@ ifclassq_tbr_set(struct ifclassq *ifq, struct tb_profile *profile,
 }
 
 void
-ifclassq_calc_target_qdelay(struct ifnet *ifp, u_int64_t *if_target_qdelay)
+ifclassq_calc_target_qdelay(struct ifnet *ifp, uint64_t *if_target_qdelay,
+    uint32_t flags)
 {
-	u_int64_t qdelay = 0;
-	qdelay = IFCQ_TARGET_QDELAY(&ifp->if_snd);
+	uint64_t qdelay = 0, qdelay_configed = 0, qdely_default = 0;
+	if (flags == IF_CLASSQ_DEF) {
+		qdelay = IFCQ_TARGET_QDELAY(ifp->if_snd);
+	}
 
-	if (ifclassq_target_qdelay != 0) {
-		qdelay = ifclassq_target_qdelay;
+	switch (flags) {
+	case IF_CLASSQ_DEF:
+		qdelay_configed = ifclassq_def_c_target_qdelay;
+		qdely_default = IFQ_DEF_C_TARGET_DELAY;
+		break;
+	case IF_CLASSQ_L4S:
+		qdelay_configed = ifclassq_def_l4s_target_qdelay;
+		qdely_default = IFQ_DEF_L4S_TARGET_DELAY;
+		break;
+	case IF_CLASSQ_LOW_LATENCY:
+		qdelay_configed = ifclassq_ll_c_target_qdelay;
+		qdely_default = IFQ_LL_C_TARGET_DELAY;
+		break;
+	case (IF_CLASSQ_LOW_LATENCY | IF_CLASSQ_L4S):
+		qdelay_configed = ifclassq_ll_l4s_target_qdelay;
+		qdely_default = IFQ_LL_L4S_TARGET_DELAY;
+		break;
+	default:
+		VERIFY(0);
+		/* NOTREACHED */
+		__builtin_unreachable();
+	}
+
+	if (qdelay_configed != 0) {
+		qdelay = qdelay_configed;
 	}
 
 	/*
@@ -743,7 +867,7 @@ ifclassq_calc_target_qdelay(struct ifnet *ifp, u_int64_t *if_target_qdelay)
 	 * target queue delay.
 	 */
 	if (qdelay == 0) {
-		qdelay = IFQ_TARGET_DELAY;
+		qdelay = qdely_default;
 	}
 
 	/*
@@ -760,26 +884,109 @@ ifclassq_calc_target_qdelay(struct ifnet *ifp, u_int64_t *if_target_qdelay)
 }
 
 void
-ifclassq_calc_update_interval(u_int64_t *update_interval)
+ifclassq_calc_update_interval(uint64_t *update_interval, uint32_t flags)
 {
-	u_int64_t uint = 0;
+	uint64_t interval = 0, interval_configed = 0, interval_default = 0;
+
+	switch (flags) {
+	case IF_CLASSQ_DEF:
+		interval_configed = ifclassq_def_c_update_interval;
+		interval_default = IFQ_DEF_C_UPDATE_INTERVAL;
+		break;
+	case IF_CLASSQ_L4S:
+		interval_configed = ifclassq_def_l4s_update_interval;
+		interval_default = IFQ_DEF_L4S_UPDATE_INTERVAL;
+		break;
+	case IF_CLASSQ_LOW_LATENCY:
+		interval_configed = ifclassq_ll_c_update_interval;
+		interval_default = IFQ_LL_C_UPDATE_INTERVAL;
+		break;
+	case (IF_CLASSQ_LOW_LATENCY | IF_CLASSQ_L4S):
+		interval_configed = ifclassq_ll_l4s_update_interval;
+		interval_default = IFQ_LL_L4S_UPDATE_INTERVAL;
+		break;
+	default:
+		VERIFY(0);
+		/* NOTREACHED */
+		__builtin_unreachable();
+	}
 
 	/* If the system level override is set, use it */
-	if (ifclassq_update_interval != 0) {
-		uint = ifclassq_update_interval;
+	if (interval_configed != 0) {
+		interval = interval_configed;
 	}
 
 	/* Otherwise use the default value */
-	if (uint == 0) {
-		uint = IFQ_UPDATE_INTERVAL;
+	if (interval == 0) {
+		interval = interval_default;
 	}
 
-	*update_interval = uint;
+	*update_interval = interval;
+}
+
+struct ifclassq *
+ifclassq_alloc(void)
+{
+	struct ifclassq *ifcq;
+
+	ifcq = zalloc_flags(ifcq_zone, Z_WAITOK | Z_ZERO | Z_NOFAIL);
+	os_ref_init(&ifcq->ifcq_refcnt, NULL);
+	os_ref_retain(&ifcq->ifcq_refcnt);
+	lck_mtx_init(&ifcq->ifcq_lock, &ifcq_lock_group, &ifcq_lock_attr);
+	return ifcq;
 }
 
 void
-ifclassq_reap_caches(boolean_t purge)
+ifclassq_retain(struct ifclassq *ifcq)
 {
-	fq_codel_reap_caches(purge);
-	flowadv_reap_caches(purge);
+	os_ref_retain(&ifcq->ifcq_refcnt);
+}
+
+void
+ifclassq_release(struct ifclassq **pifcq)
+{
+	struct ifclassq *ifcq = *pifcq;
+
+	*pifcq = NULL;
+	if (os_ref_release(&ifcq->ifcq_refcnt) == 0) {
+		ifclassq_teardown(ifcq);
+		zfree(ifcq_zone, ifcq);
+	}
+}
+
+int
+ifclassq_setup_group(struct ifclassq *ifcq, uint8_t grp_idx, uint8_t flags)
+{
+	int err;
+
+	IFCQ_LOCK(ifcq);
+	VERIFY(ifcq->ifcq_disc != NULL);
+	VERIFY(ifcq->ifcq_type == PKTSCHEDT_FQ_CODEL);
+
+	err = fq_if_create_grp(ifcq, grp_idx, flags);
+	IFCQ_UNLOCK(ifcq);
+
+	return err;
+}
+
+void
+ifclassq_set_grp_combined(struct ifclassq *ifcq, uint8_t grp_idx)
+{
+	IFCQ_LOCK(ifcq);
+	VERIFY(ifcq->ifcq_disc != NULL);
+	VERIFY(ifcq->ifcq_type == PKTSCHEDT_FQ_CODEL);
+
+	fq_if_set_grp_combined(ifcq, grp_idx);
+	IFCQ_UNLOCK(ifcq);
+}
+
+void
+ifclassq_set_grp_separated(struct ifclassq *ifcq, uint8_t grp_idx)
+{
+	IFCQ_LOCK(ifcq);
+	VERIFY(ifcq->ifcq_disc != NULL);
+	VERIFY(ifcq->ifcq_type == PKTSCHEDT_FQ_CODEL);
+
+	fq_if_set_grp_separated(ifcq, grp_idx);
+	IFCQ_UNLOCK(ifcq);
 }

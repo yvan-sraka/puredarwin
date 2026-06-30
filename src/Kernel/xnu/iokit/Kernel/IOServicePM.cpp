@@ -98,6 +98,7 @@ static IOPMCompletionQueue * gIOPMCompletionQueue   = NULL;
 static IOPMRequest *         gIOPMRequest           = NULL;
 static IOService *           gIOPMRootNode          = NULL;
 static IOPlatformExpert *    gPlatform              = NULL;
+static IOLock *              gIOPMInitLock          = NULL;
 
 // log setPowerStates and powerStateChange longer than (ns):
 static uint64_t              gIOPMSetPowerStateLogNS =
@@ -117,7 +118,13 @@ const OSSymbol *             gIOPMPowerClientRootDomain = NULL;
 static const OSSymbol *      gIOPMPowerClientAdvisoryTickle = NULL;
 static bool                  gIOPMAdvisoryTickleEnabled = true;
 static thread_t              gIOPMWatchDogThread        = NULL;
-uint32_t                     gCanSleepTimeout           = 0;
+TUNABLE_WRITEABLE(uint32_t, gSleepAckTimeout, "pmtimeout", 0);
+
+/*
+ *  While waiting for a driver callout to complete, we log any instances
+ *  that have taken longer than the below period (in milliseconds) to return.
+ */
+TUNABLE_WRITEABLE(uint32_t, gDriverCalloutTimer, "pmcallouttimer", 2000);
 
 static uint32_t
 getPMRequestType( void )
@@ -129,7 +136,8 @@ getPMRequestType( void )
 	return type;
 }
 
-SYSCTL_UINT(_kern, OID_AUTO, pmtimeout, CTLFLAG_RW | CTLFLAG_LOCKED, &gCanSleepTimeout, 0, "Power Management Timeout");
+SYSCTL_UINT(_kern, OID_AUTO, pmtimeout, CTLFLAG_RW | CTLFLAG_LOCKED, &gSleepAckTimeout, 0, "Power Management Timeout");
+SYSCTL_UINT(_kern, OID_AUTO, pmcallouttimer, CTLFLAG_RW | CTLFLAG_LOCKED, &gDriverCalloutTimer, 0, "Power Management Driver Callout Log Timer");
 
 //******************************************************************************
 // Macros
@@ -172,10 +180,13 @@ do {                                  \
 #define ns_per_us                   1000
 #define k30Seconds                  (30*us_per_s)
 #define k5Seconds                   ( 5*us_per_s)
+#define k7Seconds                   ( 7*us_per_s)
 #if !defined(XNU_TARGET_OS_OSX)
 #define kCanSleepMaxTimeReq         k5Seconds
+#define kWillSleepMaxTimeReq        k7Seconds
 #else /* defined(XNU_TARGET_OS_OSX) */
 #define kCanSleepMaxTimeReq         k30Seconds
+#define kWillSleepMaxTimeReq        k30Seconds
 #endif /* defined(XNU_TARGET_OS_OSX) */
 #define kMaxTimeRequested           k30Seconds
 #define kMinAckTimeoutTicks         (10*1000000)
@@ -314,6 +325,19 @@ enum {
 };
 
 //*********************************************************************************
+// [private static] allocPMInitLock
+//
+// Allocate gIOPMInitLock prior to gIOPMWorkLoop initialization.
+//*********************************************************************************
+
+void
+IOService::allocPMInitLock( void )
+{
+	gIOPMInitLock = IOLockAlloc();
+	assert(gIOPMInitLock);
+}
+
+//*********************************************************************************
 // [public] PMinit
 //
 // Initialize power management.
@@ -323,10 +347,12 @@ void
 IOService::PMinit( void )
 {
 	if (!initialized) {
+		IOLockLock(gIOPMInitLock);
 		if (!gIOPMInitialized) {
 			gPlatform = getPlatform();
 			gIOPMWorkLoop = IOWorkLoop::workLoop();
 			if (gIOPMWorkLoop) {
+				assert(OSDynamicCast(IOPMrootDomain, this));
 				gIOPMRequestQueue = IOPMRequestQueue::create(
 					this, OSMemberFunctionCast(IOPMRequestQueue::Action,
 					this, &IOService::actionPMRequestQueue));
@@ -401,6 +427,9 @@ IOService::PMinit( void )
 			}
 #endif
 		}
+
+		IOLockUnlock(gIOPMInitLock);
+
 		if (!gIOPMInitialized) {
 			return;
 		}
@@ -467,6 +496,8 @@ IOService::PMinit( void )
 #endif
 		fIdleTimer = thread_call_allocate(
 			&idle_timer_expired, (thread_call_param_t)this);
+		fDriverCallTimer = thread_call_allocate(
+			&IOService::pmDriverCalloutTimer, (thread_call_param_t)this);
 		fDriverCallEntry = thread_call_allocate(
 			(thread_call_func_t) &IOService::pmDriverCallout, this);
 		assert(fDriverCallEntry);
@@ -552,6 +583,10 @@ IOService::PMfree( void )
 			thread_call_free(fDriverCallEntry);
 			fDriverCallEntry = NULL;
 		}
+		if (fDriverCallTimer) {
+			thread_call_free(fDriverCallTimer);
+			fDriverCallTimer = NULL;
+		}
 		if (fPMLock) {
 			IOLockFree(fPMLock);
 			fPMLock = NULL;
@@ -578,11 +613,11 @@ IOService::PMfree( void )
 			fNotifyClientArray = NULL;
 		}
 		if (fReportBuf && fNumberOfPowerStates) {
-			IOFree(fReportBuf, STATEREPORT_BUFSIZE(fNumberOfPowerStates));
+			IOFreeData(fReportBuf, STATEREPORT_BUFSIZE(fNumberOfPowerStates));
 			fReportBuf = NULL;
 		}
 		if (fPowerStates && fNumberOfPowerStates) {
-			IODelete(fPowerStates, IOPMPSEntry, fNumberOfPowerStates);
+			IODeleteData(fPowerStates, IOPMPSEntry, fNumberOfPowerStates);
 			fNumberOfPowerStates = 0;
 			fPowerStates = NULL;
 		}
@@ -1131,7 +1166,7 @@ IOService::registerPowerDriver(
 
 	do {
 		// Make a copy of the supplied power state array.
-		powerStatesCopy = IONew(IOPMPSEntry, numberOfStates);
+		powerStatesCopy = IONewData(IOPMPSEntry, numberOfStates);
 		if (!powerStatesCopy) {
 			error = kIOReturnNoMemory;
 			break;
@@ -1190,7 +1225,7 @@ IOService::registerPowerDriver(
 	}while (false);
 
 	if (powerStatesCopy) {
-		IODelete(powerStatesCopy, IOPMPSEntry, numberOfStates);
+		IODeleteData(powerStatesCopy, IOPMPSEntry, numberOfStates);
 	}
 
 	return error;
@@ -1323,7 +1358,7 @@ IOService::handleRegisterPowerDriver( IOPMRequest * request )
 		}
 	} else {
 		OUR_PMLog(kPMLogControllingDriverErr2, numberOfStates, 0);
-		IODelete(powerStates, IOPMPSEntry, numberOfStates);
+		IODeleteData(powerStates, IOPMPSEntry, numberOfStates);
 	}
 
 	powerDriver->release();
@@ -1549,6 +1584,12 @@ IOService::handleAcknowledgePowerChange( IOPMRequest * request )
 			// it's an interested driver
 			// make sure we're expecting this ack
 			if (informee->timer != 0) {
+				SOCD_TRACE_XNU(PM_INFORM_POWER_CHANGE_ACK,
+				    ADDR(informee->whatObject->getMetaClass()),
+				    ADDR(this->getMetaClass()),
+				    PACK_2X32(VALUE(this->getRegistryEntryID()), VALUE(informee->whatObject->getRegistryEntryID())),
+				    PACK_2X32(VALUE(0), VALUE(fDriverCallReason)));
+
 				if (informee->timer > 0) {
 					uint64_t nsec = computeTimeDeltaNS(&informee->startTime);
 					if (nsec > gIOPMSetPowerStateLogNS) {
@@ -1632,6 +1673,63 @@ IOService::acknowledgeSetPowerState( void )
 
 	submitPMRequest( request );
 	return kIOReturnSuccess;
+}
+
+//*********************************************************************************
+// [private] handleAcknowledgeSetPowerState
+//*********************************************************************************
+
+bool
+IOService::handleAcknowledgeSetPowerState( IOPMRequest * request __unused)
+{
+	const OSMetaClass  *controllingDriverMetaClass = NULL;
+	uint32_t            controllingDriverRegistryEntryID = 0;
+	bool                more = false;
+	bool                trace_this_ack = true;
+
+	if (fDriverTimer == -1) {
+		// driver acked while setPowerState() call is in-flight.
+		// take this ack, return value from setPowerState() is irrelevant.
+		OUR_PMLog(kPMLogDriverAcknowledgeSet,
+		    (uintptr_t) this, fDriverTimer);
+		fDriverTimer = 0;
+	} else if (fDriverTimer > 0) {
+		// expected ack, stop the timer
+		stop_ack_timer();
+
+		getPMRootDomain()->reset_watchdog_timer(this, 0);
+
+		uint64_t nsec = computeTimeDeltaNS(&fDriverCallStartTime);
+		if (nsec > gIOPMSetPowerStateLogNS) {
+			getPMRootDomain()->pmStatsRecordApplicationResponse(
+				gIOPMStatsDriverPSChangeSlow,
+				fName, kDriverCallSetPowerState, NS_TO_MS(nsec), getRegistryEntryID(),
+				NULL, fHeadNotePowerState, true);
+		}
+
+		OUR_PMLog(kPMLogDriverAcknowledgeSet, (uintptr_t) this, fDriverTimer);
+		fDriverTimer = 0;
+		more = true;
+	} else {
+		// unexpected ack
+		OUR_PMLog(kPMLogAcknowledgeErr4, (uintptr_t) this, 0);
+		trace_this_ack = false;
+	}
+
+	if (trace_this_ack) {
+		if (fControllingDriver) {
+			controllingDriverMetaClass = fControllingDriver->getMetaClass();
+			controllingDriverRegistryEntryID = (uint32_t)fControllingDriver->getRegistryEntryID();
+		}
+
+		SOCD_TRACE_XNU(PM_SET_POWER_STATE_ACK,
+		    ADDR(controllingDriverMetaClass),
+		    ADDR(this->getMetaClass()),
+		    PACK_2X32(VALUE(this->getRegistryEntryID()), VALUE(controllingDriverRegistryEntryID)),
+		    PACK_2X32(VALUE(fHeadNotePowerState), VALUE(0)));
+	}
+
+	return more;
 }
 
 //*********************************************************************************
@@ -2940,13 +3038,62 @@ IOService::setAdvisoryTickleEnable( bool enable )
 bool
 IOService::activityTickle( unsigned long type, unsigned long stateNumber )
 {
+	if (!initialized) {
+		return true; // no power change
+	}
+
+	if (!fPowerStates) {
+		// registerPowerDriver may not have completed
+		IOPMRequest *   request;
+
+		request = acquirePMRequest( this, kIOPMRequestTypeDeferredActivityTickle );
+		if (request) {
+			request->fArg0 = (void *)            type;
+			request->fArg1 = (void *)(uintptr_t) stateNumber;
+			submitPMRequest(request);
+		}
+		// Returns false if the activityTickle might cause a transition to a
+		// higher powered state. We don't know, so this seems safest.
+		return false;
+	}
+
+	return _activityTickle(type, stateNumber);
+}
+
+//*********************************************************************************
+// [private] handleDeferredActivityTickle
+//*********************************************************************************
+
+void
+IOService::handleDeferredActivityTickle( IOPMRequest * request )
+{
+	unsigned long type        = (unsigned long) request->fArg1;
+	unsigned long stateNumber = (unsigned long) request->fArg2;
+
+	if (!fPowerStates) {
+		// registerPowerDriver was not called before activityTickle()
+		return;
+	}
+	(void) _activityTickle(type, stateNumber);
+}
+
+//*********************************************************************************
+// [private] _activityTickle
+//
+// The tickle with parameter kIOPMSuperclassPolicy1 causes the activity
+// flag to be set, and the device state checked.  If the device has been
+// powered down, it is powered up again.
+// The tickle with parameter kIOPMSubclassPolicy is ignored here and
+// should be intercepted by a subclass.
+//*********************************************************************************
+
+bool
+IOService::_activityTickle( unsigned long type, unsigned long stateNumber )
+{
 	IOPMRequest *   request;
 	bool            noPowerChange = true;
 	uint32_t        tickleFlags;
 
-	if (!initialized) {
-		return true; // no power change
-	}
 	if ((type == kIOPMSuperclassPolicy1) && StateOrder(stateNumber)) {
 		IOLockLock(fActivityLock);
 
@@ -3625,7 +3772,7 @@ IOService::notifyInterestedDrivers( void )
 
 	informee = list->firstInList();
 	assert(informee);
-	for (IOItemCount i = 0; i < count; i++) {
+	for (IOItemCount i = 0, arrayIdx = 0; i < count; i++) {
 		if (fInitialSetPowerState || (fHeadNoteChangeFlags & kIOPMInitialPowerChange)) {
 			// Skip notifying self, if 'kIOPMInitialDeviceState' is set and
 			// this is the initial power state change
@@ -3636,9 +3783,10 @@ IOService::notifyInterestedDrivers( void )
 			}
 		}
 		informee->timer = -1;
-		param[i].Target = informee;
+		param[arrayIdx].Target = informee;
 		informee->retain();
 		informee = list->nextInList( informee );
+		arrayIdx++;
 	}
 
 	count -= skipCnt;
@@ -3994,9 +4142,11 @@ IOService::actionDriverCalloutDone(
 }
 
 void
-IOService::pmDriverCallout( IOService * from )
+IOService::pmDriverCallout( IOService * from,
+    __unused thread_call_param_t p)
 {
 	assert(from);
+	from->startDriverCalloutTimer();
 	switch (from->fDriverCallReason) {
 	case kDriverCallSetPowerState:
 		from->driverSetPowerState();
@@ -4015,6 +4165,7 @@ IOService::pmDriverCallout( IOService * from )
 		panic("IOService::pmDriverCallout bad machine state %x",
 		    from->fDriverCallReason);
 	}
+	from->stopDriverCalloutTimer();
 
 	gIOPMWorkLoop->runAction(actionDriverCalloutDone,
 	    /* target */ from,
@@ -4036,6 +4187,8 @@ IOService::driverSetPowerState( void )
 	AbsoluteTime        end;
 	IOReturn            result;
 	uint32_t            oldPowerState = getPowerState();
+	const OSMetaClass  *controllingDriverMetaClass = NULL;
+	uint32_t            controllingDriverRegistryEntryID = 0;
 
 	assert( fDriverCallBusy );
 	assert( fDriverCallParamPtr );
@@ -4043,8 +4196,18 @@ IOService::driverSetPowerState( void )
 
 	param = (DriverCallParam *) fDriverCallParamPtr;
 	powerState = fHeadNotePowerState;
+	if (fControllingDriver) {
+		controllingDriverMetaClass = fControllingDriver->getMetaClass();
+		controllingDriverRegistryEntryID = (uint32_t)fControllingDriver->getRegistryEntryID();
+	}
 
 	if (assertPMDriverCall(&callEntry, kIOPMDriverCallMethodSetPowerState)) {
+		SOCD_TRACE_XNU_START(PM_SET_POWER_STATE,
+		    ADDR(controllingDriverMetaClass),
+		    ADDR(this->getMetaClass()),
+		    PACK_2X32(VALUE(this->getRegistryEntryID()), VALUE(controllingDriverRegistryEntryID)),
+		    PACK_2X32(VALUE(powerState), VALUE(oldPowerState)));
+
 		OUR_PMLogFuncStart(kPMLogProgramHardware, (uintptr_t) this, powerState);
 		clock_get_uptime(&fDriverCallStartTime);
 
@@ -4055,6 +4218,11 @@ IOService::driverSetPowerState( void )
 		}
 		clock_get_uptime(&end);
 		OUR_PMLogFuncEnd(kPMLogProgramHardware, (uintptr_t) this, (UInt32) result);
+		SOCD_TRACE_XNU_END(PM_SET_POWER_STATE,
+		    ADDR(controllingDriverMetaClass),
+		    ADDR(this->getMetaClass()),
+		    PACK_2X32(VALUE(this->getRegistryEntryID()), VALUE(controllingDriverRegistryEntryID)),
+		    PACK_2X32(VALUE(powerState), VALUE(result)));
 
 		deassertPMDriverCall(&callEntry);
 
@@ -4127,6 +4295,12 @@ IOService::driverInformPowerChange( void )
 		driver   = informee->whatObject;
 
 		if (assertPMDriverCall(&callEntry, callMethod, informee)) {
+			SOCD_TRACE_XNU_START(PM_INFORM_POWER_CHANGE,
+			    ADDR(driver->getMetaClass()),
+			    ADDR(this->getMetaClass()),
+			    PACK_2X32(VALUE(this->getRegistryEntryID()), VALUE(driver->getRegistryEntryID())),
+			    PACK_2X32(VALUE(powerState), VALUE(fDriverCallReason)));
+
 			if (fDriverCallReason == kDriverCallInformPreChange) {
 				OUR_PMLogFuncStart(kPMLogInformDriverPreChange, (uintptr_t) this, powerState);
 				clock_get_uptime(&informee->startTime);
@@ -4140,6 +4314,12 @@ IOService::driverInformPowerChange( void )
 				clock_get_uptime(&end);
 				OUR_PMLogFuncEnd(kPMLogInformDriverPostChange, (uintptr_t) this, result);
 			}
+
+			SOCD_TRACE_XNU_END(PM_INFORM_POWER_CHANGE,
+			    ADDR(driver->getMetaClass()),
+			    ADDR(this->getMetaClass()),
+			    PACK_2X32(VALUE(this->getRegistryEntryID()), VALUE(driver->getRegistryEntryID())),
+			    PACK_2X32(VALUE(result), VALUE(fDriverCallReason)));
 
 			deassertPMDriverCall(&callEntry);
 
@@ -4163,6 +4343,48 @@ IOService::driverInformPowerChange( void )
 		param->Result = result;
 		param++;
 	}
+}
+
+//*********************************************************************************
+// [private, static] pmDriverCalloutTimer
+//
+// Thread call context.
+//*********************************************************************************
+
+void
+IOService::startDriverCalloutTimer( void )
+{
+	AbsoluteTime    deadline;
+	boolean_t       pending;
+
+	clock_interval_to_deadline(gDriverCalloutTimer, kMillisecondScale, &deadline);
+
+	retain();
+	pending = thread_call_enter_delayed(fDriverCallTimer, deadline);
+	if (pending) {
+		release();
+	}
+}
+
+void
+IOService::stopDriverCalloutTimer( void )
+{
+	boolean_t   pending;
+
+	pending = thread_call_cancel(fDriverCallTimer);
+	if (pending) {
+		release();
+	}
+}
+
+void
+IOService::pmDriverCalloutTimer( thread_call_param_t arg0,
+    __unused thread_call_param_t arg1)
+{
+	assert(arg0);
+	IOService *from = (IOService *) arg0;
+	PM_LOG("PM waiting on pmDriverCallout(0x%x) to %s (%u ms)\n", from->fDriverCallReason, from->fName, gDriverCalloutTimer);
+	from->release();
 }
 
 //*********************************************************************************
@@ -5344,8 +5566,8 @@ IOService::ackTimerTick( void )
 #endif /* CONFIG_XNUPOST */
 				if (panic_allowed) {
 					// rdar://problem/48743340 - excluding AppleSEPManager from panic
-					const char *whitelist = "AppleSEPManager";
-					if (strncmp(fName, whitelist, strlen(whitelist))) {
+					const char *allowlist = "AppleSEPManager";
+					if (strncmp(fName, allowlist, strlen(allowlist))) {
 						panic("%s::setPowerState(%p, %lu -> %lu) timed out after %d ms",
 						    fName, this, fCurrentPowerState, fHeadNotePowerState, NS_TO_MS(nsec));
 					}
@@ -5477,7 +5699,6 @@ IOService::start_watchdog_timer( void )
 
 	timeout = getPMRootDomain()->getWatchdogTimeout();
 	clock_interval_to_deadline(timeout, kSecondScale, &deadline);
-	fWatchdogDeadline = deadline;
 	start_watchdog_timer(deadline);
 	IOLockUnlock(fWatchdogLock);
 }
@@ -5486,6 +5707,7 @@ void
 IOService::start_watchdog_timer(uint64_t deadline)
 {
 	IOLockAssert(fWatchdogLock, kIOLockAssertOwned);
+	fWatchdogDeadline = deadline;
 
 	if (!thread_call_isactive(fWatchdogTimer)) {
 		thread_call_enter_delayed(fWatchdogTimer, deadline);
@@ -5598,7 +5820,14 @@ void
 IOService::watchdog_timer_expired( thread_call_param_t arg0, thread_call_param_t arg1 )
 {
 	IOService * me = (IOService *) arg0;
+	bool expired;
 
+	IOLockLock(me->fWatchdogLock);
+	expired = me->fWatchdogDeadline && (me->fWatchdogDeadline <= mach_absolute_time());
+	IOLockUnlock(me->fWatchdogLock);
+	if (!expired) {
+		return;
+	}
 
 	gIOPMWatchDogThread = current_thread();
 	getPMRootDomain()->sleepWakeDebugTrig(true);
@@ -5829,7 +6058,7 @@ logAppTimeouts( OSObject * object, void * arg )
 				clientID->release();
 			}
 
-			PM_ERROR(context->errorLog, pid, name);
+			PM_ERROR("PM notification timeout (pid %d, %s)\n", pid, name);
 
 			// TODO: record message type if possible
 			IOService::getPMRootDomain()->pmStatsRecordApplicationResponse(
@@ -5861,7 +6090,6 @@ IOService::cleanClientResponses( bool logErrors )
 				context.stateNumber      = fHeadNotePowerState;
 				context.stateFlags       = fHeadNotePowerArrayEntry->capabilityFlags;
 				context.changeFlags      = fHeadNoteChangeFlags;
-				context.errorLog         = "PM notification timeout (pid %d, %s)\n";
 
 				applyToInterested(gIOAppPowerStateInterest, logAppTimeouts, (void *) &context);
 			}
@@ -5964,8 +6192,14 @@ IOService::tellClientsWithResponse( int messageType )
 		}
 		if (context.messageType == kIOMessageCanSystemSleep) {
 			maxTimeOut = kCanSleepMaxTimeReq;
-			if (gCanSleepTimeout) {
-				maxTimeOut = (gCanSleepTimeout * us_per_s);
+			if (gSleepAckTimeout) {
+				maxTimeOut = (gSleepAckTimeout * us_per_s);
+			}
+		}
+		if (context.messageType == kIOMessageSystemWillSleep) {
+			maxTimeOut = kWillSleepMaxTimeReq;
+			if (gSleepAckTimeout) {
+				maxTimeOut = (gSleepAckTimeout * us_per_s);
 			}
 		}
 		context.maxTimeRequested = maxTimeOut;
@@ -5995,8 +6229,8 @@ IOService::tellClientsWithResponse( int messageType )
 		    pmTellCapabilityAppWithResponse, (void *) &context );
 		if (context.messageType == kIOMessageCanSystemSleep) {
 			maxTimeOut = kCanSleepMaxTimeReq;
-			if (gCanSleepTimeout) {
-				maxTimeOut = (gCanSleepTimeout * us_per_s);
+			if (gSleepAckTimeout) {
+				maxTimeOut = (gSleepAckTimeout * us_per_s);
 			}
 		}
 		context.maxTimeRequested = maxTimeOut;
@@ -6073,10 +6307,10 @@ IOService::pmTellAppWithResponse( OSObject * object, void * arg )
 			proc = proc_find(clientPID);
 
 			if (proc) {
-				proc_suspended = get_task_pidsuspended((task_t) proc->task);
+				proc_suspended = get_task_pidsuspended((task_t) proc_task(proc));
 				if (proc_suspended) {
 					logClientIDForNotification(object, context, "PMTellAppWithResponse - Suspended");
-				} else if (getPMRootDomain()->isAOTMode() && get_task_suspended((task_t) proc->task)) {
+				} else if (getPMRootDomain()->isAOTMode() && get_task_suspended((task_t) proc_task(proc))) {
 					proc_suspended = true;
 					context->skippedInDark++;
 				}
@@ -6264,7 +6498,7 @@ IOService::pmTellCapabilityAppWithResponse( OSObject * object, void * arg )
 {
 	IOPMSystemCapabilityChangeParameters msgArg;
 	IOPMInterestContext *       context = (IOPMInterestContext *) arg;
-	OSObject *                  replied = kOSBooleanTrue;
+	OSObject *                  waitForReply = kOSBooleanFalse;
 	IOServicePM *               pwrMgt = context->us->pwrMgt;
 	uint32_t                    msgIndex, msgRef, msgType;
 #if LOG_APP_RESPONSE_TIMES
@@ -6277,7 +6511,7 @@ IOService::pmTellCapabilityAppWithResponse( OSObject * object, void * arg )
 
 	memset(&msgArg, 0, sizeof(msgArg));
 	if (context->messageFilter &&
-	    !context->messageFilter(context->us, object, context, &msgArg, &replied)) {
+	    !context->messageFilter(context->us, object, context, &msgArg, &waitForReply)) {
 		return;
 	}
 
@@ -6292,10 +6526,10 @@ IOService::pmTellCapabilityAppWithResponse( OSObject * object, void * arg )
 			clientID->release();
 			proc = proc_find(clientPID);
 			if (proc) {
-				proc_suspended = get_task_pidsuspended((task_t) proc->task);
+				proc_suspended = get_task_pidsuspended((task_t) proc_task(proc));
 				if (proc_suspended) {
 					logClientIDForNotification(object, context, "PMTellCapablityAppWithResponse - Suspended");
-				} else if (get_task_suspended((task_t) proc->task)) {
+				} else if (get_task_suspended((task_t) proc_task(proc))) {
 					proc_suspended = true;
 					context->skippedInDark++;
 				}
@@ -6323,7 +6557,7 @@ IOService::pmTellCapabilityAppWithResponse( OSObject * object, void * arg )
 	if (kIOLogDebugPower & gIOKitDebug) {
 		// Log client pid/name and client array index.
 		OSNumber * clientID = NULL;
-		OSString * clientIDString = NULL;;
+		OSString * clientIDString = NULL;
 		context->us->messageClient(kIOMessageCopyClientID, object, &clientID);
 		if (clientID) {
 			clientIDString = IOCopyLogNameForPID(clientID->unsigned32BitValue());
@@ -6332,7 +6566,7 @@ IOService::pmTellCapabilityAppWithResponse( OSObject * object, void * arg )
 		PM_LOG("%s MESG App(%u) %s, wait %u, %s\n",
 		    context->us->getName(),
 		    msgIndex, getIOMessageString(msgType),
-		    (replied != kOSBooleanTrue),
+		    (waitForReply == kOSBooleanTrue),
 		    clientIDString ? clientIDString->getCStringNoCopy() : "");
 		if (clientID) {
 			clientID->release();
@@ -6345,7 +6579,7 @@ IOService::pmTellCapabilityAppWithResponse( OSObject * object, void * arg )
 	msgArg.notifyRef = msgRef;
 	msgArg.maxWaitForReply = 0;
 
-	if (replied == kOSBooleanTrue) {
+	if (waitForReply == kOSBooleanFalse) {
 		msgArg.notifyRef = 0;
 		context->responseArray->setObject(msgIndex, kOSBooleanTrue);
 		if (context->notifyClients) {
@@ -6644,10 +6878,10 @@ tellAppClientApplier( OSObject * object, void * arg )
 			proc = proc_find(clientPID);
 
 			if (proc) {
-				proc_suspended = get_task_pidsuspended((task_t) proc->task);
+				proc_suspended = get_task_pidsuspended((task_t) proc_task(proc));
 				if (proc_suspended) {
 					logClientIDForNotification(object, context, "tellAppClientApplier - Suspended");
-				} else if (IOService::getPMRootDomain()->isAOTMode() && get_task_suspended((task_t) proc->task)) {
+				} else if (IOService::getPMRootDomain()->isAOTMode() && get_task_suspended((task_t) proc_task(proc))) {
 					proc_suspended = true;
 					context->skippedInDark++;
 				}
@@ -6756,7 +6990,6 @@ IOService::responseValid( uint32_t refcon, int pid )
 				IOLog("PM response took %d ms (%d, %s)\n", NS_TO_MS(nsec),
 				    pid, name);
 			}
-
 
 			if (nsec > LOG_APP_RESPONSE_MSG_TRACER) {
 				// TODO: populate the messageType argument
@@ -6949,12 +7182,11 @@ IOService::configurePowerStatesReport( IOReportConfigureAction action, void *res
 			break;
 		}
 		reportSize = STATEREPORT_BUFSIZE(fNumberOfPowerStates);
-		fReportBuf = IOMalloc(reportSize);
+		fReportBuf = IOMallocZeroData(reportSize);
 		if (!fReportBuf) {
 			rc = kIOReturnNoMemory;
 			break;
 		}
-		memset(fReportBuf, 0, reportSize);
 
 		STATEREPORT_INIT((uint16_t) fNumberOfPowerStates, fReportBuf, reportSize,
 		    getRegistryEntryID(), kPMPowerStatesChID, kIOReportCategoryPower);
@@ -6985,7 +7217,7 @@ IOService::configurePowerStatesReport( IOReportConfigureAction action, void *res
 			break;
 		}
 		if (fReportClientCnt == 1) {
-			IOFree(fReportBuf, STATEREPORT_BUFSIZE(fNumberOfPowerStates));
+			IOFreeData(fReportBuf, STATEREPORT_BUFSIZE(fNumberOfPowerStates));
 			fReportBuf = NULL;
 		}
 		fReportClientCnt--;
@@ -7935,6 +8167,10 @@ IOService::executePMRequest( IOPMRequest * request )
 		gIOPMWorkQueue->finishQuiesceRequest(request);
 		break;
 
+	case kIOPMRequestTypeDeferredActivityTickle:
+		handleDeferredActivityTickle(request);
+		break;
+
 	default:
 		panic("executePMRequest: unknown request type %x", request->getType());
 	}
@@ -8005,33 +8241,7 @@ IOService::actionPMReplyQueue( IOPMRequest * request, IOPMRequestQueue * queue )
 		break;
 
 	case kIOPMRequestTypeAckSetPowerState:
-		if (fDriverTimer == -1) {
-			// driver acked while setPowerState() call is in-flight.
-			// take this ack, return value from setPowerState() is irrelevant.
-			OUR_PMLog(kPMLogDriverAcknowledgeSet,
-			    (uintptr_t) this, fDriverTimer);
-			fDriverTimer = 0;
-		} else if (fDriverTimer > 0) {
-			// expected ack, stop the timer
-			stop_ack_timer();
-
-			getPMRootDomain()->reset_watchdog_timer(this, 0);
-
-			uint64_t nsec = computeTimeDeltaNS(&fDriverCallStartTime);
-			if (nsec > gIOPMSetPowerStateLogNS) {
-				getPMRootDomain()->pmStatsRecordApplicationResponse(
-					gIOPMStatsDriverPSChangeSlow,
-					fName, kDriverCallSetPowerState, NS_TO_MS(nsec), getRegistryEntryID(),
-					NULL, fHeadNotePowerState, true);
-			}
-
-			OUR_PMLog(kPMLogDriverAcknowledgeSet, (uintptr_t) this, fDriverTimer);
-			fDriverTimer = 0;
-			more = true;
-		} else {
-			// unexpected ack
-			OUR_PMLog(kPMLogAcknowledgeErr4, (uintptr_t) this, 0);
-		}
+		more = handleAcknowledgeSetPowerState( request );
 		break;
 
 	case kIOPMRequestTypeInterestChanged:
@@ -8458,6 +8668,9 @@ IOPMRequest::detachRootRequest( void )
 
 OSDefineMetaClassAndStructors( IOPMRequestQueue, IOEventSource );
 
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wcast-function-type"
+
 IOPMRequestQueue *
 IOPMRequestQueue::create( IOService * inOwner, Action inAction )
 {
@@ -8480,6 +8693,8 @@ IOPMRequestQueue::init( IOService * inOwner, Action inAction )
 	fLock = IOLockAlloc();
 	return fLock != NULL;
 }
+
+#pragma clang diagnostic pop
 
 void
 IOPMRequestQueue::free( void )
@@ -8529,7 +8744,7 @@ IOPMRequestQueue::queuePMRequestChain( IOPMRequest ** requests, IOItemCount coun
 bool
 IOPMRequestQueue::checkForWork( void )
 {
-	Action          dqAction = (Action) action;
+	Action          dqAction = (Action) (void (*)(void))action;
 	IOPMRequest *   request;
 	IOService *     target;
 	int             dequeueCount = 0;
@@ -8815,6 +9030,9 @@ IOPMWorkQueue::finishQuiesceRequest( IOPMRequest * quiesceRequest )
 
 OSDefineMetaClassAndStructors( IOPMCompletionQueue, IOEventSource );
 
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wcast-function-type"
+
 IOPMCompletionQueue *
 IOPMCompletionQueue::create( IOService * inOwner, Action inAction )
 {
@@ -8836,6 +9054,7 @@ IOPMCompletionQueue::init( IOService * inOwner, Action inAction )
 	queue_init(&fQueue);
 	return true;
 }
+
 
 bool
 IOPMCompletionQueue::queuePMRequest( IOPMRequest * request )
@@ -8872,6 +9091,8 @@ IOPMCompletionQueue::checkForWork( void )
 
 	return more;
 }
+
+#pragma clang diagnostic pop
 
 // MARK: -
 // MARK: IOServicePM

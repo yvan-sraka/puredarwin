@@ -29,12 +29,12 @@
 #define IOKIT_ENABLE_SHARED_PTR
 
 extern "C" {
-#include <machine/machine_routines.h>
 #include <pexpert/pexpert.h>
 #include <kern/cpu_number.h>
 extern void kperf_kernel_configure(char *);
 }
 
+#include <machine/machine_routines.h>
 #include <IOKit/IOLib.h>
 #include <IOKit/IOPlatformExpert.h>
 #include <IOKit/pwr_mgt/RootDomain.h>
@@ -52,8 +52,8 @@ extern void kperf_kernel_configure(char *);
 
 extern "C" void console_suspend();
 extern "C" void console_resume();
-extern "C" void sched_override_recommended_cores_for_sleep(void);
-extern "C" void sched_restore_recommended_cores_after_sleep(void);
+extern "C" void sched_override_available_cores_for_sleep(void);
+extern "C" void sched_restore_available_cores_after_sleep(void);
 
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
 
@@ -143,26 +143,26 @@ PE_cpu_machine_init(cpu_id_t target, boolean_t bootb)
 	}
 
 	targetCPU->initCPU(bootb);
-#if defined(__arm__) || defined(__arm64__)
+#if defined(__arm64__)
 	if (!bootb && (targetCPU->getCPUNumber() == (UInt32)master_cpu)) {
 		ml_set_is_quiescing(false);
 	}
-#endif /* defined(__arm__) || defined(__arm64__) */
+#endif /* defined(__arm64__) */
 }
 
 void
 PE_cpu_machine_quiesce(cpu_id_t target)
 {
 	IOCPU *targetCPU = (IOCPU*)target;
-#if defined(__arm__) || defined(__arm64__)
+#if defined(__arm64__)
 	if (targetCPU->getCPUNumber() == (UInt32)master_cpu) {
 		ml_set_is_quiescing(true);
 	}
-#endif /* defined(__arm__) || defined(__arm64__) */
+#endif /* defined(__arm64__) */
 	targetCPU->quiesceCPU();
 }
 
-#if defined(__arm__) || defined(__arm64__)
+#if defined(__arm64__)
 static perfmon_interrupt_handler_func pmi_handler = NULL;
 
 kern_return_t
@@ -183,7 +183,7 @@ PE_cpu_perfmon_interrupt_enable(cpu_id_t target, boolean_t enable)
 	}
 
 	if (enable) {
-		targetCPU->getProvider()->registerInterrupt(1, targetCPU, (IOInterruptAction)pmi_handler, NULL);
+		targetCPU->getProvider()->registerInterrupt(1, targetCPU, (IOInterruptAction)(void (*)(void))pmi_handler, NULL);
 		targetCPU->getProvider()->enableInterrupt(1);
 	} else {
 		targetCPU->getProvider()->disableInterrupt(1);
@@ -222,9 +222,7 @@ IOCPUSleepKernel(void)
 	IOPMrootDomain  *rootDomain = IOService::getPMRootDomain();
 
 	printf("IOCPUSleepKernel enter\n");
-#if defined(__arm64__)
-	sched_override_recommended_cores_for_sleep();
-#endif
+	sched_override_available_cores_for_sleep();
 
 	rootDomain->tracePoint( kIOPMTracePointSleepPlatformActions );
 	IOPlatformActionsPreSleep();
@@ -288,11 +286,9 @@ IOCPUSleepKernel(void)
 	 */
 
 	rootDomain->start_watchdog_timer();
-	rootDomain->tracePoint( kIOPMTracePointWakePlatformActions );
 
 	console_resume();
 
-	IOPlatformActionsPostResume();
 	rootDomain->tracePoint( kIOPMTracePointWakeCPUs );
 
 	// Wake the other CPUs.
@@ -311,9 +307,10 @@ IOCPUSleepKernel(void)
 		}
 	}
 
-#if defined(__arm64__)
-	sched_restore_recommended_cores_after_sleep();
-#endif
+	rootDomain->tracePoint( kIOPMTracePointWakePlatformActions );
+	IOPlatformActionsPostResume();
+
+	sched_restore_available_cores_after_sleep();
 
 	thread_kern_set_pri(self, old_pri);
 	printf("IOCPUSleepKernel exit\n");
@@ -564,11 +561,8 @@ IOCPUInterruptController::initCPUInterruptController(int sources, int cpus)
 	numSources = sources;
 	numCPUs = cpus;
 
-	vectors = (IOInterruptVector *)IOMalloc(numSources * sizeof(IOInterruptVector));
-	if (vectors == NULL) {
-		return kIOReturnNoMemory;
-	}
-	bzero(vectors, numSources * sizeof(IOInterruptVector));
+	vectors = (IOInterruptVector *)zalloc_permanent(numSources *
+	    sizeof(IOInterruptVector), ZALIGN(IOInterruptVector));
 
 	// Allocate a lock for each vector
 	for (cnt = 0; cnt < numSources; cnt++) {
@@ -614,7 +608,7 @@ IOCPUInterruptController::setCPUInterruptProperties(IOService *service)
 	specifier = OSArray::withCapacity(numSources);
 	for (cnt = 0; cnt < numSources; cnt++) {
 		tmpLong = cnt;
-		OSSharedPtr<OSData> tmpData = OSData::withBytes(&tmpLong, sizeof(tmpLong));
+		OSSharedPtr<OSData> tmpData = OSData::withValue(tmpLong);
 		specifier->setObject(tmpData.get());
 	}
 
