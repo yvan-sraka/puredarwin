@@ -86,6 +86,7 @@
 #include <pexpert/arm64/boot.h>
 #include <arm64/ppl/sart.h>
 #include <arm64/ppl/uat.h>
+#include <arm/pmap/pmap_ppl_opensource_stubs.h>
 
 #if defined(KERNEL_INTEGRITY_KTRR) || defined(KERNEL_INTEGRITY_CTRR)
 #include <arm64/amcc_rorgn.h>
