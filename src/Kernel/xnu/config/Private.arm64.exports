@@ -75,13 +75,6 @@ _mach_bridge_recv_timestamps
 _mach_bridge_init_timestamp
 _mach_bridge_set_params
 _vfs_resolver_result
-_pmap_iommu_init
-_pmap_iommu_iovmalloc
-_pmap_iommu_map
-_pmap_iommu_unmap
-_pmap_iommu_iovmfree
-_pmap_iommu_ioctl
-_pmap_iommu_alloc_contiguous_pages
 _ml_mcache_flush_callback_register
 _set_invalidate_hmac_function
 _PE_panic_debugging_enabled

@@ -1817,6 +1817,15 @@ out:
 	*ret = error;
 	return error;
 }
+#else /* XNU_TARGET_OS_OSX */
+kern_return_t
+pid_hibernate(struct proc *p __unused, struct pid_hibernate_args *args __unused, int *ret)
+{
+	if (ret != NULL) {
+		*ret = ENOSYS;
+	}
+	return ENOSYS;
+}
 #endif /* !XNU_TARGET_OS_OSX */
 
 #if SOCKETS

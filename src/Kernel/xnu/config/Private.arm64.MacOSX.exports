@@ -1,26 +1,26 @@
 _aes_decrypt
 _bufattr_delayidlesleep
-_csr_check
+# _csr_check - proprietary, not in OSS BCM2837 build
 _mountroot_post_hook
 _unmountroot_pre_hook
-_vfs_addtrigger
-_vfs_settriggercallback
-_vnode_trigger_update
-_dqfileclose
-_dqfileopen
-_dqflush
-_dqget
-_dqhashinit
-_dqisinitialized
-_dqlock
-_dqrele
-_dqsync
-_dqsync_orphans
-_dqunlock
-_qf_get
-_qf_put
-_dqfileinit
-_dqreclaim
+# _vfs_addtrigger - proprietary
+# _vfs_settriggercallback - proprietary
+# _vnode_trigger_update - proprietary
+# _dqfileclose - proprietary
+# _dqfileopen - proprietary
+# _dqflush - proprietary
+# _dqget - proprietary
+# _dqhashinit - proprietary
+# _dqisinitialized - proprietary
+# _dqlock - proprietary
+# _dqrele - proprietary
+# _dqsync - proprietary
+# _dqsync_orphans - proprietary
+# _dqunlock - proprietary
+# _qf_get - proprietary
+# _qf_put - proprietary
+# _dqfileinit - proprietary
+# _dqreclaim - proprietary
 _cs_vm_supports_4k_translations
 _csfg_get_supplement_platform_binary
 _csfg_get_supplement_cdhash

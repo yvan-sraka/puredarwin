@@ -10485,7 +10485,7 @@ pmap_batch_set_cache_attributes_internal(
 				panic("%s: page is not managed; addr: 0x%016llx", __func__, paddr);
 			}
 
-			CleanPoC_DcacheRegion_Force_nopreempt_nohid(phystokv(paddr), PAGE_SIZE);
+			pmap_force_dcache_clean(phystokv(paddr), PAGE_SIZE);
 
 			page_index++;
 

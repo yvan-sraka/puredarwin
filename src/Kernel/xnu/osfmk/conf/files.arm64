@@ -14,6 +14,7 @@ osfmk/arm/pmap/pmap_iommu.c		optional nos_arm_pmap
 osfmk/arm/pmap/pmap_misc.c		optional nos_arm_pmap
 osfmk/arm/pmap/pmap_ppl_interface.c	optional nos_arm_pmap
 osfmk/arm/pmap/pmap_ppl_opensource_stubs.c	optional nos_arm_pmap config_pmap_ppl
+osfmk/arm/bcm2837_kernel_stubs.c	standard
 
 
 osfmk/arm64/bsd_arm64.c		optional mach_bsd
