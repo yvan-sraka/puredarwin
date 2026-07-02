@@ -342,7 +342,10 @@ void IOPCIDevice::free()
     if (savedConfig)
     {
 		if (configShadow(this)->link.next) panic("IOPCIDevice(%p) linked", this);
-		IODelete(configShadow(this), IOPCIConfigShadow, 1);
+		{
+			IOPCIConfigShadow *shadow = configShadow(this);
+			IODelete(shadow, IOPCIConfigShadow, 1);
+		}
         savedConfig = 0;
     }
     //  This needs to be the LAST thing we do, as it disposes of our "fake" member
