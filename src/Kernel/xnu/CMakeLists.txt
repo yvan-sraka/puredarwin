@@ -3,10 +3,11 @@ find_program(dsymutil_path NAMES dsymutil llvm-dsymutil REQUIRED)
 # Map cmake arch name to XNU ARCH_CONFIGS name
 if(PUREDARWIN_TARGET_ARCH STREQUAL "arm64")
     set(XNU_ARCH_CONFIGS "ARM64")
-    # VMAPPLE is the Apple Silicon virtual platform; skip proprietary KernelSupport
-    # via optional link in MakeInc.def.in when the archive is absent.
-    set(XNU_MAKE_MACHINE_CONFIG "TARGET_CONFIGS=RELEASE ARM64 VMAPPLE")
-    set(XNU_MAKE_EXTRA_ARGS "")
+    # BCM2837 is the open-source arm64 board (no libVMAPPLE). ARM_EXTRAS_BASE in
+    # MASTER.arm64.bcm2837 enables open-source asm/pmap via nos_arm_asm/pmap.
+    set(XNU_MAKE_MACHINE_CONFIG "TARGET_CONFIGS=RELEASE ARM64 BCM2837")
+    # BCM2837 on MacOSX: avoid ARM_LARGE_MEMORY (41-bit pointers) with T1SZ_BOOT=26.
+    set(XNU_MAKE_EXTRA_ARGS LARGE_MEMORY_DEFINE=-UARM_LARGE_MEMORY)
 else()
     set(XNU_ARCH_CONFIGS "X86_64")
     set(XNU_MAKE_MACHINE_CONFIG "")
