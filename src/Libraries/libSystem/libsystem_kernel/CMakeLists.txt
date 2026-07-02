@@ -25,14 +25,21 @@
 # - /usr/local/lib/loaderd/libsystem_kernel.a (copy of /usr/local/lib/dyld/libsystem_kernel.a)
 # - /usr/local/lib/dyld_stub/libsystem_kernel.a (copy of /usr/local/lib/dyld/libsystem_kernel.a)
 
+# Syscall stub architecture matches the PureDarwin target (see cmake/mig.cmake).
+if(PUREDARWIN_TARGET_ARCH STREQUAL "arm64")
+    set(LIBSYSTEM_KERNEL_SYSCALL_ARCH "arm64")
+else()
+    set(LIBSYSTEM_KERNEL_SYSCALL_ARCH "x86_64")
+endif()
+
 add_custom_command(OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/syscalls.a
     COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_CURRENT_BINARY_DIR}/sys
-    COMMAND ${CMAKE_COMMAND} -E env ARCHS=x86_64
+    COMMAND ${CMAKE_COMMAND} -E env ARCHS=${LIBSYSTEM_KERNEL_SYSCALL_ARCH}
         ${CMAKE_CURRENT_SOURCE_DIR}/scripts/create-syscalls.pl
         ${PUREDARWIN_SOURCE_DIR}/src/Kernel/xnu/bsd/kern/syscalls.master
         ${CMAKE_CURRENT_SOURCE_DIR}/custom ${CMAKE_CURRENT_SOURCE_DIR}/Platforms
         MacOSX ${CMAKE_CURRENT_BINARY_DIR}/sys
-    COMMAND ${CMAKE_COMMAND} -E env ARCHS=x86_64
+    COMMAND ${CMAKE_COMMAND} -E env ARCHS=${LIBSYSTEM_KERNEL_SYSCALL_ARCH}
         ${CMAKE_CURRENT_SOURCE_DIR}/scripts/compile-syscalls.pl
         ${CMAKE_CURRENT_BINARY_DIR}/sys/stubs.list ${CMAKE_CURRENT_BINARY_DIR}/syscalls.a
         -I${PUREDARWIN_BINARY_DIR}/src/Kernel/xnu/xnu_header_install/usr/include
