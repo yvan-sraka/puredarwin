@@ -2515,6 +2515,9 @@ exec_handle_port_actions(struct image_params *imgp,
 				goto done;
 			}
 			break;
+		case PSPA_SUID_CRED:
+			ret = ENOTSUP;
+			goto done;
 		default:
 			ret = EINVAL;
 			goto done;
