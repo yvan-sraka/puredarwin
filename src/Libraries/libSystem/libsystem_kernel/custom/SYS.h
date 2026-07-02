@@ -154,13 +154,22 @@ LEAF(_##name, 0)								;\
 LEAF(pseudo, 0)					;\
 	UNIX_SYSCALL_NONAME(name, nargs, cerror)
 
+#ifdef UNWIND_EPILOGUE
+#define SYSCALL_STUB_RETURN				\
+	ret;						;\
+	UNWIND_EPILOGUE
+#else
+#define SYSCALL_STUB_RETURN				\
+	ret
+#endif
+
 #define __SYSCALL2(pseudo, name, nargs, cerror) \
 	PSEUDO(pseudo, name, nargs, cerror)			;\
-	ret
+	SYSCALL_STUB_RETURN
 
 #define __SYSCALL(pseudo, name, nargs)			\
 	PSEUDO(pseudo, name, nargs, cerror)			;\
-	ret
+	SYSCALL_STUB_RETURN
 
 #elif defined(__arm__)
 
