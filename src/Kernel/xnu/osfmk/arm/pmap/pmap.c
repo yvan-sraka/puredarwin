@@ -125,6 +125,7 @@ extern u_int32_t random(void); /* from <libkern/libkern.h> */
 
 static bool alloc_asid(pmap_t pmap);
 static void free_asid(pmap_t pmap);
+MARK_AS_PMAP_TEXT static void pmap_phys_write_disable(vm_address_t va);
 static void flush_mmu_tlb_region_asid_async(vm_offset_t va, size_t length, pmap_t pmap, bool last_level_only);
 static void flush_mmu_tlb_full_asid_async(pmap_t pmap);
 static pt_entry_t wimg_to_pte(unsigned int wimg, pmap_paddr_t pa);
