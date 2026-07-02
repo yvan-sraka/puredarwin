@@ -115,4 +115,7 @@ fastlane/test_output
 
 iOSInjectionProject/
 
+# QEMU disk images (downloaded by qemu/fetch-image.sh)
+qemu/images/
+
 # End of https://www.gitignore.io/api/macos,swift

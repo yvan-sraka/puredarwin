@@ -8,6 +8,10 @@ One current goal of this project is to provide a useful bootable ISO/VM of some 
 
 See the [Website](https://www.puredarwin.org) for more information.
 
+### Running on Linux (QEMU)
+
+Pre-built disk images (e.g. PureDarwin 17.4 Beta) can be booted on Linux with QEMU. See [`qemu/README.md`](qemu/README.md) for profiles, download helpers, and launch scripts.
+
 ## Building PureDarwin
 
 To build PureDarwin, you will need OpenSSL installed, which is used by xar and ld64.
