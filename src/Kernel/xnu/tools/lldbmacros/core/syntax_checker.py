@@ -12,9 +12,16 @@ Usage:
 """
 import sys
 import os
+
+# lldbmacros/core/ contains modules such as collections.py that shadow the
+# Python standard library when this script is executed by path.
+_script_dir = os.path.dirname(os.path.abspath(__file__))
+while _script_dir in sys.path:
+    sys.path.remove(_script_dir)
+
 import re
 
-tabs_search_rex = re.compile("^\s*\t+",re.MULTILINE|re.DOTALL)
+tabs_search_rex = re.compile(r"^\s*\t+", re.MULTILINE | re.DOTALL)
 
 def find_non_ascii(s):
     for c in s:
