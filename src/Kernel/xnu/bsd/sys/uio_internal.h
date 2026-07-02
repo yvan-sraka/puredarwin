@@ -163,14 +163,10 @@ __END_DECLS
 /*
  * UIO_SIZEOF - return the amount of space a uio_t requires to
  *	contain the given number of iovecs.  Use this macro to
- *  create a stack buffer (of type uio_stackbuf_t to ensure
- *  alignment requirements) that can be passed to
- *  uio_createwithbuffer.
+ *  create a stack buffer that can be passed to uio_createwithbuffer.
  */
 #define UIO_SIZEOF( a_iovcount ) \
 	( sizeof(struct uio) + UIO_SIZEOF_IOVS(a_iovcount) )
-
-typedef char __attribute__((aligned(_Alignof(union iovecs)))) uio_stackbuf_t;
 
 #define UIO_IS_USER_SPACE32( a_uio_t )  \
 	( (a_uio_t)->uio_segflg == UIO_USERSPACE32 || (a_uio_t)->uio_segflg == UIO_PHYS_USERSPACE32 || \
