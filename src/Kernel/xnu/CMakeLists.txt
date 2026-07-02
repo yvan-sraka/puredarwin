@@ -3,7 +3,9 @@ find_program(dsymutil_path NAMES dsymutil llvm-dsymutil REQUIRED)
 # Map cmake arch name to XNU ARCH_CONFIGS name
 if(PUREDARWIN_TARGET_ARCH STREQUAL "arm64")
     set(XNU_ARCH_CONFIGS "ARM64")
-    set(XNU_MAKE_MACHINE_CONFIG "DEFAULT_ARM64_MACHINE_CONFIG=NONE")
+    # MakeInc.top uses override for DEFAULT_ARM64_MACHINE_CONFIG, so a command-line
+    # assignment is ignored. RC_ProjectName=*_host selects NONE (generic arm64).
+    set(XNU_MAKE_MACHINE_CONFIG "RC_ProjectName=puredarwin_host")
 else()
     set(XNU_ARCH_CONFIGS "X86_64")
     set(XNU_MAKE_MACHINE_CONFIG "")
