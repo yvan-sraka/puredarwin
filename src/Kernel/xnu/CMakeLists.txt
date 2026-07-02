@@ -1,5 +1,15 @@
 find_program(dsymutil_path NAMES dsymutil llvm-dsymutil REQUIRED)
 
+# Map cmake arch name to XNU ARCH_CONFIGS name
+if(PUREDARWIN_TARGET_ARCH STREQUAL "arm64")
+    set(XNU_ARCH_CONFIGS "ARM64")
+else()
+    set(XNU_ARCH_CONFIGS "X86_64")
+endif()
+
+set(XNU_FIREHOSE_INCLUDE "${CMAKE_CURRENT_SOURCE_DIR}/../libfirehose_kernel/include")
+set(XNU_PTHREAD_INCLUDE "${PUREDARWIN_SOURCE_DIR}/src/Libraries/libSystem/pthread/include")
+
 file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/xnu_header_install)
 externalproject_add(xnu_headers.extproj
     PREFIX ${CMAKE_CURRENT_BINARY_DIR}/xnu_header_build
@@ -23,9 +33,10 @@ externalproject_add(xnu_headers.extproj
             -D LIBTOOL_PATH=$<TARGET_FILE:host_libtool>
             -D UNIFDEF_PATH=$<TARGET_FILE:unifdef>
             -D DSYMUTIL_PATH=${dsymutil_path}
+            -D PTHREAD_HEADER_PATH=${XNU_PTHREAD_INCLUDE}
             -P ${CMAKE_CURRENT_SOURCE_DIR}/preprocess_files.cmake
     COMMAND
-        make -C <SOURCE_DIR> installhdrs ARCH_CONFIGS=X86_64 BUILD_LTO=0
+        make -C <SOURCE_DIR> installhdrs ARCH_CONFIGS=${XNU_ARCH_CONFIGS} BUILD_LTO=0
             BUILD_WERROR=0 DO_CTFMERGE=0 KERNEL_CONFIGS=RELEASE
             SRCROOT=${CMAKE_CURRENT_SOURCE_DIR} OBJROOT=<BINARY_DIR>
             DSTROOT=${CMAKE_CURRENT_BINARY_DIR}/xnu_header_install
@@ -88,11 +99,11 @@ externalproject_add(xnu
             -D UNIFDEF_PATH=$<TARGET_FILE:unifdef>
             -D DSYMUTIL_PATH=${dsymutil_path}
             -D FIREHOSE_KERNEL_LIBRARY_PATH=$<TARGET_FILE:libfirehose_kernel>
-            -D FIREHOSE_KERNEL_HEADER_PATH=$<TARGET_PROPERTY:libfirehose_kernel,INTERFACE_INCLUDE_DIRECTORIES>
-            -D PTHREAD_HEADER_PATH=$<TARGET_PROPERTY:pthread_common_headers,INTERFACE_INCLUDE_DIRECTORIES>
+            -D FIREHOSE_KERNEL_HEADER_PATH=${XNU_FIREHOSE_INCLUDE}
+            -D PTHREAD_HEADER_PATH=${XNU_PTHREAD_INCLUDE}
             -P ${CMAKE_CURRENT_SOURCE_DIR}/preprocess_files.cmake
     COMMAND
-        make -C <SOURCE_DIR> install ARCH_CONFIGS=X86_64 BUILD_LTO=0
+        make -C <SOURCE_DIR> install ARCH_CONFIGS=${XNU_ARCH_CONFIGS} BUILD_LTO=0
             BUILD_WERROR=0 DO_CTFMERGE=0 KERNEL_CONFIGS=RELEASE
             SRCROOT=${CMAKE_CURRENT_SOURCE_DIR} OBJROOT=<BINARY_DIR>
             SYMROOT=${CMAKE_CURRENT_BINARY_DIR}/xnu_sym DSTROOT=${CMAKE_CURRENT_BINARY_DIR}/xnu
