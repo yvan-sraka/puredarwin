@@ -166,6 +166,9 @@ boolean_t vm_swap_force_defrag = FALSE, vm_swap_force_reclaim = FALSE;
 #else /* !XNU_TARGET_OS_OSX */
 
 #define VM_MAX_SWAP_FILE_NUM            100
+#define VM_MAX_SWAP_FILE_SWAP_ENABLED_NUM VM_MAX_SWAP_FILE_NUM
+#define VM_MIN_SWAP_FILE_SWAP_ENABLED_NUM 1
+#define VM_SWAP_MIN_VOLUME_CAPACITY (128ULL * (1ULL << 30))
 #define VM_SWAPFILE_DELAYED_TRIM_MAX    128
 
 #define VM_SWAP_SHOULD_DEFRAGMENT()     (((vm_swap_force_defrag == TRUE) || (c_swappedout_sparse_count > (vm_swapfile_total_segs_used / 4))) ? 1 : 0)
