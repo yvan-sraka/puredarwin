@@ -51,7 +51,7 @@ struct wait_queue { unsigned char opaque[32]; };
 #endif  /* MACH_KERNEL_PRIVATE */
 
 typedef struct zone                     *zone_t;
-#define         ZONE_NULL                       ((zone_t) 0)
+#define         ZONE_NULL               ((zone_t) 0)
 
 typedef struct wait_queue               *wait_queue_t;
 #define         WAIT_QUEUE_NULL         ((wait_queue_t) 0)
@@ -65,6 +65,17 @@ typedef void *                          ipc_kobject_t;
 typedef void *event_t;          /* wait event */
 #define         NO_EVENT                        ((event_t) 0)
 
+/*
+ * Events are used to selectively wake up threads waiting
+ * on a specified wait queue.
+ *
+ * The NO_EVENT64 value is a special event that is used
+ * on wait queues that can be members of wait queue sets
+ * for waits/wakeups that need to prepost to the set.
+ *
+ * This event must be "unique" and it is customary to use
+ * a pointer to memory related to the event.
+ */
 typedef uint64_t event64_t;             /* 64 bit wait event */
 #define         NO_EVENT64              ((event64_t) 0)
 #define         CAST_EVENT64_T(a_ptr)   ((event64_t)((uintptr_t)(a_ptr)))
@@ -325,6 +336,24 @@ typedef enum perfcontrol_class {
 	PERFCONTROL_CLASS_MAX            = 9,
 } perfcontrol_class_t;
 
+typedef enum {
+	REASON_NONE,
+	REASON_SYSTEM,
+	REASON_USER,
+	REASON_CLPC_SYSTEM,
+	REASON_CLPC_USER,
+} processor_reason_t;
+
+#define SHUTDOWN_TEMPORARY      0x0001
+#define LOCK_STATE              0x0002
+#define UNLOCK_STATE            0x0004
+#define WAIT_FOR_START          0x0008
+#define WAIT_FOR_LAST_START     0x0010
+#if DEVELOPMENT || DEBUG
+#define ASSERT_IN_SLEEP            0x10000000
+#define ASSERT_POWERDOWN_SUSPENDED 0x20000000
+#endif
+
 /*
  * struct sched_clutch_edge
  *
@@ -351,6 +380,21 @@ typedef union sched_clutch_edge {
 	};
 	uint64_t sce_edge_packed;
 } sched_clutch_edge;
+
+/*
+ * Cluster shared resource management
+ *
+ * The options describe the various shared cluster resource
+ * types that can be contended under load and need special
+ * handling from the scheduler.
+ */
+__options_decl(cluster_shared_rsrc_type_t, uint32_t, {
+	CLUSTER_SHARED_RSRC_TYPE_RR                     = 0,
+	CLUSTER_SHARED_RSRC_TYPE_NATIVE_FIRST           = 1,
+	CLUSTER_SHARED_RSRC_TYPE_COUNT                  = 2,
+	CLUSTER_SHARED_RSRC_TYPE_MIN                    = CLUSTER_SHARED_RSRC_TYPE_RR,
+	CLUSTER_SHARED_RSRC_TYPE_NONE                   = CLUSTER_SHARED_RSRC_TYPE_COUNT,
+});
 
 #endif  /* KERNEL_PRIVATE */
 

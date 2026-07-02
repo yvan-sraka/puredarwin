@@ -127,6 +127,23 @@ LEAF(pseudo, 0)					;\
 #include <architecture/i386/asm_help.h>
 #include <mach/i386/syscall_sw.h>
 
+/* Ventura asm_help.h emits .cfi_startproc in LEAF prologues; syscall stubs
+ * use plain ret without .cfi_endproc. Skip unwind metadata for syscall asm. */
+#ifdef UNWIND_EPILOGUE
+#undef LEAF_FUNCTION_PROLOGUE
+#if defined(__x86_64__)
+#define LEAF_FUNCTION_PROLOGUE(localvarsize)			\
+	.set	L__framesize,ROUND_TO_STACK(localvarsize)	;\
+	.set	L__nested_function, 0				;\
+	CALL_MCOUNT						\
+	.if L__framesize						;\
+	  pushq	%rbp						;\
+	  movq	%rsp, %rbp					;\
+	  subq	$L__framesize, %rsp				;\
+	.endif
+#endif
+#endif
+
 #define UNIX_SYSCALL_SYSCALL	\
 	movq	%rcx, %r10		;\
 	syscall

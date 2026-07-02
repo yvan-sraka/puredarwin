@@ -395,7 +395,10 @@ configure_mxcsr_capability_mask(x86_ext_thread_state_t *fps)
 	set_ts();
 }
 
-int fpsimd_fault_popc = 0;
+#if DEBUG || DEVELOPMENT
+int fpsimd_fault_popc = 1;
+#endif
+
 /*
  * Look for FPU and initialize it.
  * Called on each CPU.
@@ -433,8 +436,6 @@ init_fpu(void)
 
 	fpu_capability = fpu_default = FP;
 
-	PE_parse_boot_argn("fpsimd_fault_popc", &fpsimd_fault_popc, sizeof(fpsimd_fault_popc));
-
 	static boolean_t is_avx512_enabled = TRUE;
 	if (cpu_number() == master_cpu) {
 		if (cpuid_leaf7_features() & CPUID_LEAF7_FEATURE_AVX512F) {
@@ -450,7 +451,7 @@ init_fpu(void)
 	if (cpuid_features() & CPUID_FEATURE_XSAVE) {
 		cpuid_xsave_leaf_t *xs0p = &cpuid_info()->cpuid_xsave_leaf[0];
 		if (is_avx512_enabled &&
-		    (xs0p->extended_state[eax] & XFEM_ZMM) == XFEM_ZMM) {
+		    (xs0p->extended_state[eax] & XFEM_ZMM_OPMASK) == XFEM_ZMM_OPMASK) {
 			assert(xs0p->extended_state[eax] & XFEM_SSE);
 			assert(xs0p->extended_state[eax] & XFEM_YMM);
 			fpu_capability = AVX512;
@@ -544,7 +545,7 @@ fpu_load_registers(void *fstate)
 	struct x86_fx_thread_state *ifps = fstate;
 	fp_save_layout_t layout = ifps->fp_save_layout;
 
-	assert(current_task() == NULL ||                                \
+	assert(startup_phase < STARTUP_SUB_EARLY_BOOT || \
 	    (thread_is_64bit_addr(current_thread()) ?                        \
 	    (layout == FXSAVE64 || layout == XSAVE64) :     \
 	    (layout == FXSAVE32 || layout == XSAVE32)));
@@ -567,7 +568,7 @@ fpu_load_registers(void *fstate)
 	}
 	if (fpu_YMM_capable) {
 		if (layout != XSAVE32 && layout != XSAVE64) {
-			panic("Inappropriate layout: %u\n", layout);
+			panic("Inappropriate layout: %u", layout);
 		}
 	}
 #endif  /* DEBUG */
@@ -586,7 +587,7 @@ fpu_load_registers(void *fstate)
 		xrstor(ifps, xstate_xmask[current_xstate()]);
 		break;
 	default:
-		panic("fpu_load_registers() bad layout: %d\n", layout);
+		panic("fpu_load_registers() bad layout: %d", layout);
 	}
 }
 
@@ -617,7 +618,7 @@ fpu_store_registers(void *fstate, boolean_t is64)
 		}
 		break;
 	default:
-		panic("fpu_store_registers() bad xstate: %d\n", xs);
+		panic("fpu_store_registers() bad xstate: %d", xs);
 	}
 }
 
@@ -629,7 +630,7 @@ void
 fpu_module_init(void)
 {
 	if (!IS_VALID_XSTATE(fpu_default)) {
-		panic("fpu_module_init: invalid extended state %u\n",
+		panic("fpu_module_init: invalid extended state %u",
 		    fpu_default);
 	}
 
@@ -650,6 +651,15 @@ fpu_module_init(void)
 
 	/* Determine MXCSR reserved bits and configure initial FPU state*/
 	configure_mxcsr_capability_mask(&initial_fp_state);
+
+#if DEBUG || DEVELOPMENT
+	if (kern_feature_override(KF_DISABLE_FP_POPC_ON_PGFLT)) {
+		fpsimd_fault_popc = 0;
+	}
+
+	/* Allow the explicit boot-arg to override the validation disables */
+	PE_parse_boot_argn("fpsimd_fault_popc", &fpsimd_fault_popc, sizeof(fpsimd_fault_popc));
+#endif
 }
 
 /*
@@ -669,7 +679,7 @@ fpu_switch_context(thread_t old, thread_t new)
 	ifps = (old)->machine.ifps;
 #if     DEBUG
 	if (ifps && ((ifps->fp_valid != FALSE) && (ifps->fp_valid != TRUE))) {
-		panic("ifps->fp_valid: %u\n", ifps->fp_valid);
+		panic("ifps->fp_valid: %u", ifps->fp_valid);
 	}
 #endif
 	if (ifps != 0 && (ifps->fp_valid == FALSE)) {
@@ -898,8 +908,13 @@ Retry:
 			case x86_AVX512_STATE32:
 				__nochk_bcopy(&xs.s32->fpu_k0, iavx->x_Opmask, 8 * sizeof(_STRUCT_OPMASK_REG));
 				__nochk_bcopy(&xs.s32->fpu_zmmh0, iavx->x_ZMM_Hi256, 8 * sizeof(_STRUCT_YMM_REG));
+
+				if (fpu_allzeroes((uint64_t *)(void *)iavx->x_Opmask, 8 * sizeof(_STRUCT_OPMASK_REG)) == TRUE) {
+					iavx->_xh.xstate_bv &= ~XFEM_OPMASK;
+				}
+
 				if (fpu_allzeroes((uint64_t *)(void *)iavx->x_ZMM_Hi256, 8 * sizeof(_STRUCT_YMM_REG)) == TRUE) {
-					iavx->_xh.xstate_bv &= ~XFEM_ZMM;
+					iavx->_xh.xstate_bv &= ~(XFEM_ZMM_HI256 | XFEM_HI16_ZMM);
 				}
 				__nochk_bcopy(&xs.s32->fpu_ymmh0, iavx->x_YMM_Hi128, 8 * sizeof(_STRUCT_XMM_REG));
 				if (fpu_allzeroes((uint64_t *)(void *)iavx->x_YMM_Hi128, 8 * sizeof(_STRUCT_XMM_REG)) == TRUE) {
@@ -919,13 +934,17 @@ Retry:
 				__nochk_bcopy(&xs.s64->fpu_zmm16, iavx->x_Hi16_ZMM, 16 * sizeof(_STRUCT_ZMM_REG));
 				__nochk_bcopy(&xs.s64->fpu_zmmh0, iavx->x_ZMM_Hi256, 16 * sizeof(_STRUCT_YMM_REG));
 				/*
-				 * Note that it is valid to have XFEM_ZMM set but XFEM_YMM cleared.  In that case,
+				 * Note that it is valid to have XFEM_ZMM_OPMASK set but XFEM_YMM cleared.  In that case,
 				 * the upper bits of the YMMs would be cleared and would result in a clean-upper
 				 * state, allowing SSE instruction to avoid false dependencies.
 				 */
+				if (fpu_allzeroes((uint64_t *)(void *)iavx->x_Opmask, 8 * sizeof(_STRUCT_OPMASK_REG)) == TRUE) {
+					iavx->_xh.xstate_bv &= ~XFEM_OPMASK;
+				}
+
 				if (fpu_allzeroes((uint64_t *)(void *)iavx->x_Hi16_ZMM, 16 * sizeof(_STRUCT_ZMM_REG)) == TRUE &&
 				    fpu_allzeroes((uint64_t *)(void *)iavx->x_ZMM_Hi256, 16 * sizeof(_STRUCT_YMM_REG)) == TRUE) {
-					iavx->_xh.xstate_bv &= ~XFEM_ZMM;
+					iavx->_xh.xstate_bv &= ~(XFEM_ZMM_HI256 | XFEM_HI16_ZMM);
 				}
 
 				__nochk_bcopy(&xs.s64->fpu_ymmh0, iavx->x_YMM_Hi128, 16 * sizeof(_STRUCT_XMM_REG));
@@ -1296,10 +1315,10 @@ fpextovrflt(void)
 	intr = ml_set_interrupts_enabled(FALSE);
 
 	if (get_interrupt_level()) {
-		panic("FPU segment overrun exception at interrupt context\n");
+		panic("FPU segment overrun exception at interrupt context");
 	}
 	if (current_task() == kernel_task) {
-		panic("FPU segment overrun exception in kernel thread context\n");
+		panic("FPU segment overrun exception in kernel thread context");
 	}
 
 	/*
@@ -1330,8 +1349,6 @@ fpextovrflt(void)
 	}
 }
 
-extern void fpxlog(int, uint32_t, uint32_t, uint32_t);
-
 /*
  * FPU error. Called by AST.
  */
@@ -1340,30 +1357,25 @@ void
 fpexterrflt(void)
 {
 	thread_t        thr_act = current_thread();
-	struct x86_fx_thread_state *ifps = thr_act->machine.ifps;
 	boolean_t       intr;
 
 	intr = ml_set_interrupts_enabled(FALSE);
 
 	if (get_interrupt_level()) {
-		panic("FPU error exception at interrupt context\n");
+		panic("FPU error exception at interrupt context");
 	}
 	if (current_task() == kernel_task) {
-		panic("FPU error exception in kernel thread context\n");
+		panic("FPU error exception in kernel thread context");
 	}
 
 	/*
 	 * Save the FPU state and turn off the FPU.
 	 */
 	fp_save(thr_act);
+	/* Set TS to ensure we catch attempts to use the FPU before returning from trap handling */
+	set_ts();
 
 	(void)ml_set_interrupts_enabled(intr);
-
-	const uint32_t mask = ifps->fx_control &
-	    (FPC_IM | FPC_DM | FPC_ZM | FPC_OM | FPC_UE | FPC_PE);
-	const uint32_t xcpt = ~mask & (ifps->fx_status &
-	    (FPS_IE | FPS_DE | FPS_ZE | FPS_OE | FPS_UE | FPS_PE));
-	fpxlog(EXC_I386_EXTERR, ifps->fx_status, ifps->fx_control, xcpt);
 }
 
 /*
@@ -1408,7 +1420,7 @@ fp_load(
 	assert(ifps);
 #if     DEBUG
 	if (ifps->fp_valid != FALSE && ifps->fp_valid != TRUE) {
-		panic("fp_load() invalid fp_valid: %u, fp_save_layout: %u\n",
+		panic("fp_load() invalid fp_valid: %u, fp_save_layout: %u",
 		    ifps->fp_valid, ifps->fp_save_layout);
 	}
 #endif
@@ -1430,34 +1442,25 @@ void
 fpSSEexterrflt(void)
 {
 	thread_t        thr_act = current_thread();
-	struct x86_fx_thread_state *ifps = thr_act->machine.ifps;
 	boolean_t       intr;
 
 	intr = ml_set_interrupts_enabled(FALSE);
 
 	if (get_interrupt_level()) {
-		panic("SSE exception at interrupt context\n");
+		panic("SSE exception at interrupt context");
 	}
 	if (current_task() == kernel_task) {
-		panic("SSE exception in kernel thread context\n");
+		panic("SSE exception in kernel thread context");
 	}
 
 	/*
 	 * Save the FPU state and turn off the FPU.
 	 */
 	fp_save(thr_act);
+	/* Set TS to ensure we catch attempts to use the FPU before returning from trap handling */
+	set_ts();
 
 	(void)ml_set_interrupts_enabled(intr);
-	/*
-	 * Raise FPU exception.
-	 * Locking not needed on pcb->ifps,
-	 * since thread is running.
-	 */
-	const uint32_t mask = (ifps->fx_MXCSR >> 7) &
-	    (FPC_IM | FPC_DM | FPC_ZM | FPC_OM | FPC_UE | FPC_PE);
-	const uint32_t xcpt = ~mask & (ifps->fx_MXCSR &
-	    (FPS_IE | FPS_DE | FPS_ZE | FPS_OE | FPS_UE | FPS_PE));
-	fpxlog(EXC_I386_SSEEXTERR, ifps->fx_MXCSR, ifps->fx_MXCSR, xcpt);
 }
 
 
@@ -1592,6 +1595,15 @@ fpUDflt(user_addr_t rip)
 	uint8_t         instruction_prefix;
 	boolean_t       is_AVX512_instruction = FALSE;
 	user_addr_t     original_rip = rip;
+
+	/*
+	 * If this thread's xstate is already AVX512, then this #UD is
+	 * a true #UD.
+	 */
+	if (thread_xstate(current_thread()) == AVX512) {
+		return 1;
+	}
+
 	do {
 		/* TODO: as an optimisation, copy up to the lesser of the
 		 * next page boundary or maximal prefix length in one pass
@@ -1677,23 +1689,15 @@ ml_fpu_avx512_enabled(void)
 }
 
 static xstate_t
-task_xstate(task_t task)
-{
-	if (task == TASK_NULL) {
-		return fpu_default;
-	} else {
-		return task->xstate;
-	}
-}
-
-static xstate_t
 thread_xstate(thread_t thread)
 {
 	xstate_t xs = THREAD_TO_PCB(thread)->xstate;
-	if (xs == UNDEFINED) {
-		return task_xstate(thread->task);
-	} else {
+	if (xs != UNDEFINED) {
 		return xs;
+	} else if (startup_phase < STARTUP_SUB_EARLY_BOOT) {
+		return fpu_default;
+	} else {
+		return get_threadtask(thread)->xstate;
 	}
 }
 
@@ -1723,6 +1727,7 @@ fpu_switch_addrmode(thread_t thread, boolean_t is_64bit)
 	mp_enable_preemption();
 }
 
+#if DEBUG || DEVELOPMENT
 static inline uint32_t
 fpsimd_pop(uintptr_t ins, int sz)
 {
@@ -1756,13 +1761,15 @@ fpsimd_pop(uintptr_t ins, int sz)
 	return rv;
 }
 
-uint32_t
+bool
+thread_fpsimd_hash_enabled(void)
+{
+	return fpsimd_fault_popc ? true : false;
+}
+
+uint32_t __attribute__((noinline))
 thread_fpsimd_hash(thread_t ft)
 {
-	if (fpsimd_fault_popc == 0) {
-		return 0;
-	}
-
 	uint32_t prv = 0;
 	boolean_t istate = ml_set_interrupts_enabled(FALSE);
 	struct x86_fx_thread_state *pifps = THREAD_TO_PCB(ft)->ifps;
@@ -1773,16 +1780,20 @@ thread_fpsimd_hash(thread_t ft)
 			    sizeof(pifps->fx_XMM_reg));
 		} else {
 			uintptr_t cr0 = get_cr0();
-			clear_ts();
-			fp_save(ft);
-			prv = fpsimd_pop((uintptr_t) &pifps->fx_XMM_reg[0][0],
-			    sizeof(pifps->fx_XMM_reg));
-			pifps->fp_valid = FALSE;
-			if (cr0 & CR0_TS) {
-				set_cr0(cr0);
+			/*
+			 * The unusual case where the fp save area is not valid, yet TS is set,
+			 * is used to perform a lazy-init of FP state, so for this specific case,
+			 * assume that the popcount of the FP regs is 0.
+			 */
+			if (!(cr0 & CR0_TS)) {
+				fp_save(ft);
+				prv = fpsimd_pop((uintptr_t) &pifps->fx_XMM_reg[0][0],
+				    sizeof(pifps->fx_XMM_reg));
+				pifps->fp_valid = FALSE;
 			}
 		}
 	}
 	ml_set_interrupts_enabled(istate);
 	return prv;
 }
+#endif /* DEBUG || DEVELOPMENT */

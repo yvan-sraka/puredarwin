@@ -70,8 +70,6 @@
  *	Functions to initialize the IPC system.
  */
 
-#include <mach_debug.h>
-
 #include <mach/port.h>
 #include <mach/message.h>
 #include <mach/kern_return.h>
@@ -85,10 +83,7 @@
 #include <kern/ipc_kobject.h>
 #include <kern/ipc_mig.h>
 #include <kern/host_notify.h>
-#include <kern/mk_timer.h>
 #include <kern/misc_protos.h>
-#include <kern/suid_cred.h>
-#include <kern/sync_lock.h>
 #include <kern/sync_sema.h>
 #include <kern/ux_handler.h>
 #include <vm/vm_map.h>
@@ -103,14 +98,11 @@
 #include <ipc/ipc_kmsg.h>
 #include <ipc/ipc_hash.h>
 #include <ipc/ipc_init.h>
-#include <ipc/ipc_table.h>
 #include <ipc/ipc_voucher.h>
-#include <ipc/ipc_importance.h>
 #include <ipc/ipc_eventlink.h>
 
 #include <mach/machine/ndr_def.h>   /* NDR_record */
 
-#define IPC_KERNEL_MAP_SIZE      (CONFIG_IPC_KERNEL_MAP_SIZE * 1024 * 1024)
 SECURITY_READ_ONLY_LATE(vm_map_t) ipc_kernel_map;
 
 /* values to limit physical copy out-of-line memory descriptors */
@@ -118,34 +110,38 @@ SECURITY_READ_ONLY_LATE(vm_map_t) ipc_kernel_copy_map;
 #define IPC_KERNEL_COPY_MAP_SIZE (8 * 1024 * 1024)
 const vm_size_t ipc_kmsg_max_vm_space = ((IPC_KERNEL_COPY_MAP_SIZE * 7) / 8);
 
-/*
- * values to limit inline message body handling
- * avoid copyin/out limits - even after accounting for maximum descriptor expansion.
- */
-#define IPC_KMSG_MAX_SPACE (64 * 1024 * 1024) /* keep in sync with COPYSIZELIMIT_PANIC */
-const vm_size_t ipc_kmsg_max_body_space = ((IPC_KMSG_MAX_SPACE * 3) / 4 - MAX_TRAILER_SIZE);
+#define IPC_KERNEL_MAP_SIZE      (CONFIG_IPC_KERNEL_MAP_SIZE << 20)
 
+/* Note: Consider Developer Mode when changing the default. */
 #if XNU_TARGET_OS_OSX
-#define IPC_CONTROL_PORT_OPTIONS_DEFAULT IPC_CONTROL_PORT_OPTIONS_NONE
+#define IPC_CONTROL_PORT_OPTIONS_DEFAULT (ICP_OPTIONS_IMMOVABLE_1P_HARD | ICP_OPTIONS_PINNED_1P_HARD)
 #else
-#define IPC_CONTROL_PORT_OPTIONS_DEFAULT (IPC_CONTROL_PORT_OPTIONS_IMMOVABLE_HARD | IPC_CONTROL_PORT_OPTIONS_PINNED_SOFT)
+#define IPC_CONTROL_PORT_OPTIONS_DEFAULT (ICP_OPTIONS_IMMOVABLE_ALL_HARD | \
+	ICP_OPTIONS_PINNED_1P_HARD | \
+	ICP_OPTIONS_PINNED_3P_SOFT)
 #endif
 
 TUNABLE(ipc_control_port_options_t, ipc_control_port_options,
     "ipc_control_port_options", IPC_CONTROL_PORT_OPTIONS_DEFAULT);
 
-SECURITY_READ_ONLY_LATE(bool) pinned_control_port_enabled;
-SECURITY_READ_ONLY_LATE(bool) immovable_control_port_enabled;
-
-
 LCK_GRP_DECLARE(ipc_lck_grp, "ipc");
 LCK_ATTR_DECLARE(ipc_lck_attr, 0, 0);
 
 /*
- * XXX tunable, belongs in mach.message.h
+ * As an optimization, 'small' out of line data regions using a
+ * physical copy strategy are copied into kalloc'ed buffers.
+ * The value of 'small' is determined here.  Requests kalloc()
+ * with sizes greater than msg_ool_size_small may fail.
  */
-#define MSG_OOL_SIZE_SMALL_MAX (2*PAGE_SIZE)
-SECURITY_READ_ONLY_LATE(vm_size_t) msg_ool_size_small;
+const vm_size_t msg_ool_size_small = KHEAP_MAX_SIZE;
+__startup_data
+static struct mach_vm_range ipc_kernel_range;
+__startup_data
+static struct mach_vm_range ipc_kernel_copy_range;
+KMEM_RANGE_REGISTER_STATIC(ipc_kernel_map, &ipc_kernel_range,
+    IPC_KERNEL_MAP_SIZE);
+KMEM_RANGE_REGISTER_STATIC(ipc_kernel_copy_map, &ipc_kernel_copy_range,
+    IPC_KERNEL_COPY_MAP_SIZE);
 
 /*
  *	Routine:	ipc_init
@@ -157,7 +153,6 @@ static void
 ipc_init(void)
 {
 	kern_return_t kr;
-	vm_offset_t min;
 
 	/* create special spaces */
 
@@ -169,75 +164,41 @@ ipc_init(void)
 
 	/* initialize modules with hidden data structures */
 
-#if IMPORTANCE_INHERITANCE
-	ipc_importance_init();
-#endif
 #if CONFIG_ARCADE
 	arcade_init();
 #endif
 
-	pinned_control_port_enabled    = !!(ipc_control_port_options & (IPC_CONTROL_PORT_OPTIONS_PINNED_SOFT | IPC_CONTROL_PORT_OPTIONS_PINNED_HARD));
-	immovable_control_port_enabled = !!(ipc_control_port_options & (IPC_CONTROL_PORT_OPTIONS_IMMOVABLE_SOFT | IPC_CONTROL_PORT_OPTIONS_IMMOVABLE_HARD));
+	bool pinned_control_port_enabled_1p = !!(ipc_control_port_options & ICP_OPTIONS_1P_PINNED);
+	bool immovable_control_port_enabled_1p = !!(ipc_control_port_options & ICP_OPTIONS_1P_IMMOVABLE);
 
-	if (pinned_control_port_enabled && !immovable_control_port_enabled) {
-		kprintf("Invalid ipc_control_port_options boot-arg: pinned control port cannot be enabled without immovability enforcement. Ignoring pinning boot-arg.");
-		pinned_control_port_enabled = false;
-		ipc_control_port_options &= ~(IPC_CONTROL_PORT_OPTIONS_PINNED_SOFT | IPC_CONTROL_PORT_OPTIONS_PINNED_HARD);
+	bool pinned_control_port_enabled_3p = !!(ipc_control_port_options & ICP_OPTIONS_3P_PINNED);
+	bool immovable_control_port_enabled_3p = !!(ipc_control_port_options & ICP_OPTIONS_3P_IMMOVABLE);
+
+	if (pinned_control_port_enabled_1p && !immovable_control_port_enabled_1p) {
+		kprintf("Invalid ipc_control_port_options boot-arg: pinned control port cannot be enabled without immovability enforcement. Ignoring 1p pinning boot-arg.");
+		ipc_control_port_options &= ~ICP_OPTIONS_1P_PINNED;
 	}
 
-	kr = kmem_suballoc(kernel_map, &min, IPC_KERNEL_MAP_SIZE,
-	    TRUE,
-	    (VM_FLAGS_ANYWHERE),
-	    VM_MAP_KERNEL_FLAGS_NONE,
-	    VM_KERN_MEMORY_IPC,
-	    &ipc_kernel_map);
-
-	if (kr != KERN_SUCCESS) {
-		panic("ipc_init: kmem_suballoc of ipc_kernel_map failed");
+	if (pinned_control_port_enabled_3p && !immovable_control_port_enabled_3p) {
+		kprintf("Invalid ipc_control_port_options boot-arg: pinned control port cannot be enabled without immovability enforcement. Ignoring 3p pinning boot-arg.");
+		ipc_control_port_options &= ~ICP_OPTIONS_3P_PINNED;
 	}
 
-	kr = kmem_suballoc(kernel_map, &min, IPC_KERNEL_COPY_MAP_SIZE,
-	    TRUE,
-	    (VM_FLAGS_ANYWHERE),
-	    VM_MAP_KERNEL_FLAGS_NONE,
-	    VM_KERN_MEMORY_IPC,
-	    &ipc_kernel_copy_map);
+	ipc_kernel_map = kmem_suballoc(kernel_map, &ipc_kernel_range.min_address,
+	    IPC_KERNEL_MAP_SIZE, VM_MAP_CREATE_PAGEABLE,
+	    VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE, KMS_PERMANENT | KMS_NOFAIL,
+	    VM_KERN_MEMORY_IPC).kmr_submap;
 
-	if (kr != KERN_SUCCESS) {
-		panic("ipc_init: kmem_suballoc of ipc_kernel_copy_map failed");
-	}
+	ipc_kernel_copy_map = kmem_suballoc(kernel_map, &ipc_kernel_copy_range.min_address,
+	    IPC_KERNEL_COPY_MAP_SIZE,
+	    VM_MAP_CREATE_PAGEABLE | VM_MAP_CREATE_DISABLE_HOLELIST,
+	    VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE, KMS_PERMANENT | KMS_NOFAIL,
+	    VM_KERN_MEMORY_IPC).kmr_submap;
 
 	ipc_kernel_copy_map->no_zero_fill = TRUE;
 	ipc_kernel_copy_map->wait_for_space = TRUE;
-
-	/*
-	 * As an optimization, 'small' out of line data regions using a
-	 * physical copy strategy are copied into kalloc'ed buffers.
-	 * The value of 'small' is determined here.  Requests kalloc()
-	 * with sizes greater or equal to kalloc_max_prerounded may fail.
-	 */
-	if (kalloc_max_prerounded <= MSG_OOL_SIZE_SMALL_MAX) {
-		msg_ool_size_small = kalloc_max_prerounded;
-	} else {
-		msg_ool_size_small = MSG_OOL_SIZE_SMALL_MAX;
-	}
 
 	ipc_host_init();
 	ux_handler_init();
 }
 STARTUP(MACH_IPC, STARTUP_RANK_LAST, ipc_init);
-
-
-/*
- *	Routine:	ipc_thread_call_init
- *	Purpose:
- *		Initialize IPC logic that needs thread call support
- */
-
-void
-ipc_thread_call_init(void)
-{
-#if IMPORTANCE_INHERITANCE
-	ipc_importance_thread_call_init();
-#endif
-}

@@ -149,11 +149,37 @@ enum {
 #define DKS                "%s-0x%qx"
 #define DKN(s)              s->getName(), s->getRegistryEntryID()
 
+#ifdef IOKITDEBUG
+#define DEBUG_INIT_VALUE IOKITDEBUG
+#else
+// Enable IOWaitQuiet panics except on KASAN. These panics can only
+// be triggered by specially entitled entities granted the privilege
+// to panic on a registry quiesce timeout.
+#if KASAN
+#define DEBUG_INIT_VALUE 0
+#else /* !KASAN */
+#define DEBUG_INIT_VALUE kIOWaitQuietPanics
+#endif /* KASAN */
+#endif
+
 #endif /* XNU_KERNEL_PRIVATE */
 
 extern SInt64    gIOKitDebug;
 extern SInt64    gIOKitTrace;
 extern SInt64    gIODKDebug;
+
+#ifdef __cplusplus
+
+typedef kern_return_t (*IOCoreAnalyticsSendEventProc)(
+	uint64_t       options,
+	OSString     * eventName,
+	OSDictionary * eventPayload);
+
+#if XNU_KERNEL_PRIVATE
+extern IOCoreAnalyticsSendEventProc gIOCoreAnalyticsSendEventProc;
+#endif /* XNU_KERNEL_PRIVATE */
+
+#endif /* __cplusplus */
 
 #ifdef __cplusplus
 extern "C" {
@@ -175,7 +201,10 @@ extern void    OSPrintMemory( void );
 #endif
 #define IOPrintMemory OSPrintMemory
 
-
+#if defined(KERNEL) && defined(__cplusplus)
+kern_return_t
+IOSetCoreAnalyticsSendEventProc(IOCoreAnalyticsSendEventProc proc);
+#endif /* defined(KERNEL) && defined(__cplusplus) */
 
 #define kIOKitDiagnosticsClientClassName "IOKitDiagnosticsClient"
 
@@ -258,6 +287,7 @@ void              IOTrackingQueueFree(IOTrackingQueue * head);
 void              IOTrackingQueueCollectUser(IOTrackingQueue * queue);
 void              IOTrackingAdd(IOTrackingQueue * head, IOTracking * mem, size_t size, bool address, vm_tag_t tag);
 void              IOTrackingRemove(IOTrackingQueue * head, IOTracking * mem, size_t size);
+void              IOTrackingRemoveAddress(IOTrackingQueue * head, IOTrackingAddress * mem, size_t size);
 void              IOTrackingAddUser(IOTrackingQueue * queue, IOTrackingUser * mem, vm_size_t size);
 void              IOTrackingRemoveUser(IOTrackingQueue * head, IOTrackingUser * tracking);
 
@@ -274,6 +304,13 @@ extern IOTrackingQueue * gIOWireTracking;
 extern IOTrackingQueue * gIOMapTracking;
 
 #endif /* XNU_KERNEL_PRIVATE && IOTRACKING */
+
+enum{
+	kIOTrackingLeakScanStart       = 0x00000001,
+	kIOTrackingLeakScanEnd         = 0x00000002,
+};
+
+extern void    (*gIOTrackingLeakScanCallback)(uint32_t notification);
 
 enum{
 	kIOTrackingExcludeNames      = 0x00000001,

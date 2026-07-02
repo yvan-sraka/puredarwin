@@ -71,6 +71,9 @@ UNUSED_SYMBOL(decmpfs_validate_compressed_file)
 #include <sys/uio_internal.h>
 #include <libkern/OSByteOrder.h>
 #include <libkern/section_keywords.h>
+#include <sys/fsctl.h>
+
+#include <sys/kdebug_triage.h>
 
 #include <ptrauth.h>
 
@@ -125,6 +128,32 @@ vnpath(vnode_t vp, char *path, int len)
 #define VerboseLogWithPath(x...) do { } while(0)
 #endif
 
+#define decmpfs_ktriage_record(code, arg) ktriage_record(thread_tid(current_thread()), KDBG_TRIAGE_EVENTID(KDBG_TRIAGE_SUBSYS_DECMPFS, KDBG_TRIAGE_RESERVED, code), arg);
+
+enum ktriage_decmpfs_error_codes {
+	KTRIAGE_DECMPFS_PREFIX = 0,
+	KTRIAGE_DECMPFS_IVALID_OFFSET,
+	KTRIAGE_DECMPFS_COMPRESSOR_NOT_REGISTERED,
+	KTRIAGE_DECMPFS_FETCH_CALLBACK_FAILED,
+	KTRIAGE_DECMPFS_FETCH_HEADER_FAILED,
+	KTRIAGE_DECMPFS_UBC_UPL_MAP_FAILED,
+	KTRIAGE_DECMPFS_FETCH_UNCOMPRESSED_DATA_FAILED,
+
+	KTRIAGE_DECMPFS_MAX
+};
+
+const char *ktriage_decmpfs_strings[] = {
+	[KTRIAGE_DECMPFS_PREFIX] = "decmpfs - ",
+	[KTRIAGE_DECMPFS_IVALID_OFFSET] = "pagein offset is invalid\n",
+	[KTRIAGE_DECMPFS_COMPRESSOR_NOT_REGISTERED] = "compressor is not registered\n",
+	[KTRIAGE_DECMPFS_FETCH_CALLBACK_FAILED] = "fetch callback failed\n",
+	[KTRIAGE_DECMPFS_FETCH_HEADER_FAILED] = "fetch decmpfs xattr failed\n",
+	[KTRIAGE_DECMPFS_UBC_UPL_MAP_FAILED] = "failed to map a UBC UPL\n",
+	[KTRIAGE_DECMPFS_FETCH_UNCOMPRESSED_DATA_FAILED] = "failed to fetch uncompressed data\n",
+};
+
+ktriage_strings_t ktriage_decmpfs_subsystem_strings = {KTRIAGE_DECMPFS_MAX, ktriage_decmpfs_strings};
+
 #pragma mark --- globals ---
 
 static LCK_GRP_DECLARE(decmpfs_lockgrp, "VFSCOMP");
@@ -161,7 +190,7 @@ _func_from_offset(uint32_t type, uintptr_t offset, uint32_t discriminator)
 		return NULL;
 	}
 
-	void *ptr = *(void * const *)((const void *)reg + offset);
+	void *ptr = *(void * const *)((uintptr_t)reg + offset);
 	if (ptr != NULL) {
 		/* Resign as a function-in-void* */
 		ptr = ptrauth_auth_and_resign(ptr, ptrauth_key_asia, discriminator, ptrauth_key_asia, 0);
@@ -252,7 +281,7 @@ vnsize(vnode_t vp, uint64_t *size)
 
 #pragma mark --- cnode routines ---
 
-ZONE_DECLARE(decmpfs_cnode_zone, "decmpfs_cnode",
+ZONE_DEFINE(decmpfs_cnode_zone, "decmpfs_cnode",
     sizeof(struct decmpfs_cnode), ZC_NONE);
 
 decmpfs_cnode *
@@ -503,7 +532,7 @@ decmpfs_fetch_compressed_header(vnode_t vp, decmpfs_cnode *cp, decmpfs_header **
 		/* this file's xattr didn't have any extra data when we fetched it, so we can synthesize a header from the data in the cnode */
 
 		alloc_size = sizeof(decmpfs_header);
-		data = kheap_alloc(KHEAP_TEMP, alloc_size, Z_WAITOK);
+		data = kalloc_data(sizeof(decmpfs_header), Z_WAITOK);
 		if (!data) {
 			err = ENOMEM;
 			goto out;
@@ -539,7 +568,7 @@ decmpfs_fetch_compressed_header(vnode_t vp, decmpfs_cnode *cp, decmpfs_header **
 		}
 
 		/* allocation includes space for the extra attr_size field of a compressed_header */
-		data = kheap_alloc(KHEAP_TEMP, alloc_size, Z_WAITOK);
+		data = (char *)kalloc_data(alloc_size, Z_WAITOK);
 		if (!data) {
 			err = ENOMEM;
 			goto out;
@@ -592,7 +621,7 @@ decmpfs_fetch_compressed_header(vnode_t vp, decmpfs_cnode *cp, decmpfs_header **
 out:
 	if (err && (err != ERANGE)) {
 		DebugLogWithPath("err %d\n", err);
-		kheap_free(KHEAP_TEMP, data, alloc_size);
+		kfree_data(data, alloc_size);
 		*hdrOut = NULL;
 	} else {
 		*hdrOut = hdr;
@@ -696,7 +725,7 @@ decmpfs_validate_compressed_file(vnode_t vp, decmpfs_cnode *cp)
 	}
 out:
 	if (hdr != NULL) {
-		kheap_free(KHEAP_TEMP, hdr, alloc_size);
+		kfree_data(hdr, alloc_size);
 	}
 #if COMPRESSION_DEBUG
 	if (err) {
@@ -884,7 +913,7 @@ done:
 	}
 
 	if (hdr != NULL) {
-		kheap_free(KHEAP_TEMP, hdr, alloc_size);
+		kfree_data(hdr, alloc_size);
 	}
 
 	/*
@@ -970,7 +999,7 @@ decmpfs_update_attributes(vnode_t vp, struct vnode_attr *vap)
 					vap->va_flags &= ~UF_COMPRESSED;
 				}
 				if (hdr != NULL) {
-					kheap_free(KHEAP_TEMP, hdr, alloc_size);
+					kfree_data(hdr, alloc_size);
 				}
 			}
 		}
@@ -1195,8 +1224,11 @@ decmpfs_fetch_uncompressed_data(vnode_t vp, decmpfs_cnode *cp, decmpfs_header *h
 				}
 #endif
 			}
+		} else {
+			decmpfs_ktriage_record(KTRIAGE_DECMPFS_FETCH_CALLBACK_FAILED, err);
 		}
 	} else {
+		decmpfs_ktriage_record(KTRIAGE_DECMPFS_COMPRESSOR_NOT_REGISTERED, hdr->compression_type);
 		err = ENOTSUP;
 		lck_rw_unlock_shared(&decompressorsLock);
 	}
@@ -1256,15 +1288,17 @@ decmpfs_pagein_compressed(struct vnop_pagein_args *ap, int *is_compressed, decmp
 	int flags                    = ap->a_flags;
 	off_t uplPos                 = 0;
 	user_ssize_t uplSize         = 0;
+	user_ssize_t rounded_uplSize = 0;
 	size_t verify_block_size     = 0;
 	void *data                   = NULL;
 	decmpfs_header *hdr = NULL;
 	size_t alloc_size            = 0;
 	uint64_t cachedSize          = 0;
+	uint32_t fs_bsize            = 0;
 	int cmpdata_locked           = 0;
-	bool file_tail_page_valid    = false;
 	int  num_valid_pages         = 0;
 	int  num_invalid_pages       = 0;
+	bool file_tail_page_valid    = false;
 
 	if (!decmpfs_trylock_compressed_data(cp, 0)) {
 		return EAGAIN;
@@ -1278,6 +1312,7 @@ decmpfs_pagein_compressed(struct vnop_pagein_args *ap, int *is_compressed, decmp
 
 	err = decmpfs_fetch_compressed_header(vp, cp, &hdr, 0, &alloc_size);
 	if (err != 0) {
+		decmpfs_ktriage_record(KTRIAGE_DECMPFS_FETCH_HEADER_FAILED, err);
 		goto out;
 	}
 
@@ -1285,7 +1320,21 @@ decmpfs_pagein_compressed(struct vnop_pagein_args *ap, int *is_compressed, decmp
 
 	if (!compression_type_valid(vp, hdr)) {
 		/* compressor not registered */
+		decmpfs_ktriage_record(KTRIAGE_DECMPFS_COMPRESSOR_NOT_REGISTERED, hdr->compression_type);
 		err = ENOTSUP;
+		goto out;
+	}
+
+	/*
+	 * can't page-in from a negative offset
+	 * or if we're starting beyond the EOF
+	 * or if the file offset isn't page aligned
+	 * or the size requested isn't a multiple of PAGE_SIZE
+	 */
+	if (f_offset < 0 || f_offset >= cachedSize ||
+	    (f_offset & PAGE_MASK_64) || (size & PAGE_MASK) || (pl_offset & PAGE_MASK)) {
+		decmpfs_ktriage_record(KTRIAGE_DECMPFS_IVALID_OFFSET, 0);
+		err = EINVAL;
 		goto out;
 	}
 
@@ -1295,17 +1344,35 @@ decmpfs_pagein_compressed(struct vnop_pagein_args *ap, int *is_compressed, decmp
 	 * we will only check if the passed in UPL length conforms to the
 	 * alignment requirements.
 	 */
-	err = VNOP_VERIFY(vp, f_offset, NULL, 0, &verify_block_size,
+	err = VNOP_VERIFY(vp, f_offset, NULL, 0, &verify_block_size, NULL,
 	    VNODE_VERIFY_DEFAULT, NULL);
 	if (err) {
+		ErrorLogWithPath("VNOP_VERIFY returned error = %d\n", err);
 		goto out;
 	} else if (verify_block_size) {
+		if (vp->v_mount->mnt_vfsstat.f_bsize > PAGE_SIZE) {
+			fs_bsize = vp->v_mount->mnt_vfsstat.f_bsize;
+		}
 		if (verify_block_size & (verify_block_size - 1)) {
-			ErrorLogWithPath("verify block size is not power of 2, no verification will be done\n");
+			ErrorLogWithPath("verify block size (%zu) is not power of 2, no verification will be done\n", verify_block_size);
 			err = EINVAL;
 		} else if (size % verify_block_size) {
-			ErrorLogWithPath("upl size is not a multiple of verify block size\n");
+			ErrorLogWithPath("upl size (%zu) is not a multiple of verify block size (%zu)\n", (size_t)size, verify_block_size);
 			err = EINVAL;
+		} else if (fs_bsize) {
+			/*
+			 * Filesystems requesting verification have to provide
+			 * values for block sizes which are powers of 2.
+			 */
+			if (fs_bsize & (fs_bsize - 1)) {
+				ErrorLogWithPath("FS block size (%u) is greater than PAGE_SIZE (%d) and is not power of 2, no verification will be done\n",
+				    fs_bsize, PAGE_SIZE);
+				err = EINVAL;
+			} else if (fs_bsize > verify_block_size) {
+				ErrorLogWithPath("FS block size (%u) is greater than verify block size (%zu), no verification will be done\n",
+				    fs_bsize, verify_block_size);
+				err = EINVAL;
+			}
 		}
 		if (err) {
 			goto out;
@@ -1320,6 +1387,7 @@ decmpfs_pagein_compressed(struct vnop_pagein_args *ap, int *is_compressed, decmp
 	/* map the upl so we can fetch into it */
 	kern_return_t kr = ubc_upl_map(pl, (vm_offset_t*)&data);
 	if ((kr != KERN_SUCCESS) || (data == NULL)) {
+		decmpfs_ktriage_record(KTRIAGE_DECMPFS_UBC_UPL_MAP_FAILED, kr);
 		err = ENOSPC;
 		data = NULL;
 #if CONFIG_IOSCHED
@@ -1329,12 +1397,21 @@ decmpfs_pagein_compressed(struct vnop_pagein_args *ap, int *is_compressed, decmp
 	}
 
 	uplPos = f_offset;
-	uplSize = size;
+	off_t max_size = cachedSize - f_offset;
 
-	/* clip the size to the size of the file */
-	if ((uint64_t)uplPos + uplSize > cachedSize) {
-		/* truncate the read to the size of the file */
-		uplSize = (user_ssize_t)(cachedSize - uplPos);
+	if (size < max_size) {
+		rounded_uplSize = uplSize = size;
+		file_tail_page_valid = true;
+	} else {
+		uplSize = (user_ssize_t)max_size;
+		if (fs_bsize) {
+			/* First round up to fs_bsize */
+			rounded_uplSize = (uplSize + (fs_bsize - 1)) & ~(fs_bsize - 1);
+			/* then to PAGE_SIZE */
+			rounded_uplSize = MIN(size, round_page((vm_offset_t)rounded_uplSize));
+		} else {
+			rounded_uplSize = round_page((vm_offset_t)uplSize);
+		}
 	}
 
 	/* do the fetch */
@@ -1356,8 +1433,12 @@ decompress:
 		 */
 		err = 0;
 	} else {
-		if (!verify_block_size || (verify_block_size <= PAGE_SIZE)) {
+		if (verify_block_size <= PAGE_SIZE) {
 			err = decmpfs_fetch_uncompressed_data(vp, cp, hdr, uplPos, uplSize, 1, &vec, &did_read);
+			/* zero out whatever wasn't read */
+			if (did_read < rounded_uplSize) {
+				memset((char*)vec.buf + did_read, 0, (size_t)(rounded_uplSize - did_read));
+			}
 		} else {
 			off_t l_uplPos = uplPos;
 			off_t l_pl_offset = pl_offset;
@@ -1470,7 +1551,7 @@ decompress:
 				} else {
 					/* no invalid pages left */
 					l_did_read = l_uplSize;
-					if (uplSize < size) {
+					if (!file_tail_page_valid) {
 						file_tail_page_valid = true;
 					}
 				}
@@ -1484,9 +1565,15 @@ decompress:
 				l_uplPos += l_did_read;
 				l_uplSize -= l_did_read;
 			}
+
+			/* Zero out the region after EOF in the last page (if needed) */
+			if (!err && !file_tail_page_valid && (uplSize < rounded_uplSize)) {
+				memset((char*)vec.buf + uplSize, 0, (size_t)(rounded_uplSize - uplSize));
+			}
 		}
 	}
 	if (err) {
+		decmpfs_ktriage_record(KTRIAGE_DECMPFS_FETCH_UNCOMPRESSED_DATA_FAILED, err)
 		DebugLogWithPath("decmpfs_fetch_uncompressed_data err %d\n", err);
 		int cmp_state = decmpfs_fast_get_state(cp);
 		if (cmp_state == FILE_IS_CONVERTING) {
@@ -1505,19 +1592,12 @@ decompress:
 		}
 	}
 
-	/* zero out whatever we didn't read, and zero out the end of the last page(s) */
-	uint64_t total_size = (size + (PAGE_SIZE - 1)) & ~(PAGE_SIZE - 1);
-	if (did_read < total_size && !(verify_block_size && err)) {
-		uint64_t rounded_up_did_read = file_tail_page_valid ? (uint64_t)(round_page((vm_offset_t)did_read)) : did_read;
-		memset((char*)vec.buf + rounded_up_did_read, 0, (size_t)(total_size - rounded_up_did_read));
-	}
-
 	if (!err && verify_block_size) {
 		size_t cur_verify_block_size = verify_block_size;
 
-		if ((err = VNOP_VERIFY(vp, uplPos, vec.buf, size, &cur_verify_block_size, 0, NULL))) {
-			ErrorLogWithPath("Verification failed with error %d, uplPos = %lld, uplSize = %d, did_read = %d, total_size = %d, valid_pages = %d, invalid_pages = %d, tail_page_valid = %d\n",
-			    err, (long long)uplPos, (int)uplSize, (int)did_read, (int)total_size, num_valid_pages, num_invalid_pages, file_tail_page_valid);
+		if ((err = VNOP_VERIFY(vp, uplPos, vec.buf, rounded_uplSize, &cur_verify_block_size, NULL, 0, NULL))) {
+			ErrorLogWithPath("Verification failed with error %d, uplPos = %lld, uplSize = %d, did_read = %d, valid_pages = %d, invalid_pages = %d, tail_page_valid = %d\n",
+			    err, (long long)uplPos, (int)rounded_uplSize, (int)did_read, num_valid_pages, num_invalid_pages, file_tail_page_valid);
 		}
 		/* XXX : If the verify block size changes, redo the read */
 	}
@@ -1532,7 +1612,12 @@ decompress:
 	} else {
 		if (!err) {
 			/* commit our pages */
-			kr = commit_upl(pl, pl_offset, (size_t)total_size, UPL_COMMIT_FREE_ON_EMPTY, 0);
+			kr = commit_upl(pl, pl_offset, (size_t)rounded_uplSize, UPL_COMMIT_FREE_ON_EMPTY, 0 /* commit */);
+			/* If there were any pages after the page containing EOF, abort them. */
+			if (rounded_uplSize < size) {
+				kr = commit_upl(pl, (upl_offset_t)(pl_offset + rounded_uplSize), (size_t)(size - rounded_uplSize),
+				    UPL_ABORT_FREE_ON_EMPTY | UPL_ABORT_ERROR, 1 /* abort */);
+			}
 		}
 	}
 
@@ -1541,7 +1626,7 @@ out:
 		ubc_upl_unmap(pl);
 	}
 	if (hdr != NULL) {
-		kheap_free(KHEAP_TEMP, hdr, alloc_size);
+		kfree_data(hdr, alloc_size);
 	}
 	if (cmpdata_locked) {
 		decmpfs_unlock_compressed_data(cp, 0);
@@ -1662,7 +1747,7 @@ decmpfs_read_compressed(struct vnop_read_args *ap, int *is_compressed, decmpfs_c
 	 */
 
 	/* If the verify block size is larger than the page size, the UPL needs to aligned to it */
-	err = VNOP_VERIFY(vp, uplPos, NULL, 0, &verify_block_size, VNODE_VERIFY_DEFAULT, NULL);
+	err = VNOP_VERIFY(vp, uplPos, NULL, 0, &verify_block_size, NULL, VNODE_VERIFY_DEFAULT, NULL);
 	if (err) {
 		goto out;
 	} else if (verify_block_size) {
@@ -1771,7 +1856,7 @@ decompress:
 		if (!err && verify_block_size) {
 			size_t cur_verify_block_size = verify_block_size;
 
-			if ((err = VNOP_VERIFY(vp, curUplPos, data, curUplSize, &cur_verify_block_size, 0, NULL))) {
+			if ((err = VNOP_VERIFY(vp, curUplPos, data, curUplSize, &cur_verify_block_size, NULL, 0, NULL))) {
 				ErrorLogWithPath("Verification failed with error %d\n", err);
 				abort_read = 1;
 			}
@@ -1828,7 +1913,7 @@ decompress:
 out:
 
 	if (hdr != NULL) {
-		kheap_free(KHEAP_TEMP, hdr, alloc_size);
+		kfree_data(hdr, alloc_size);
 	}
 	if (cmpdata_locked) {
 		decmpfs_unlock_compressed_data(cp, 0);
@@ -1894,7 +1979,7 @@ decmpfs_free_compressed_data(vnode_t vp, decmpfs_cnode *cp)
 	err = vn_removexattr(vp, DECMPFS_XATTR_NAME, 0, decmpfs_ctx);
 
 	if (hdr != NULL) {
-		kheap_free(KHEAP_TEMP, hdr, alloc_size);
+		kfree_data(hdr, alloc_size);
 	}
 	return err;
 }
@@ -1906,24 +1991,48 @@ unset_compressed_flag(vnode_t vp)
 {
 	int err = 0;
 	struct vnode_attr va;
-	int new_bsdflags = 0;
+	struct fsioc_cas_bsdflags cas;
+	int i;
 
-	VATTR_INIT(&va);
-	VATTR_WANTED(&va, va_flags);
-	err = vnode_getattr(vp, &va, decmpfs_ctx);
-
-	if (err != 0) {
-		ErrorLogWithPath("vnode_getattr err %d\n", err);
-	} else {
-		new_bsdflags = va.va_flags & ~UF_COMPRESSED;
-
+# define MAX_CAS_BSDFLAGS_LOOPS 4
+	/* UF_COMPRESSED should be manipulated only with FSIOC_CAS_BSDFLAGS */
+	for (i = 0; i < MAX_CAS_BSDFLAGS_LOOPS; i++) {
 		VATTR_INIT(&va);
-		VATTR_SET(&va, va_flags, new_bsdflags);
+		VATTR_WANTED(&va, va_flags);
+		err = vnode_getattr(vp, &va, decmpfs_ctx);
+		if (err != 0) {
+			ErrorLogWithPath("vnode_getattr err %d, num retries %d\n", err, i);
+			goto out;
+		}
+
+		cas.expected_flags = va.va_flags;
+		cas.new_flags = va.va_flags & ~UF_COMPRESSED;
+		err = VNOP_IOCTL(vp, FSIOC_CAS_BSDFLAGS, (caddr_t)&cas, FWRITE, decmpfs_ctx);
+
+		if ((err == 0) && (va.va_flags == cas.actual_flags)) {
+			goto out;
+		}
+
+		if ((err != 0) && (err != EAGAIN)) {
+			break;
+		}
+	}
+
+	/* fallback to regular chflags if FSIOC_CAS_BSDFLAGS is not supported */
+	if (err == ENOTTY) {
+		VATTR_INIT(&va);
+		VATTR_SET(&va, va_flags, cas.new_flags);
 		err = vnode_setattr(vp, &va, decmpfs_ctx);
 		if (err != 0) {
 			ErrorLogWithPath("vnode_setattr err %d\n", err);
 		}
+	} else if (va.va_flags != cas.actual_flags) {
+		ErrorLogWithPath("FSIOC_CAS_BSDFLAGS err: flags mismatc. actual (%x) expected (%x), num retries %d\n", cas.actual_flags, va.va_flags, i);
+	} else if (err != 0) {
+		ErrorLogWithPath("FSIOC_CAS_BSDFLAGS err %d, num retries %d\n", err, i);
 	}
+
+out:
 	return err;
 }
 
@@ -2020,7 +2129,7 @@ decompress:
 	}
 
 	allocSize = MIN(64 * 1024, (size_t)toSize);
-	data = kheap_alloc(KHEAP_TEMP, allocSize, Z_WAITOK);
+	data = (char *)kalloc_data(allocSize, Z_WAITOK);
 	if (!data) {
 		err = ENOMEM;
 		goto out;
@@ -2135,9 +2244,10 @@ nodecmp:
 
 out:
 	if (hdr != NULL) {
-		kheap_free(KHEAP_TEMP, hdr, hdr_size);
+		kfree_data(hdr, hdr_size);
 	}
-	kheap_free(KHEAP_TEMP, data, allocSize);
+	kfree_data(data, allocSize);
+
 	if (uio_w) {
 		uio_free(uio_w);
 	}
@@ -2250,6 +2360,8 @@ decmpfs_init(void)
 	decmpfs_ctx = vfs_context_create(vfs_context_kernel());
 
 	register_decmpfs_decompressor(CMP_Type1, &Type1Reg);
+
+	ktriage_register_subsystem_strings(KDBG_TRIAGE_SUBSYS_DECMPFS, &ktriage_decmpfs_subsystem_strings);
 
 	done = 1;
 }

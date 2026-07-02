@@ -57,6 +57,7 @@
 #define LOCK_PRIVATE 1
 
 #include <vm/pmap.h>
+#include <vm/vm_map.h>
 #include <kern/kalloc.h>
 #include <kern/cpu_number.h>
 #include <kern/locks.h>
@@ -75,6 +76,7 @@
 #include <ddb/db_print.h>
 #endif                          /* MACH_KDB */
 
+#include <san/kasan.h>
 #include <sys/kdebug.h>
 #include <sys/munge.h>
 #include <machine/cpu_capabilities.h>
@@ -97,10 +99,6 @@ kern_return_t arm64_ropjop_test(void);
 #if defined(KERNEL_INTEGRITY_CTRR)
 kern_return_t ctrr_test(void);
 kern_return_t ctrr_test_cpu(void);
-#endif
-#if HAS_TWO_STAGE_SPR_LOCK
-kern_return_t arm64_spr_lock_test(void);
-extern void arm64_msr_lock_test(uint64_t);
 #endif
 
 // exception handler ignores this fault address during PAN test
@@ -344,9 +342,7 @@ lt_grab_hw_lock_with_try()
 static void
 lt_grab_hw_lock_with_to()
 {
-	while (0 == hw_lock_to(&lt_hw_lock, LockTimeOut, LCK_GRP_NULL)) {
-		mp_enable_preemption();
-	}
+	(void)hw_lock_to(&lt_hw_lock, &hw_lock_spin_policy, LCK_GRP_NULL);
 	lt_counter++;
 	lt_spin_a_little_bit();
 	hw_lock_unlock(&lt_hw_lock);
@@ -398,7 +394,8 @@ lt_trylock_hw_lock_with_to()
 		lt_sleep_a_little_bit();
 		OSMemoryBarrier();
 	}
-	lt_thread_lock_success = hw_lock_to(&lt_hw_lock, 100, LCK_GRP_NULL);
+	lt_thread_lock_success = hw_lock_to(&lt_hw_lock,
+	    &hw_lock_test_give_up_policy, LCK_GRP_NULL);
 	OSMemoryBarrier();
 	mp_enable_preemption();
 }
@@ -539,7 +536,7 @@ lt_test_trylocks()
 	lt_target_done_threads = 1;
 	OSMemoryBarrier();
 	lt_start_trylock_thread(lt_trylock_hw_lock_with_to);
-	success = hw_lock_to(&lt_hw_lock, 100, LCK_GRP_NULL);
+	success = hw_lock_to(&lt_hw_lock, &hw_lock_test_give_up_policy, LCK_GRP_NULL);
 	T_ASSERT_NOTNULL(success, "First spin lock with timeout should succeed");
 	if (real_ncpus == 1) {
 		mp_enable_preemption(); /* if we re-enable preemption, the other thread can timeout and exit */
@@ -652,13 +649,7 @@ lt_e_thread(void *arg, wait_result_t wres __unused)
 
 	thread_t thread = current_thread();
 
-	spl_t s = splsched();
-	thread_lock(thread);
-	thread->sched_flags |= TH_SFLAG_ECORE_ONLY;
-	thread_unlock(thread);
-	splx(s);
-
-	thread_block(THREAD_CONTINUE_NULL);
+	thread_bind_cluster_type(thread, 'e', false);
 
 	func();
 
@@ -672,13 +663,7 @@ lt_p_thread(void *arg, wait_result_t wres __unused)
 
 	thread_t thread = current_thread();
 
-	spl_t s = splsched();
-	thread_lock(thread);
-	thread->sched_flags |= TH_SFLAG_PCORE_ONLY;
-	thread_unlock(thread);
-	splx(s);
-
-	thread_block(THREAD_CONTINUE_NULL);
+	thread_bind_cluster_type(thread, 'p', false);
 
 	func();
 
@@ -725,6 +710,18 @@ lt_start_lock_thread_bound(thread_continue_t func)
 static kern_return_t
 lt_test_locks()
 {
+#if SCHED_HYGIENE_DEBUG
+	/*
+	 * When testing, the preemption disable threshold may be hit (for
+	 * example when testing a lock timeout). To avoid this, the preemption
+	 * disable measurement is temporarily disabled during lock testing.
+	 */
+	int old_mode = sched_preemption_disable_debug_mode;
+	if (old_mode == SCHED_HYGIENE_MODE_PANIC) {
+		sched_preemption_disable_debug_mode = SCHED_HYGIENE_MODE_OFF;
+	}
+#endif /* SCHED_HYGIENE_DEBUG */
+
 	kern_return_t kr = KERN_SUCCESS;
 	lck_grp_attr_t *lga = lck_grp_attr_alloc_init();
 	lck_grp_t *lg = lck_grp_alloc_init("lock test", lga);
@@ -994,6 +991,10 @@ lt_test_locks()
 	lt_start_lock_thread(lt_grab_spin_lock_with_try);
 	lt_wait_for_lock_test_threads();
 	T_EXPECT_EQ_UINT(lt_counter, LOCK_TEST_ITERATIONS * lt_target_done_threads, NULL);
+
+#if SCHED_HYGIENE_DEBUG
+	sched_preemption_disable_debug_mode = old_mode;
+#endif /* SCHED_HYGIENE_DEBUG */
 
 	return KERN_SUCCESS;
 }
@@ -1278,7 +1279,9 @@ arm64_late_pan_test()
 	return KERN_SUCCESS;
 }
 
-static bool
+// Disable KASAN checking for PAN tests as the fixed commpage address doesn't have a shadow mapping
+
+static NOKASAN bool
 arm64_pan_test_pan_enabled_fault_handler(arm_saved_state_t * state)
 {
 	bool retval                 = false;
@@ -1311,7 +1314,7 @@ arm64_pan_test_pan_enabled_fault_handler(arm_saved_state_t * state)
 	return retval;
 }
 
-static bool
+static NOKASAN bool
 arm64_pan_test_pan_disabled_fault_handler(arm_saved_state_t * state)
 {
 	bool retval             = false;
@@ -1338,11 +1341,11 @@ arm64_pan_test_pan_disabled_fault_handler(arm_saved_state_t * state)
 	return retval;
 }
 
-kern_return_t
+NOKASAN kern_return_t
 arm64_pan_test()
 {
 	bool values_match = false;
-	vm_offset_t priv_addr = _COMM_PAGE_SIGNATURE;
+	vm_offset_t priv_addr = 0;
 
 	T_LOG("Testing PAN.");
 
@@ -1353,13 +1356,33 @@ arm64_pan_test()
 
 	pan_exception_level = 0;
 	pan_fault_value = 0xDE;
-	// convert priv_addr to one that is accessible from user mode
-	pan_test_addr = priv_addr + _COMM_HIGH_PAGE64_BASE_ADDRESS -
-	    _COMM_PAGE_START_ADDRESS;
+
+	// Create an empty pmap, so we can map a user-accessible page
+	pmap_t pmap = pmap_create_options(NULL, 0, PMAP_CREATE_64BIT);
+	T_ASSERT(pmap != NULL, NULL);
+
+	// Get a physical page to back the mapping
+	vm_page_t vm_page = vm_page_grab();
+	T_ASSERT(vm_page != VM_PAGE_NULL, NULL);
+	ppnum_t pn = VM_PAGE_GET_PHYS_PAGE(vm_page);
+	pmap_paddr_t pa = ptoa(pn);
+
+	// Write to the underlying physical page through the physical aperture
+	// so we can test against a known value
+	priv_addr = phystokv((pmap_paddr_t)pa);
+	*(volatile char *)priv_addr = 0xAB;
+
+	// Map the page in the user address space at some, non-zero address
+	pan_test_addr = PAGE_SIZE;
+	pmap_enter(pmap, pan_test_addr, pn, VM_PROT_READ, VM_PROT_READ, 0, true);
 
 	// Context-switch with PAN disabled is prohibited; prevent test logging from
 	// triggering a voluntary context switch.
 	mp_disable_preemption();
+
+	// Insert the user's pmap root table pointer in TTBR0
+	pmap_t old_pmap = vm_map_pmap(current_thread()->map);
+	pmap_switch(pmap);
 
 	// Below should trigger a PAN exception as pan_test_addr is accessible
 	// in user mode
@@ -1392,12 +1415,21 @@ arm64_pan_test()
 
 	T_ASSERT(pan_fault_value == *(char *)priv_addr, NULL);
 
-	pan_test_addr = 0;
+	pmap_switch(old_pmap);
+
 	pan_ro_addr = 0;
 
 	__builtin_arm_wsr("pan", 1);
 
 	mp_enable_preemption();
+
+	pmap_remove(pmap, pan_test_addr, pan_test_addr + PAGE_SIZE);
+	pan_test_addr = 0;
+
+	vm_page_lock_queues();
+	vm_page_free(vm_page);
+	vm_page_unlock_queues();
+	pmap_destroy(pmap);
 
 	return KERN_SUCCESS;
 }
@@ -1494,9 +1526,11 @@ ctrr_test_nx_fault_handler(arm_saved_state_t * state)
 	return retval;
 }
 
+// Disable KASAN checking for CTRR tests as the test VA  doesn't have a shadow mapping
+
 /* test CTRR on a cpu, caller to bind thread to desired cpu */
 /* ctrr_test_page was reserved during bootstrap process */
-kern_return_t
+NOKASAN kern_return_t
 ctrr_test_cpu(void)
 {
 	ppnum_t ro_pn, nx_pn;
@@ -1508,8 +1542,8 @@ ctrr_test_cpu(void)
 
 	/* ctrr read only region = [rorgn_begin_va, rorgn_end_va) */
 
-	vm_offset_t rorgn_begin_va = phystokv(ctrr_begin);
-	vm_offset_t rorgn_end_va = phystokv(ctrr_end) + 1;
+	vm_offset_t rorgn_begin_va = phystokv(__builtin_arm_rsr64("S3_4_C15_C2_3"));
+	vm_offset_t rorgn_end_va = phystokv(__builtin_arm_rsr64("S3_4_C15_C2_4")) + 1;
 	vm_offset_t ro_test_va = (vm_offset_t)&ctrr_ro_test;
 	vm_offset_t nx_test_va = (vm_offset_t)&ctrr_nx_test;
 
@@ -1600,43 +1634,3 @@ ctrr_test_cpu(void)
 }
 #endif /* defined(KERNEL_INTEGRITY_CTRR) && defined(CONFIG_XNUPOST) */
 
-#if HAS_TWO_STAGE_SPR_LOCK
-
-#define STR1(x) #x
-#define STR(x) STR1(x)
-
-volatile vm_offset_t spr_lock_test_addr;
-volatile uint32_t spr_lock_exception_esr;
-
-kern_return_t
-arm64_spr_lock_test()
-{
-	processor_t p;
-
-	for (p = processor_list; p != NULL; p = p->processor_list) {
-		thread_bind(p);
-		thread_block(THREAD_CONTINUE_NULL);
-		T_LOG("Running SPR lock test on cpu %d\n", p->cpu_id);
-
-		uint64_t orig_value = __builtin_arm_rsr64(STR(HID8));
-		spr_lock_test_addr = (vm_offset_t)VM_KERNEL_STRIP_PTR(arm64_msr_lock_test);
-		spr_lock_exception_esr = 0;
-		arm64_msr_lock_test(~orig_value);
-		T_EXPECT(spr_lock_exception_esr != 0, "MSR write generated synchronous abort");
-
-		uint64_t new_value = __builtin_arm_rsr64(STR(HID8));
-		T_EXPECT(orig_value == new_value, "MSR write did not succeed");
-
-		spr_lock_test_addr = 0;
-	}
-
-	/* unbind thread from specific cpu */
-	thread_bind(PROCESSOR_NULL);
-	thread_block(THREAD_CONTINUE_NULL);
-
-	T_PASS("Done running SPR lock tests");
-
-	return KERN_SUCCESS;
-}
-
-#endif /* HAS_TWO_STAGE_SPR_LOCK */

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2015-2018 Apple Inc. All rights reserved.
+ * Copyright (c) 2015-2022 Apple Inc. All rights reserved.
  *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
  *
@@ -83,10 +83,10 @@ typedef union cpxunion {
 	fcpx_t cpx_fixed;
 } cpxunion_t;
 
-ZONE_DECLARE(cpx_zone, "cpx",
+ZONE_DEFINE(cpx_zone, "cpx",
     sizeof(struct fcpx), ZC_ZFREE_CLEARMEM);
-ZONE_DECLARE(aes_ctz_zone, "AES ctx",
-    sizeof(aes_encrypt_ctx), ZC_ZFREE_CLEARMEM | ZC_NOENCRYPT);
+ZONE_DEFINE(aes_ctz_zone, "AES ctx",
+    sizeof(aes_encrypt_ctx), ZC_ZFREE_CLEARMEM);
 
 // Note: see struct fcpx defined in sys/cprotect.h
 
@@ -113,36 +113,18 @@ cpx_alloc(size_t key_len, bool needs_ctx)
 	cpx_t cpx = NULL;
 
 #if CONFIG_KEYPAGE_WP
+#pragma unused(key_len, needs_ctx)
+
 	/*
 	 * Macs only use 1 key per volume, so force it into its own page.
 	 * This way, we can write-protect as needed.
 	 */
-	size_t cpsize = cpx_size(key_len);
 
-	// silence warning for needs_ctx
-	(void) needs_ctx;
-
-	if (cpsize < PAGE_SIZE) {
-		/*
-		 * Don't use MALLOC to allocate the page-sized structure.  Instead,
-		 * use kmem_alloc to bypass KASAN since we are supplying our own
-		 * unilateral write protection on this page. Note that kmem_alloc
-		 * can block.
-		 */
-		if (kmem_alloc(kernel_map, (vm_offset_t *)&cpx, PAGE_SIZE, VM_KERN_MEMORY_FILE)) {
-			/*
-			 * returning NULL at this point (due to failed allocation) would just
-			 * result in a panic. fall back to attempting a normal MALLOC, and don't
-			 * let the cpx get marked PROTECTABLE.
-			 */
-			MALLOC(cpx, cpx_t, cpx_size(key_len), M_TEMP, M_WAITOK);
-		} else {
-			//mark the page as protectable, since kmem_alloc succeeded.
-			cpx->cpx_flags |= CPX_WRITE_PROTECTABLE;
-		}
-	} else {
-		panic("cpx_size too large ! (%lu)", cpsize);
-	}
+	assert(cpx_size(key_len) <= PAGE_SIZE);
+	kmem_alloc(kernel_map, (vm_offset_t *)&cpx, PAGE_SIZE,
+	    KMA_DATA | KMA_NOFAIL, VM_KERN_MEMORY_FILE);
+	//mark the page as protectable, since kmem_alloc succeeded.
+	cpx->cpx_flags |= CPX_WRITE_PROTECTABLE;
 #else
 	/* If key page write protection disabled, just switch to zalloc */
 
@@ -429,16 +411,26 @@ cpx_copy(const struct cpx *src, cpx_t dst)
 	}
 }
 
+typedef unsigned char cp_vfs_callback_arg_type_t;
+enum {
+	CP_TYPE_LOCK_STATE   = 0,
+	CP_TYPE_EP_STATE     = 1,
+};
+
 typedef struct {
-	cp_lock_state_t state;
+	cp_vfs_callback_arg_type_t type;
+	union {
+		cp_lock_state_t lock_state;
+		cp_ep_state_t   ep_state;
+	};
 	int             valid_uuid;
 	uuid_t          volume_uuid;
-} cp_lock_vfs_callback_arg;
+} cp_vfs_callback_arg;
 
 static int
-cp_lock_vfs_callback(mount_t mp, void *arg)
+cp_vfs_callback(mount_t mp, void *arg)
 {
-	cp_lock_vfs_callback_arg *callback_arg = (cp_lock_vfs_callback_arg *)arg;
+	cp_vfs_callback_arg *callback_arg = (cp_vfs_callback_arg *)arg;
 
 	if (callback_arg->valid_uuid) {
 		struct vfs_attr va;
@@ -458,22 +450,38 @@ cp_lock_vfs_callback(mount_t mp, void *arg)
 		}
 	}
 
-	VFS_IOCTL(mp, FIODEVICELOCKED, (void *)(uintptr_t)callback_arg->state, 0, vfs_context_kernel());
+	switch (callback_arg->type) {
+	case(CP_TYPE_LOCK_STATE):
+		VFS_IOCTL(mp, FIODEVICELOCKED, (void *)(uintptr_t)callback_arg->lock_state, 0, vfs_context_kernel());
+		break;
+	case(CP_TYPE_EP_STATE):
+		VFS_IOCTL(mp, FIODEVICEEPSTATE, (void *)(uintptr_t)callback_arg->ep_state, 0, vfs_context_kernel());
+		break;
+	default:
+		break;
+	}
 	return 0;
 }
 
 int
 cp_key_store_action(cp_key_store_action_t action)
 {
-	cp_lock_vfs_callback_arg callback_arg;
+	cp_vfs_callback_arg callback_arg;
 
 	switch (action) {
 	case CP_ACTION_LOCKED:
 	case CP_ACTION_UNLOCKED:
-		callback_arg.state = (action == CP_ACTION_LOCKED ? CP_LOCKED_STATE : CP_UNLOCKED_STATE);
+		callback_arg.type = CP_TYPE_LOCK_STATE;
+		callback_arg.lock_state = (action == CP_ACTION_LOCKED ? CP_LOCKED_STATE : CP_UNLOCKED_STATE);
 		memset(callback_arg.volume_uuid, 0, sizeof(uuid_t));
 		callback_arg.valid_uuid = 0;
-		return vfs_iterate(0, cp_lock_vfs_callback, (void *)&callback_arg);
+		return vfs_iterate(0, cp_vfs_callback, (void *)&callback_arg);
+	case CP_ACTION_EP_INVALIDATED:
+		callback_arg.type = CP_TYPE_EP_STATE;
+		callback_arg.ep_state = CP_EP_INVALIDATED;
+		memset(callback_arg.volume_uuid, 0, sizeof(uuid_t));
+		callback_arg.valid_uuid = 0;
+		return vfs_iterate(0, cp_vfs_callback, (void *)&callback_arg);
 	default:
 		return -1;
 	}
@@ -482,15 +490,22 @@ cp_key_store_action(cp_key_store_action_t action)
 int
 cp_key_store_action_for_volume(uuid_t volume_uuid, cp_key_store_action_t action)
 {
-	cp_lock_vfs_callback_arg callback_arg;
+	cp_vfs_callback_arg callback_arg;
 
 	switch (action) {
 	case CP_ACTION_LOCKED:
 	case CP_ACTION_UNLOCKED:
-		callback_arg.state = (action == CP_ACTION_LOCKED ? CP_LOCKED_STATE : CP_UNLOCKED_STATE);
+		callback_arg.type = CP_TYPE_LOCK_STATE;
+		callback_arg.lock_state = (action == CP_ACTION_LOCKED ? CP_LOCKED_STATE : CP_UNLOCKED_STATE);
 		memcpy(callback_arg.volume_uuid, volume_uuid, sizeof(uuid_t));
 		callback_arg.valid_uuid = 1;
-		return vfs_iterate(0, cp_lock_vfs_callback, (void *)&callback_arg);
+		return vfs_iterate(0, cp_vfs_callback, (void *)&callback_arg);
+	case CP_ACTION_EP_INVALIDATED:
+		callback_arg.type = CP_TYPE_EP_STATE;
+		callback_arg.ep_state = CP_EP_INVALIDATED;
+		memcpy(callback_arg.volume_uuid, volume_uuid, sizeof(uuid_t));
+		callback_arg.valid_uuid = 1;
+		return vfs_iterate(0, cp_vfs_callback, (void *)&callback_arg);
 	default:
 		return -1;
 	}

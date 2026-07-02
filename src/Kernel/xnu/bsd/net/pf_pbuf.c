@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2016-2018 Apple Inc. All rights reserved.
+ * Copyright (c) 2016-2022 Apple Inc. All rights reserved.
  *
  * @APPLE_LICENSE_HEADER_START@
  *
@@ -89,6 +89,7 @@ pbuf_sync(pbuf_t *pbuf)
 		pbuf->pb_proto = &m->m_pkthdr.pkt_proto;
 		pbuf->pb_flowsrc = &m->m_pkthdr.pkt_flowsrc;
 		pbuf->pb_flowid = &m->m_pkthdr.pkt_flowid;
+		pbuf->pb_flow_gencnt = &m->m_pkthdr.comp_gencnt;
 		pbuf->pb_flags = &m->m_pkthdr.pkt_flags;
 		pbuf->pb_pftag = m_pftag(m);
 		pbuf->pb_pf_fragtag = pf_find_fragment_tag(m);
@@ -111,6 +112,7 @@ pbuf_sync(pbuf_t *pbuf)
 		pbuf->pb_proto = &nm->pm_proto;
 		pbuf->pb_flowsrc = &nm->pm_flowsrc;
 		pbuf->pb_flowid = &nm->pm_flowid;
+		pbuf->pb_flow_gencnt = &nm->pm_flow_gencnt;
 		pbuf->pb_flags = &nm->pm_flags;
 		pbuf->pb_pftag = &nm->pm_pftag;
 		pbuf->pb_pf_fragtag = &nm->pm_pf_fragtag;
@@ -154,6 +156,7 @@ pbuf_to_mbuf(pbuf_t *pbuf, boolean_t release_ptr)
 		m->m_pkthdr.pkt_proto = *pbuf->pb_proto;
 		m->m_pkthdr.pkt_flowsrc = *pbuf->pb_flowsrc;
 		m->m_pkthdr.pkt_flowid = *pbuf->pb_flowid;
+		m->m_pkthdr.comp_gencnt = *pbuf->pb_flow_gencnt;
 		m->m_pkthdr.pkt_flags = *pbuf->pb_flags;
 
 		if (pbuf->pb_pftag != NULL) {
@@ -423,4 +426,16 @@ pbuf_get_service_class(const pbuf_t *pbuf)
 	VERIFY(pbuf->pb_type == PBUF_TYPE_MEMORY);
 
 	return MBUF_SC_BE;
+}
+
+void *
+pbuf_get_packet_buffer_address(const pbuf_t *pbuf)
+{
+	VERIFY(pbuf != NULL);
+
+	if (pbuf->pb_type == PBUF_TYPE_MBUF) {
+		return pbuf->pb_mbuf;
+	} else {
+		return pbuf->pb_memory.pm_buffer;
+	}
 }

@@ -73,11 +73,8 @@ const struct memory_object_pager_ops device_pager_ops = {
 	.memory_object_data_request = device_pager_data_request,
 	.memory_object_data_return = device_pager_data_return,
 	.memory_object_data_initialize = device_pager_data_initialize,
-	.memory_object_data_unlock = device_pager_data_unlock,
-	.memory_object_synchronize = device_pager_synchronize,
 	.memory_object_map = device_pager_map,
 	.memory_object_last_unmap = device_pager_last_unmap,
-	.memory_object_data_reclaim = NULL,
 	.memory_object_backing_object = NULL,
 	.memory_object_pager_name = "device pager"
 };
@@ -112,8 +109,7 @@ device_pager_get_refcount(device_pager_t device_object)
 
 LCK_GRP_DECLARE(device_pager_lck_grp, "device_pager");
 
-ZONE_DECLARE(device_pager_zone, "device node pager structures",
-    sizeof(struct device_pager), ZC_NONE);
+KALLOC_TYPE_DEFINE(device_pager_zone, struct device_pager, KT_DEFAULT);
 
 #define device_pager_lock_init(pager) \
 	lck_mtx_init(&(pager)->lock, &device_pager_lck_grp, LCK_ATTR_NULL)
@@ -441,37 +437,12 @@ device_pager_data_initialize(
 }
 
 kern_return_t
-device_pager_data_unlock(
-	__unused memory_object_t                mem_obj,
-	__unused memory_object_offset_t offset,
-	__unused memory_object_size_t           size,
-	__unused vm_prot_t              desired_access)
-{
-	return KERN_FAILURE;
-}
-
-kern_return_t
 device_pager_terminate(
 	__unused memory_object_t        mem_obj)
 {
 	return KERN_SUCCESS;
 }
 
-
-
-/*
- *
- */
-kern_return_t
-device_pager_synchronize(
-	__unused memory_object_t        mem_obj,
-	__unused memory_object_offset_t offset,
-	__unused memory_object_size_t   length,
-	__unused vm_sync_t              sync_flags)
-{
-	panic("device_pager_synchronize: memory_object_synchronize no longer supported\n");
-	return KERN_FAILURE;
-}
 
 /*
  *
@@ -537,12 +508,8 @@ device_object_create(void)
 {
 	device_pager_t  device_object;
 
-	device_object = (struct device_pager *) zalloc(device_pager_zone);
-	if (device_object == DEVICE_PAGER_NULL) {
-		return DEVICE_PAGER_NULL;
-	}
-
-	bzero(device_object, sizeof(*device_object));
+	device_object = zalloc_flags(device_pager_zone,
+	    Z_WAITOK | Z_ZERO | Z_NOFAIL);
 
 	device_object->dev_pgr_hdr.mo_ikot = IKOT_MEMORY_OBJECT;
 	device_object->dev_pgr_hdr.mo_pager_ops = &device_pager_ops;

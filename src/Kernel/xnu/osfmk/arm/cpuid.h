@@ -39,6 +39,7 @@
 #include <stdint.h>
 #include <mach/boolean.h>
 #include <machine/machine_cpuid.h>
+#include <machine/machine_routines.h>
 
 typedef struct {
 	uint32_t arm_rev : 4,  /* 00:03 revision number */
@@ -180,6 +181,17 @@ typedef union {
 
 #endif /* !RC_HIDE_XNU_FIRESTORM */
 
+/* H13J e-Core */
+#define CPU_PART_ICESTORM_JADE_CHOP    0x24
+#define CPU_PART_ICESTORM_JADE_DIE     0x28
+
+/* H13J p-Core */
+#define CPU_PART_FIRESTORM_JADE_CHOP   0x25
+#define CPU_PART_FIRESTORM_JADE_DIE    0x29
+
+
+
+
 
 
 /* Cache type identification */
@@ -194,6 +206,7 @@ typedef enum {
 } cache_type_t;
 
 typedef struct {
+	boolean_t    c_valid;            /* has this cache info been populated? */
 	boolean_t    c_unified;          /* unified I & D cache? */
 	uint32_t     c_isize;            /* in Bytes (ARM caches can be 0.5 KB) */
 	boolean_t    c_i_ppage;          /* protected page restriction for I cache
@@ -262,6 +275,7 @@ extern arm_debug_info_t *arm_debug_info(void);
 
 extern void do_cacheid(void);
 extern cache_info_t *cache_info(void);
+extern cache_info_t *cache_info_type(cluster_type_t cluster_type);
 
 extern void do_mvfpid(void);
 extern arm_mvfp_info_t *arm_mvfp_info(void);

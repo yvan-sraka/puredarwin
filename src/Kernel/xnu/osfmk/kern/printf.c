@@ -175,7 +175,7 @@
 #include <i386/cpu_data.h>
 #endif /* __x86_64__ */
 
-#if __arm__ || __arm64__
+#if __arm64__
 #include <arm/cpu_data_internal.h>
 #endif
 
@@ -776,7 +776,13 @@ _doprnt_log(
 boolean_t       new_printf_cpu_number = FALSE;
 #endif  /* MP_PRINTF */
 
-SIMPLE_LOCK_DECLARE(bsd_log_spinlock, 0);
+LCK_GRP_DECLARE(log_lock_grp, "log_group");
+
+#if defined(__x86_64__)
+SIMPLE_LOCK_DECLARE(log_lock, 0);
+#else
+LCK_TICKET_DECLARE(log_lock, &log_lock_grp);
+#endif /* __x86_64__ */
 
 bool bsd_log_lock(bool);
 void bsd_log_lock_safe(void);
@@ -800,9 +806,17 @@ bsd_log_lock(bool safe)
 {
 	if (!safe) {
 		assert(!oslog_is_safe());
-		return simple_lock_try(&bsd_log_spinlock, LCK_GRP_NULL);
+#if defined(__x86_64__)
+		return simple_lock_try(&log_lock, &log_lock_grp);
+#else
+		return lck_ticket_lock_try(&log_lock, &log_lock_grp);
+#endif /* __x86_64__ */
 	}
-	simple_lock(&bsd_log_spinlock, LCK_GRP_NULL);
+#if defined(__x86_64__)
+	simple_lock(&log_lock, &log_lock_grp);
+#else
+	lck_ticket_lock(&log_lock, &log_lock_grp);
+#endif /* __x86_64__ */
 	return true;
 }
 
@@ -819,68 +833,23 @@ bsd_log_lock_safe(void)
 void
 bsd_log_unlock(void)
 {
-	simple_unlock(&bsd_log_spinlock);
-}
-
-/* derived from boot_gets */
-void
-safe_gets(
-	char    *str,
-	int     maxlen)
-{
-	char *lp;
-	char c;
-	char *strmax = str + maxlen - 1; /* allow space for trailing 0 */
-
-	lp = str;
-	for (;;) {
-		c = (char)cngetc();
-		switch (c) {
-		case '\n':
-		case '\r':
-			printf("\n");
-			*lp++ = 0;
-			return;
-
-		case '\b':
-		case '#':
-		case '\177':
-			if (lp > str) {
-				printf("\b \b");
-				lp--;
-			}
-			continue;
-
-		case '@':
-		case 'u'&037:
-			lp = str;
-			printf("\n\r");
-			continue;
-
-		default:
-			if (c >= ' ' && c < '\177') {
-				if (lp < strmax) {
-					*lp++ = c;
-					printf("%c", c);
-				} else {
-					printf("%c", '\007'); /* beep */
-				}
-			}
-		}
-	}
+#if defined(__x86_64__)
+	simple_unlock(&log_lock);
+#else
+	lck_ticket_unlock(&log_lock);
+#endif /* __x86_64__ */
 }
 
 extern int disableConsoleOutput;
 
 void
-conslog_putc(
-	char c)
+conslog_putc(char c)
 {
 	if (!disableConsoleOutput) {
-		cnputc(c);
+		console_write_char(c);
 	}
 
-#ifdef  MACH_BSD
+#ifdef MACH_BSD
 	if (!kernel_debugger_entry_count) {
 		log_putc(c);
 	}
@@ -888,41 +857,32 @@ conslog_putc(
 }
 
 void
-cons_putc_locked(
-	char c)
+cons_putc_locked(char c)
 {
 	if (!disableConsoleOutput) {
-		cnputc(c);
+		console_write_char(c);
 	}
 }
 
+__printflike(1, 0)
 static int
 vprintf_internal(const char *fmt, va_list ap_in, void *caller)
 {
-	cpu_data_t * cpu_data_p;
 	if (fmt) {
 		struct console_printbuf_state info_data;
-		cpu_data_p = current_cpu_datap();
 
 		va_list ap;
 		va_copy(ap, ap_in);
-		/*
-		 * for early boot printf()s console may not be setup,
-		 * fallback to good old cnputc
-		 */
-		if (cpu_data_p->cpu_console_buf != NULL) {
-			console_printbuf_state_init(&info_data, TRUE, TRUE);
-			__doprnt(fmt, ap, console_printbuf_putc, &info_data, 16, TRUE);
-			console_printbuf_clear(&info_data);
-		} else {
-			disable_preemption();
-			_doprnt_log(fmt, &ap, cons_putc_locked, 16);
-			enable_preemption();
-		}
+		console_printbuf_state_init(&info_data, TRUE, TRUE);
+		__doprnt(fmt, ap, console_printbuf_putc, &info_data, 16, TRUE);
+		console_printbuf_clear(&info_data);
 
 		va_end(ap);
 
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wformat-nonliteral"
 		os_log_with_args(OS_LOG_DEFAULT, OS_LOG_TYPE_DEFAULT, fmt, ap_in, caller);
+#pragma clang diagnostic pop
 	}
 	return 0;
 }
@@ -952,7 +912,7 @@ void
 consdebug_putc(char c)
 {
 	if (!disableConsoleOutput) {
-		cnputc(c);
+		console_write_char(c);
 	}
 
 	debug_putc(c);
@@ -966,7 +926,7 @@ void
 consdebug_putc_unbuffered(char c)
 {
 	if (!disableConsoleOutput) {
-		cnputc_unbuffered(c);
+		console_write_unbuffered(c);
 	}
 
 	debug_putc(c);
@@ -1009,7 +969,7 @@ kdb_printf(const char *fmt, ...)
 	_doprnt_log(fmt, &listp, consdebug_putc, 16);
 	va_end(listp);
 
-#if defined(__arm__) || defined(__arm64__)
+#if defined(__arm64__)
 	paniclog_flush();
 #endif
 
@@ -1025,7 +985,7 @@ kdb_log(const char *fmt, ...)
 	_doprnt(fmt, &listp, consdebug_log, 16);
 	va_end(listp);
 
-#if defined(__arm__) || defined(__arm64__)
+#if defined(__arm64__)
 	paniclog_flush();
 #endif
 
@@ -1041,7 +1001,7 @@ kdb_printf_unbuffered(const char *fmt, ...)
 	_doprnt(fmt, &listp, consdebug_putc_unbuffered, 16);
 	va_end(listp);
 
-#if defined(__arm__) || defined(__arm64__)
+#if defined(__arm64__)
 	paniclog_flush();
 #endif
 

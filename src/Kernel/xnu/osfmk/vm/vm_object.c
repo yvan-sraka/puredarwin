@@ -63,12 +63,9 @@
  */
 
 #include <debug.h>
-#include <mach_pagemap.h>
 
 #include <mach/mach_types.h>
 #include <mach/memory_object.h>
-#include <mach/memory_object_default.h>
-#include <mach/memory_object_control_server.h>
 #include <mach/vm_param.h>
 
 #include <mach/sdt.h>
@@ -86,6 +83,8 @@
 #include <kern/processor.h>
 #include <kern/misc_protos.h>
 #include <kern/policy_internal.h>
+
+#include <sys/kdebug_triage.h>
 
 #include <vm/memory_object.h>
 #include <vm/vm_compressor_pager.h>
@@ -119,8 +118,7 @@ extern unsigned int shared_region_pagers_resident_peak;
 #endif /* DEVELOPMENT || DEBUG */
 
 #if VM_OBJECT_TRACKING
-boolean_t vm_object_tracking_inited = FALSE;
-btlog_t *vm_object_tracking_btlog;
+btlog_t vm_object_tracking_btlog;
 
 void
 vm_object_tracking_init(void)
@@ -132,12 +130,9 @@ vm_object_tracking_init(void)
 	    sizeof(vm_object_tracking));
 
 	if (vm_object_tracking) {
-		vm_object_tracking_btlog = btlog_create(
-			VM_OBJECT_TRACKING_NUM_RECORDS,
-			VM_OBJECT_TRACKING_BTDEPTH,
-			TRUE /* caller_will_remove_entries_for_element? */);
+		vm_object_tracking_btlog = btlog_create(BTLOG_HASH,
+		    VM_OBJECT_TRACKING_NUM_RECORDS);
 		assert(vm_object_tracking_btlog);
-		vm_object_tracking_inited = TRUE;
 	}
 }
 #endif /* VM_OBJECT_TRACKING */
@@ -243,10 +238,10 @@ SECURITY_READ_ONLY_LATE(zone_t) vm_object_zone; /* vm backing store zone */
  *	memory object (kernel_object) to avoid wasting data structures.
  */
 static struct vm_object                 kernel_object_store VM_PAGE_PACKED_ALIGNED;
-SECURITY_READ_ONLY_LATE(vm_object_t)    kernel_object = &kernel_object_store;
+const vm_object_t                       kernel_object = &kernel_object_store;
 
 static struct vm_object                 compressor_object_store VM_PAGE_PACKED_ALIGNED;
-SECURITY_READ_ONLY_LATE(vm_object_t)    compressor_object = &compressor_object_store;
+const vm_object_t                       compressor_object = &compressor_object_store;
 
 /*
  * This object holds all pages that have been retired due to errors like ECC.
@@ -254,16 +249,7 @@ SECURITY_READ_ONLY_LATE(vm_object_t)    compressor_object = &compressor_object_s
  * in this object is the same as the page's physical address.
  */
 static struct vm_object                 retired_pages_object_store VM_PAGE_PACKED_ALIGNED;
-SECURITY_READ_ONLY_LATE(vm_object_t)    retired_pages_object = &retired_pages_object_store;
-
-/*
- *	The submap object is used as a placeholder for vm_map_submap
- *	operations.  The object is declared in vm_map.c because it
- *	is exported by the vm_map module.  The storage is declared
- *	here because it must be initialized here.
- */
-static struct vm_object                 vm_submap_object_store VM_PAGE_PACKED_ALIGNED;
-SECURITY_READ_ONLY_LATE(vm_object_t)    vm_submap_object = &vm_submap_object_store;
+const vm_object_t                       retired_pages_object = &retired_pages_object_store;
 
 
 /*
@@ -282,9 +268,6 @@ static const struct vm_object vm_object_template = {
 	 * _vm_object_allocate(), so we don't need to initialize it in
 	 * the vm_object_template.
 	 */
-#if DEVELOPMENT || DEBUG
-	.Lock_owner = 0,
-#endif
 	.vo_size = 0,
 	.memq_hint = VM_PAGE_NULL,
 	.ref_count = 1,
@@ -299,9 +282,7 @@ static const struct vm_object vm_object_template = {
 	.pager_control = MEMORY_OBJECT_CONTROL_NULL,
 	.copy_strategy = MEMORY_OBJECT_COPY_SYMMETRIC,
 	.paging_in_progress = 0,
-#if __LP64__
-	.__object1_unused_bits = 0,
-#endif /* __LP64__ */
+	.vo_size_delta = 0,
 	.activity_in_progress = 0,
 
 	/* Begin bitfields */
@@ -385,6 +366,8 @@ static const struct vm_object vm_object_template = {
 	.__object3_unused_bits = 0,
 #endif /* CONFIG_SECLUDED_MEMORY */
 
+	.for_realtime = false,
+
 #if VM_OBJECT_ACCESS_TRACKING
 	.access_tracking = FALSE,
 	.access_tracking_reads = 0,
@@ -414,7 +397,7 @@ static uint32_t         vm_object_cache_pages_moved = 0;
 static uint32_t         vm_object_cache_pages_skipped = 0;
 static uint32_t         vm_object_cache_adds = 0;
 static uint32_t         vm_object_cached_count = 0;
-static LCK_MTX_EARLY_DECLARE_ATTR(vm_object_cached_lock_data,
+static LCK_MTX_DECLARE_ATTR(vm_object_cached_lock_data,
     &vm_object_cache_lck_grp, &vm_object_lck_attr);
 
 static uint32_t         vm_object_page_grab_failed = 0;
@@ -435,7 +418,7 @@ static void vm_object_reap(vm_object_t object);
 static void vm_object_reap_async(vm_object_t object);
 static void vm_object_reaper_thread(void);
 
-static LCK_MTX_EARLY_DECLARE_ATTR(vm_object_reaper_lock_data,
+static LCK_MTX_DECLARE_ATTR(vm_object_reaper_lock_data,
     &vm_object_lck_grp, &vm_object_lck_attr);
 
 static queue_head_t vm_object_reaper_queue; /* protected by vm_object_reaper_lock() */
@@ -461,9 +444,8 @@ LCK_SPIN_DECLARE_ATTR(io_reprioritize_list_lock,
 #define IO_REPRIORITIZE_LIST_UNLOCK()   \
 	        lck_spin_unlock(&io_reprioritize_list_lock)
 
-#define MAX_IO_REPRIORITIZE_REQS        8192
-ZONE_DECLARE(io_reprioritize_req_zone, "io_reprioritize_req",
-    sizeof(struct io_reprioritize_req), ZC_NOGC);
+ZONE_DEFINE_TYPE(io_reprioritize_req_zone, "io_reprioritize_req",
+    struct io_reprioritize_req, ZC_NONE);
 
 /* I/O Re-prioritization thread */
 int io_reprioritize_wakeup = 0;
@@ -487,6 +469,22 @@ void vm_decmp_upl_reprioritize(upl_t, int);
 #endif
 
 
+void
+vm_object_set_size(
+	vm_object_t             object,
+	vm_object_size_t        outer_size,
+	vm_object_size_t        inner_size)
+{
+	object->vo_size = vm_object_round_page(outer_size);
+#if KASAN
+	assert(object->vo_size - inner_size <= USHRT_MAX);
+	object->vo_size_delta = (unsigned short)(object->vo_size - inner_size);
+#else
+	(void)inner_size;
+#endif
+}
+
+
 /*
  *	vm_object_allocate:
  *
@@ -504,19 +502,13 @@ _vm_object_allocate(
 	queue_init(&object->uplq);
 #endif
 	vm_object_lock_init(object);
-	object->vo_size = vm_object_round_page(size);
+	vm_object_set_size(object, size, size);
 
 #if VM_OBJECT_TRACKING_OP_CREATED
-	if (vm_object_tracking_inited) {
-		void    *bt[VM_OBJECT_TRACKING_BTDEPTH];
-		int     numsaved = 0;
-
-		numsaved = OSBacktrace(bt, VM_OBJECT_TRACKING_BTDEPTH);
-		btlog_add_entry(vm_object_tracking_btlog,
-		    object,
+	if (vm_object_tracking_btlog) {
+		btlog_record(vm_object_tracking_btlog, object,
 		    VM_OBJECT_TRACKING_OP_CREATED,
-		    bt,
-		    numsaved);
+		    btref_get(__builtin_frame_address(0), 0));
 	}
 #endif /* VM_OBJECT_TRACKING_OP_CREATED */
 }
@@ -527,13 +519,8 @@ vm_object_allocate(
 {
 	vm_object_t object;
 
-	object = (vm_object_t) zalloc(vm_object_zone);
-
-//	dbgLog(object, size, 0, 2);			/* (TEST/DEBUG) */
-
-	if (object != VM_OBJECT_NULL) {
-		_vm_object_allocate(size, object);
-	}
+	object = zalloc_flags(vm_object_zone, Z_WAITOK | Z_NOFAIL);
+	_vm_object_allocate(size, object);
 
 	return object;
 }
@@ -556,15 +543,8 @@ vm_object_bootstrap(void)
 	vm_object_size = (sizeof(struct vm_object) + (VM_PAGE_PACKED_PTR_ALIGNMENT - 1)) &
 	    ~(VM_PAGE_PACKED_PTR_ALIGNMENT - 1);
 
-	vm_object_zone = zone_create_ext("vm objects", vm_object_size,
-	    ZC_NOENCRYPT | ZC_ALIGNMENT_REQUIRED,
-	    ZONE_ID_ANY, ^(zone_t z){
-#if defined(__LP64__)
-		zone_set_submap_idx(z, Z_SUBMAP_IDX_VA_RESTRICTED);
-#else
-		(void)z;
-#endif
-	});
+	vm_object_zone = zone_create("vm objects", vm_object_size,
+	    ZC_NOENCRYPT | ZC_ALIGNMENT_REQUIRED | ZC_VM | ZC_NOTBITAG);
 
 	queue_init(&vm_object_cached_list);
 
@@ -589,21 +569,6 @@ vm_object_bootstrap(void)
 	 */
 	_vm_object_allocate(VM_MAX_KERNEL_ADDRESS + 1, retired_pages_object);
 	retired_pages_object->copy_strategy = MEMORY_OBJECT_COPY_NONE;
-
-	/*
-	 *	Initialize the "submap object".  Make it as large as the
-	 *	kernel object so that no limit is imposed on submap sizes.
-	 */
-
-	_vm_object_allocate(VM_MAX_KERNEL_ADDRESS + 1, vm_submap_object);
-	vm_submap_object->copy_strategy = MEMORY_OBJECT_COPY_NONE;
-
-	/*
-	 * Create an "extra" reference to this object so that we never
-	 * try to deallocate it; zfree doesn't like to be called with
-	 * non-zone memory.
-	 */
-	vm_object_reference(vm_submap_object);
 }
 
 #if CONFIG_IOSCHED
@@ -677,11 +642,11 @@ vm_object_deallocate(
 
 		if (object->ref_count == 0) {
 			if (object == kernel_object) {
-				panic("vm_object_deallocate: losing kernel_object\n");
+				panic("vm_object_deallocate: losing kernel_object");
 			} else if (object == retired_pages_object) {
-				panic("vm_object_deallocate: losing retired_pages_object\n");
+				panic("vm_object_deallocate: losing retired_pages_object");
 			} else {
-				panic("vm_object_deallocate: losing compressor_object\n");
+				panic("vm_object_deallocate: losing compressor_object");
 			}
 		}
 		vm_object_unlock(object);
@@ -1508,7 +1473,7 @@ vm_object_reap(
 			/* remove from nonvolatile queue */
 			vm_purgeable_nonvolatile_dequeue(object);
 		} else {
-			panic("object %p in unexpected purgeable state 0x%x\n",
+			panic("object %p in unexpected purgeable state 0x%x",
 			    object, object->purgable);
 		}
 		if (object->transposed &&
@@ -1565,9 +1530,8 @@ vm_object_reap(
 	object->shadow = VM_OBJECT_NULL;
 
 #if VM_OBJECT_TRACKING
-	if (vm_object_tracking_inited) {
-		btlog_remove_entries_for_element(vm_object_tracking_btlog,
-		    object);
+	if (vm_object_tracking_btlog) {
+		btlog_erase(vm_object_tracking_btlog, object);
 	}
 #endif /* VM_OBJECT_TRACKING */
 
@@ -1774,7 +1738,7 @@ restart_after_sleep:
 				p->vmp_dirty = pmap_is_modified(VM_PAGE_GET_PHYS_PAGE(p));
 			}
 
-			if ((p->vmp_dirty || p->vmp_precious) && !p->vmp_error && object->alive) {
+			if ((p->vmp_dirty || p->vmp_precious) && !VMP_ERROR_GET(p) && object->alive) {
 				assert(!object->internal);
 
 				p->vmp_free_when_done = TRUE;
@@ -1937,6 +1901,14 @@ vm_object_release_pager(
  *		presence of address map (or other) references
  *		to the vm_object.
  */
+#if MACH_ASSERT
+extern vm_object_t fbdp_object;
+extern memory_object_t fbdp_moc;
+struct vnode;
+extern struct vnode *fbdp_vp;
+extern uint32_t system_inshutdown;
+int fbdp_no_panic = 0;
+#endif /* MACH_ASSERT */
 kern_return_t
 vm_object_destroy(
 	vm_object_t             object,
@@ -1957,10 +1929,26 @@ vm_object_destroy(
 	 *	the destroy call.]
 	 */
 
+#if MACH_ASSERT
+	if (object == fbdp_object) {
+		if (object->ref_count > 1 && !system_inshutdown) {
+			PE_parse_boot_argn("fbdp_no_panic2", &fbdp_no_panic, sizeof(fbdp_no_panic));
+			if (!fbdp_no_panic) {
+				panic("FBDP %s:%d object %p refs %d moc %p vp %p\n", __FUNCTION__, __LINE__, fbdp_object, fbdp_object->ref_count, fbdp_moc, fbdp_vp);
+			}
+		}
+		fbdp_object = NULL;
+		fbdp_moc = NULL;
+		fbdp_vp = NULL;
+	}
+#endif /* MACH_ASSERT */
+
 	vm_object_lock(object);
 	object->can_persist = FALSE;
 	object->named = FALSE;
+#if 00
 	object->alive = FALSE;
+#endif /* 00 */
 
 #if DEVELOPMENT || DEBUG
 	if (object->object_is_shared_cache &&
@@ -2107,16 +2095,20 @@ page_is_paged_out(
  * reclaimed and then re-faulted.
  */
 #if DEVELOPMENT || DEBUG
-int madvise_free_debug = 1;
+int madvise_free_debug = 0;
+int madvise_free_debug_sometimes = 1;
 #else /* DEBUG */
 int madvise_free_debug = 0;
+int madvise_free_debug_sometimes = 0;
 #endif /* DEBUG */
+int madvise_free_counter = 0;
 
 __options_decl(deactivate_flags_t, uint32_t, {
 	DEACTIVATE_KILL         = 0x1,
 	DEACTIVATE_REUSABLE     = 0x2,
 	DEACTIVATE_ALL_REUSABLE = 0x4,
-	DEACTIVATE_CLEAR_REFMOD = 0x8
+	DEACTIVATE_CLEAR_REFMOD = 0x8,
+	DEACTIVATE_REUSABLE_NO_WRITE = 0x10
 });
 
 /*
@@ -2199,11 +2191,15 @@ deactivate_pages_in_object(
 				dwp->dw_mask |= DW_clear_reference;
 
 				if ((flags & DEACTIVATE_KILL) && (object->internal)) {
-					if (madvise_free_debug) {
+					if (!(flags & DEACTIVATE_REUSABLE_NO_WRITE) &&
+					    (madvise_free_debug ||
+					    (madvise_free_debug_sometimes &&
+					    madvise_free_counter++ & 0x1))) {
 						/*
-						 * zero-fill the page now
-						 * to simulate it being
-						 * reclaimed and re-faulted.
+						 * zero-fill the page (or every
+						 * other page) now to simulate
+						 * it being reclaimed and
+						 * re-faulted.
 						 */
 						pmap_zero_page(VM_PAGE_GET_PHYS_PAGE(m));
 					}
@@ -2430,6 +2426,7 @@ vm_object_deactivate_pages(
 	vm_object_size_t        size,
 	boolean_t               kill_page,
 	boolean_t               reusable_page,
+	boolean_t               reusable_no_write,
 	struct pmap             *pmap,
 	vm_map_offset_t         pmap_offset)
 {
@@ -2445,6 +2442,9 @@ vm_object_deactivate_pages(
 	}
 	if (reusable_page) {
 		flags |= DEACTIVATE_REUSABLE;
+	}
+	if (reusable_no_write) {
+		flags |= DEACTIVATE_REUSABLE_NO_WRITE;
 	}
 
 	/*
@@ -2582,7 +2582,7 @@ vm_object_reuse_pages(
 	vm_object_lock_assert_exclusive(object);
 
 	if (object->all_reusable) {
-		panic("object %p all_reusable: can't update pmap stats\n",
+		panic("object %p all_reusable: can't update pmap stats",
 		    object);
 		assert(object->reusable_page_count == 0);
 		object->all_reusable = FALSE;
@@ -3103,7 +3103,7 @@ vm_object_copy_slowly(
 			    FALSE,     /* page not looked up */
 			    &prot, &_result_page, &top_page,
 			    (int *)0,
-			    &error_code, FALSE, FALSE, &fault_info);
+			    &error_code, FALSE, &fault_info);
 
 			switch (result) {
 			case VM_FAULT_SUCCESS:
@@ -3159,6 +3159,7 @@ vm_object_copy_slowly(
 				if (vm_page_wait(interruptible)) {
 					break;
 				}
+				ktriage_record(thread_tid(current_thread()), KDBG_TRIAGE_EVENTID(KDBG_TRIAGE_SUBSYS_VM, KDBG_TRIAGE_RESERVED, KDBG_TRIAGE_VM_FAULT_OBJCOPYSLOWLY_MEMORY_SHORTAGE), 0 /* arg */);
 				OS_FALLTHROUGH;
 
 			case VM_FAULT_INTERRUPTED:
@@ -3230,13 +3231,12 @@ vm_object_copy_slowly(
 /*ARGSUSED*/
 __private_extern__ boolean_t
 vm_object_copy_quickly(
-	vm_object_t             *_object,               /* INOUT */
+	vm_object_t             object,               /* IN */
 	__unused vm_object_offset_t     offset, /* IN */
 	__unused vm_object_size_t       size,   /* IN */
 	boolean_t               *_src_needs_copy,       /* OUT */
 	boolean_t               *_dst_needs_copy)       /* OUT */
 {
-	vm_object_t     object = *_object;
 	memory_object_copy_strategy_t copy_strategy;
 
 	if (object == VM_OBJECT_NULL) {
@@ -3413,10 +3413,10 @@ Retry:
 	return KERN_SUCCESS;
 }
 
-static int copy_delayed_lock_collisions = 0;
-static int copy_delayed_max_collisions = 0;
-static int copy_delayed_lock_contention = 0;
-static int copy_delayed_protect_iterate = 0;
+static uint32_t copy_delayed_lock_collisions;
+static uint32_t copy_delayed_max_collisions;
+static uint32_t copy_delayed_lock_contention;
+static uint32_t copy_delayed_protect_iterate;
 
 /*
  *	Routine:	vm_object_copy_delayed [internal]
@@ -3447,7 +3447,7 @@ vm_object_copy_delayed(
 	boolean_t               delayed_pmap_flush = FALSE;
 
 
-	int collisions = 0;
+	uint32_t collisions = 0;
 	/*
 	 *	The user-level memory manager wants to see all of the changes
 	 *	to this object, but it has promised not to make any changes on
@@ -3872,12 +3872,15 @@ vm_object_copy_strategically(
  *	are returned in the source parameters.
  */
 boolean_t vm_object_shadow_check = TRUE;
+uint64_t vm_object_shadow_forced = 0;
+uint64_t vm_object_shadow_skipped = 0;
 
 __private_extern__ boolean_t
 vm_object_shadow(
 	vm_object_t             *object,        /* IN/OUT */
 	vm_object_offset_t      *offset,        /* IN/OUT */
-	vm_object_size_t        length)
+	vm_object_size_t        length,
+	boolean_t               always_shadow)
 {
 	vm_object_t     source;
 	vm_object_t     result;
@@ -3888,22 +3891,7 @@ vm_object_shadow(
 		return FALSE;
 	}
 
-#if 0
-	/*
-	 * XXX FBDP
-	 * This assertion is valid but it gets triggered by Rosetta for example
-	 * due to a combination of vm_remap() that changes a VM object's
-	 * copy_strategy from SYMMETRIC to DELAY and vm_protect(VM_PROT_COPY)
-	 * that then sets "needs_copy" on its map entry.  This creates a
-	 * mapping situation that VM should never see and doesn't know how to
-	 * handle.
-	 * It's not clear if this can create any real problem but we should
-	 * look into fixing this, probably by having vm_protect(VM_PROT_COPY)
-	 * do more than just set "needs_copy" to handle the copy-on-write...
-	 * In the meantime, let's disable the assertion.
-	 */
 	assert(source->copy_strategy == MEMORY_OBJECT_COPY_SYMMETRIC);
-#endif
 
 	/*
 	 *	Determine if we really need a shadow.
@@ -3918,40 +3906,44 @@ vm_object_shadow(
 
 	assert(source->copy_strategy != MEMORY_OBJECT_COPY_NONE); /* Purgeable objects shouldn't have shadow objects. */
 
-#if 00
 	/*
 	 * The following optimization does not work in the context of submaps
 	 * (the shared region, in particular).
 	 * This object might have only 1 reference (in the submap) but that
 	 * submap can itself be mapped multiple times, so the object is
 	 * actually indirectly referenced more than once...
+	 * The caller can specify to "always_shadow" to bypass the optimization.
 	 */
 	if (vm_object_shadow_check &&
 	    source->vo_size == length &&
 	    source->ref_count == 1) {
-		/*
-		 * Lock the object and check again.
-		 * We also check to see if there's
-		 * a shadow or copy object involved.
-		 * We can't do that earlier because
-		 * without the object locked, there
-		 * could be a collapse and the chain
-		 * gets modified leaving us with an
-		 * invalid pointer.
-		 */
-		vm_object_lock(source);
-		if (source->vo_size == length &&
-		    source->ref_count == 1 &&
-		    (source->shadow == VM_OBJECT_NULL ||
-		    source->shadow->copy == VM_OBJECT_NULL)) {
-			source->shadowed = FALSE;
+		if (always_shadow) {
+			vm_object_shadow_forced++;
+		} else {
+			/*
+			 * Lock the object and check again.
+			 * We also check to see if there's
+			 * a shadow or copy object involved.
+			 * We can't do that earlier because
+			 * without the object locked, there
+			 * could be a collapse and the chain
+			 * gets modified leaving us with an
+			 * invalid pointer.
+			 */
+			vm_object_lock(source);
+			if (source->vo_size == length &&
+			    source->ref_count == 1 &&
+			    (source->shadow == VM_OBJECT_NULL ||
+			    source->shadow->copy == VM_OBJECT_NULL)) {
+				source->shadowed = FALSE;
+				vm_object_unlock(source);
+				vm_object_shadow_skipped++;
+				return FALSE;
+			}
+			/* things changed while we were locking "source"... */
 			vm_object_unlock(source);
-			return FALSE;
 		}
-		/* things changed while we were locking "source"... */
-		vm_object_unlock(source);
 	}
-#endif /* 00 */
 
 	/*
 	 * *offset is the map entry's offset into the VM object and
@@ -4267,7 +4259,7 @@ vm_object_compressor_pager_create(
 	    object->vo_size,
 	    FALSE);
 	if (pager_object != object) {
-		panic("vm_object_compressor_pager_create: mismatch (pager: %p, pager_object: %p, orig_object: %p, orig_object size: 0x%llx)\n", pager, pager_object, object, (uint64_t) object->vo_size);
+		panic("vm_object_compressor_pager_create: mismatch (pager: %p, pager_object: %p, orig_object: %p, orig_object size: 0x%llx)", pager, pager_object, object, (uint64_t) object->vo_size);
 	}
 
 	/*
@@ -4558,9 +4550,8 @@ vm_object_do_collapse(
 	vm_object_unlock(backing_object);
 
 #if VM_OBJECT_TRACKING
-	if (vm_object_tracking_inited) {
-		btlog_remove_entries_for_element(vm_object_tracking_btlog,
-		    backing_object);
+	if (vm_object_tracking_btlog) {
+		btlog_erase(vm_object_tracking_btlog, backing_object);
 	}
 #endif /* VM_OBJECT_TRACKING */
 
@@ -4696,8 +4687,7 @@ vm_object_collapse(
 	boolean_t                               can_bypass)
 {
 	vm_object_t                             backing_object;
-	unsigned int                            rcount;
-	unsigned int                            size;
+	vm_object_size_t                        object_vcount, object_rcount;
 	vm_object_t                             original_object;
 	int                                     object_lock_type;
 	int                                     backing_object_lock_type;
@@ -4910,13 +4900,13 @@ retry:
 		 *	we have to make sure no pages in the backing object
 		 *	"show through" before bypassing it.
 		 */
-		size = (unsigned int)atop(object->vo_size);
-		rcount = object->resident_page_count;
+		object_vcount = object->vo_size >> PAGE_SHIFT;
+		object_rcount = (vm_object_size_t)object->resident_page_count;
 
-		if (rcount != size) {
+		if (object_rcount != object_vcount) {
 			vm_object_offset_t      offset;
 			vm_object_offset_t      backing_offset;
-			unsigned int            backing_rcount;
+			vm_object_size_t        backing_rcount, backing_vcount;
 
 			/*
 			 *	If the backing object has a pager but no pagemap,
@@ -4949,9 +4939,12 @@ retry:
 			}
 
 			backing_offset = object->vo_shadow_offset;
-			backing_rcount = backing_object->resident_page_count;
+			backing_vcount = backing_object->vo_size >> PAGE_SHIFT;
+			backing_rcount = (vm_object_size_t)backing_object->resident_page_count;
+			assert(backing_vcount >= object_vcount);
 
-			if ((int)backing_rcount - (int)(atop(backing_object->vo_size) - size) > (int)rcount) {
+			if (backing_rcount > (backing_vcount - object_vcount) &&
+			    backing_rcount - (backing_vcount - object_vcount) > object_rcount) {
 				/*
 				 * we have enough pages in the backing object to guarantee that
 				 * at least 1 of them must be 'uncovered' by a resident page
@@ -4997,7 +4990,7 @@ retry:
 
 			if (EXISTS_IN_OBJECT(backing_object, hint_offset +
 			    backing_offset, backing_rcount) &&
-			    !EXISTS_IN_OBJECT(object, hint_offset, rcount)) {
+			    !EXISTS_IN_OBJECT(object, hint_offset, object_rcount)) {
 				/* dependency right at the hint */
 				object->cow_hint = (vm_offset_t) hint_offset; /* atomic */
 				/* try and collapse the rest of the shadow chain */
@@ -5023,8 +5016,8 @@ retry:
 			 * have to run both passes, we need to be careful
 			 * not to decrement 'rcount' in the 1st pass
 			 */
-			if (backing_rcount && backing_rcount < (size / 8)) {
-				unsigned int rc = rcount;
+			if (backing_rcount && backing_rcount < (object_vcount / 8)) {
+				vm_object_size_t rc = object_rcount;
 				vm_page_t p;
 
 				backing_rcount = backing_object->resident_page_count;
@@ -5065,7 +5058,7 @@ retry:
 				    (offset + PAGE_SIZE_64) : 0) != hint_offset) {
 					if (EXISTS_IN_OBJECT(backing_object, offset +
 					    backing_offset, backing_rcount) &&
-					    !EXISTS_IN_OBJECT(object, offset, rcount)) {
+					    !EXISTS_IN_OBJECT(object, offset, object_rcount)) {
 						/* found a dependency */
 						object->cow_hint = (vm_offset_t) offset; /* atomic */
 						break;
@@ -5416,166 +5409,6 @@ memory_object_create_named(
 		vm_object_unlock(object);
 	}
 	return KERN_SUCCESS;
-}
-
-
-/*
- *	Routine:	memory_object_recover_named [user interface]
- *	Purpose:
- *		Attempt to recover a named reference for a VM object.
- *		VM will verify that the object has not already started
- *		down the termination path, and if it has, will optionally
- *		wait for that to finish.
- *	Returns:
- *		KERN_SUCCESS - we recovered a named reference on the object
- *		KERN_FAILURE - we could not recover a reference (object dead)
- *		KERN_INVALID_ARGUMENT - bad memory object control
- */
-kern_return_t
-memory_object_recover_named(
-	memory_object_control_t control,
-	boolean_t               wait_on_terminating)
-{
-	vm_object_t             object;
-
-	object = memory_object_control_to_vm_object(control);
-	if (object == VM_OBJECT_NULL) {
-		return KERN_INVALID_ARGUMENT;
-	}
-restart:
-	vm_object_lock(object);
-
-	if (object->terminating && wait_on_terminating) {
-		vm_object_wait(object,
-		    VM_OBJECT_EVENT_PAGING_IN_PROGRESS,
-		    THREAD_UNINT);
-		goto restart;
-	}
-
-	if (!object->alive) {
-		vm_object_unlock(object);
-		return KERN_FAILURE;
-	}
-
-	if (object->named == TRUE) {
-		vm_object_unlock(object);
-		return KERN_SUCCESS;
-	}
-	object->named = TRUE;
-	vm_object_lock_assert_exclusive(object);
-	object->ref_count++;
-	while (!object->pager_ready) {
-		vm_object_sleep(object,
-		    VM_OBJECT_EVENT_PAGER_READY,
-		    THREAD_UNINT);
-	}
-	vm_object_unlock(object);
-	return KERN_SUCCESS;
-}
-
-
-/*
- *	vm_object_release_name:
- *
- *	Enforces name semantic on memory_object reference count decrement
- *	This routine should not be called unless the caller holds a name
- *	reference gained through the memory_object_create_named.
- *
- *	If the TERMINATE_IDLE flag is set, the call will return if the
- *	reference count is not 1. i.e. idle with the only remaining reference
- *	being the name.
- *	If the decision is made to proceed the name field flag is set to
- *	false and the reference count is decremented.  If the RESPECT_CACHE
- *	flag is set and the reference count has gone to zero, the
- *	memory_object is checked to see if it is cacheable otherwise when
- *	the reference count is zero, it is simply terminated.
- */
-
-__private_extern__ kern_return_t
-vm_object_release_name(
-	vm_object_t     object,
-	int             flags)
-{
-	vm_object_t     shadow;
-	boolean_t       original_object = TRUE;
-
-	while (object != VM_OBJECT_NULL) {
-		vm_object_lock(object);
-
-		assert(object->alive);
-		if (original_object) {
-			assert(object->named);
-		}
-		assert(object->ref_count > 0);
-
-		/*
-		 *	We have to wait for initialization before
-		 *	destroying or caching the object.
-		 */
-
-		if (object->pager_created && !object->pager_initialized) {
-			assert(!object->can_persist);
-			vm_object_assert_wait(object,
-			    VM_OBJECT_EVENT_INITIALIZED,
-			    THREAD_UNINT);
-			vm_object_unlock(object);
-			thread_block(THREAD_CONTINUE_NULL);
-			continue;
-		}
-
-		if (((object->ref_count > 1)
-		    && (flags & MEMORY_OBJECT_TERMINATE_IDLE))
-		    || (object->terminating)) {
-			vm_object_unlock(object);
-			return KERN_FAILURE;
-		} else {
-			if (flags & MEMORY_OBJECT_RELEASE_NO_OP) {
-				vm_object_unlock(object);
-				return KERN_SUCCESS;
-			}
-		}
-
-		if ((flags & MEMORY_OBJECT_RESPECT_CACHE) &&
-		    (object->ref_count == 1)) {
-			if (original_object) {
-				object->named = FALSE;
-			}
-			vm_object_unlock(object);
-			/* let vm_object_deallocate push this thing into */
-			/* the cache, if that it is where it is bound */
-			vm_object_deallocate(object);
-			return KERN_SUCCESS;
-		}
-		shadow = object->pageout?VM_OBJECT_NULL:object->shadow;
-
-		if (object->ref_count == 1) {
-			if (vm_object_terminate(object) != KERN_SUCCESS) {
-				if (original_object) {
-					return KERN_FAILURE;
-				} else {
-					return KERN_SUCCESS;
-				}
-			}
-			if (shadow != VM_OBJECT_NULL) {
-				original_object = FALSE;
-				object = shadow;
-				continue;
-			}
-			return KERN_SUCCESS;
-		} else {
-			vm_object_lock_assert_exclusive(object);
-			object->ref_count--;
-			assert(object->ref_count > 0);
-			if (original_object) {
-				object->named = FALSE;
-			}
-			vm_object_unlock(object);
-			return KERN_SUCCESS;
-		}
-	}
-	/*NOTREACHED*/
-	assert(0);
-	return KERN_FAILURE;
 }
 
 
@@ -7284,9 +7117,6 @@ vm_object_lock(vm_object_t object)
 	}
 	DTRACE_VM(vm_object_lock_w);
 	lck_rw_lock_exclusive(&object->Lock);
-#if DEVELOPMENT || DEBUG
-	object->Lock_owner = current_thread();
-#endif
 }
 
 boolean_t
@@ -7308,7 +7138,6 @@ _vm_object_lock_try(vm_object_t object)
 #if DEVELOPMENT || DEBUG
 	if (retval == TRUE) {
 		DTRACE_VM(vm_object_lock_w);
-		object->Lock_owner = current_thread();
 	}
 #endif
 	return retval;
@@ -7335,17 +7164,12 @@ vm_object_lock_try(vm_object_t object)
 bool
 vm_object_lock_check_contended(vm_object_t object)
 {
-	bool contended;
 	if (object == vm_pageout_scan_wants_object) {
 		scan_object_collision++;
 		mutex_pause(2);
 	}
 	DTRACE_VM(vm_object_lock_w);
-	contended = lck_rw_lock_exclusive_check_contended(&object->Lock);
-#if DEVELOPMENT || DEBUG
-	object->Lock_owner = current_thread();
-#endif
-	return contended;
+	return lck_rw_lock_exclusive_check_contended(&object->Lock);
 }
 
 void
@@ -7361,7 +7185,7 @@ vm_object_lock_shared(vm_object_t object)
 boolean_t
 vm_object_lock_yield_shared(vm_object_t object)
 {
-	boolean_t retval = FALSE, force_yield = FALSE;;
+	boolean_t retval = FALSE, force_yield = FALSE;
 
 	vm_object_lock_assert_shared(object);
 
@@ -7399,7 +7223,6 @@ vm_object_lock_upgrade(vm_object_t object)
 #if DEVELOPMENT || DEBUG
 	if (retval == TRUE) {
 		DTRACE_VM(vm_object_lock_w);
-		object->Lock_owner = current_thread();
 	}
 #endif
 	return retval;
@@ -7409,13 +7232,7 @@ void
 vm_object_unlock(vm_object_t object)
 {
 #if DEVELOPMENT || DEBUG
-	if (object->Lock_owner) {
-		if (object->Lock_owner != current_thread()) {
-			panic("vm_object_unlock: not owner - %p\n", object);
-		}
-		object->Lock_owner = 0;
-		DTRACE_VM(vm_object_unlock);
-	}
+	DTRACE_VM(vm_object_unlock);
 #endif
 	lck_rw_done(&object->Lock);
 }
@@ -7433,7 +7250,7 @@ vm_object_change_wimg_mode(vm_object_t object, unsigned int wimg_mode)
 
 	vm_object_lock_assert_exclusive(object);
 
-	vm_object_paging_wait(object, THREAD_UNINT);
+	vm_object_paging_only_wait(object, THREAD_UNINT);
 
 	vm_page_queue_iterate(&object->memq, p, vmp_listq) {
 		if (!p->vmp_fictitious) {
@@ -7593,7 +7410,7 @@ vm_object_compressed_freezer_pageout(
 
 		vm_page_lockspin_queues();
 
-		if (p->vmp_cleaning || p->vmp_fictitious || p->vmp_busy || p->vmp_absent || p->vmp_unusual || p->vmp_error || VM_PAGE_WIRED(p)) {
+		if (p->vmp_cleaning || p->vmp_fictitious || p->vmp_busy || p->vmp_absent || p->vmp_unusual || VMP_ERROR_GET(p) || VM_PAGE_WIRED(p)) {
 			vm_page_unlock_queues();
 
 			KERNEL_DEBUG(0xe0430004 | DBG_FUNC_END, object, local_freed, 1, 0, 0);
@@ -7766,7 +7583,7 @@ ReScan:
 		    p->vmp_laundry ||
 		    p->vmp_busy ||
 		    p->vmp_absent ||
-		    p->vmp_error ||
+		    VMP_ERROR_GET(p) ||
 		    p->vmp_fictitious ||
 		    VM_PAGE_WIRED(p)) {
 			/*
@@ -7800,7 +7617,7 @@ ReScan:
 		assert(!p->vmp_busy);
 		assert(!p->vmp_absent);
 		assert(!p->vmp_unusual);
-		assert(!p->vmp_error);
+		assert(!VMP_ERROR_GET(p));      /* XXX there's a window here where we could have an ECC error! */
 		assert(!VM_PAGE_WIRED(p));
 		assert(!p->vmp_cleaning);
 
@@ -7926,8 +7743,7 @@ vm_decmp_upl_reprioritize(upl_t upl, int prio)
 	upl_unlock(upl);
 
 	/* Now perform the allocation */
-	io_upl_reprio_info = (uint64_t *)kheap_alloc(KHEAP_TEMP,
-	    sizeof(uint64_t) * atop(io_upl_size), Z_WAITOK);
+	io_upl_reprio_info = kalloc_data(sizeof(uint64_t) * atop(io_upl_size), Z_WAITOK);
 	if (io_upl_reprio_info == NULL) {
 		return;
 	}
@@ -7976,8 +7792,8 @@ vm_decmp_upl_reprioritize(upl_t upl, int prio)
 
 		if (blkno != 0 && len != 0) {
 			/* Create the request for I/O reprioritization */
-			req = (io_reprioritize_req_t)zalloc(io_reprioritize_req_zone);
-			assert(req != NULL);
+			req = zalloc_flags(io_reprioritize_req_zone,
+			    Z_WAITOK | Z_NOFAIL);
 			req->blkno = blkno;
 			req->len = len;
 			req->priority = prio;
@@ -7998,8 +7814,7 @@ vm_decmp_upl_reprioritize(upl_t upl, int prio)
 	IO_REPRIO_THREAD_WAKEUP();
 
 out:
-	kheap_free(KHEAP_TEMP, io_upl_reprio_info,
-	    sizeof(uint64_t) * atop(io_upl_size));
+	kfree_data(io_upl_reprio_info, sizeof(uint64_t) * atop(io_upl_size));
 }
 
 void
@@ -8237,7 +8052,7 @@ vm_object_ledger_tag_ledgers(
 		}
 		break;
 	default:
-		panic("%s: object %p has unsupported ledger_tag %d\n",
+		panic("%s: object %p has unsupported ledger_tag %d",
 		    __FUNCTION__, object, object->vo_ledger_tag);
 	}
 }
@@ -8267,6 +8082,14 @@ vm_object_ownership_change(
 
 	if (!object->internal) {
 		return KERN_INVALID_ARGUMENT;
+	}
+	if (new_owner == VM_OBJECT_OWNER_UNCHANGED) {
+		/* leave owner unchanged */
+		new_owner = VM_OBJECT_OWNER(object);
+	}
+	if (new_ledger_tag == VM_LEDGER_TAG_UNCHANGED) {
+		/* leave ledger_tag unchanged */
+		new_ledger_tag = object->vo_ledger_tag;
 	}
 	if (new_ledger_tag == VM_LEDGER_TAG_NONE &&
 	    object->purgable == VM_PURGABLE_DENY) {

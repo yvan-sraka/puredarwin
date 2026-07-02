@@ -47,6 +47,7 @@
 
 #include <net/packet_mangler.h>
 
+#include <netinet/mptcp.h>
 #include <netinet/tcp.h>
 #include <netinet/tcp_var.h>
 #include <netinet/ip.h>
@@ -90,19 +91,16 @@ struct packet_mangler {
 };
 
 /* Array of all the packet mangler instancesi */
-struct packet_mangler **packet_manglers = NULL;
+struct packet_mangler *packet_manglers[MAX_PACKET_MANGLER];
 
 uint32_t pkt_mnglr_active_count = 0;    /* Number of active packet filters */
 uint32_t pkt_mnglr_close_wait_timeout = 1000; /* in milliseconds */
 
 static kern_ctl_ref pkt_mnglr_kctlref = NULL;
 
-static lck_grp_attr_t *pkt_mnglr_lck_grp_attr = NULL;
-static lck_attr_t *pkt_mnglr_lck_attr = NULL;
-static lck_grp_t *pkt_mnglr_lck_grp = NULL;
-
 /* The lock below protects packet_manglers DS, packet_mangler DS */
-decl_lck_rw_data(static, pkt_mnglr_lck_rw);
+static LCK_GRP_DECLARE(pkt_mnglr_lck_grp, "packet mangler");
+static LCK_RW_DECLARE(pkt_mnglr_lck_rw, &pkt_mnglr_lck_grp);
 
 #define PKT_MNGLR_RW_LCK_MAX    8
 
@@ -112,8 +110,7 @@ void* pkt_mnglr_rw_lock_history[PKT_MNGLR_RW_LCK_MAX];
 int pkt_mnglr_rw_nxt_unlck = 0;
 void* pkt_mnglr_rw_unlock_history[PKT_MNGLR_RW_LCK_MAX];
 
-static ZONE_DECLARE(packet_mangler_zone, "packet_mangler",
-    sizeof(struct packet_mangler), ZC_NONE);
+static KALLOC_TYPE_DEFINE(packet_mangler_zone, struct packet_mangler, NET_KT_DEFAULT);
 
 /*
  * For troubleshooting
@@ -139,15 +136,6 @@ static void chksm_update(mbuf_t data);
 
 #define TCP_OPT_MULTIPATH_TCP   30
 #define MPTCP_SBT_VER_OFFSET    2
-
-#define MPTCP_SUBTYPE_MPCAPABLE         0x0
-#define MPTCP_SUBTYPE_MPJOIN            0x1
-#define MPTCP_SUBTYPE_DSS               0x2
-#define MPTCP_SUBTYPE_ADD_ADDR          0x3
-#define MPTCP_SUBTYPE_REM_ADDR          0x4
-#define MPTCP_SUBTYPE_MP_PRIO           0x5
-#define MPTCP_SUBTYPE_MP_FAIL           0x6
-#define MPTCP_SUBTYPE_MP_FASTCLOSE      0x7
 
 /*
  * packet filter global read write lock
@@ -219,48 +207,22 @@ pkt_mnglr_ctl_connect(kern_ctl_ref kctlref, struct sockaddr_ctl *sac,
 
 	PKT_MNGLR_LOG(LOG_NOTICE, "Connecting packet mangler filter.");
 
-	p_pkt_mnglr = zalloc(packet_mangler_zone);
-	if (p_pkt_mnglr == NULL) {
-		PKT_MNGLR_LOG(LOG_ERR, "zalloc failed");
-		error = ENOMEM;
-		goto done;
-	}
-
-	bzero(p_pkt_mnglr, sizeof(struct packet_mangler));
-
-	pkt_mnglr_rw_lock_exclusive(&pkt_mnglr_lck_rw);
-	if (packet_manglers == NULL) {
-		struct packet_mangler **tmp;
-
-		pkt_mnglr_rw_unlock_exclusive(&pkt_mnglr_lck_rw);
-
-		MALLOC(tmp,
-		    struct packet_mangler **,
-		    MAX_PACKET_MANGLER * sizeof(struct packet_mangler *),
-		    M_TEMP,
-		    M_WAITOK | M_ZERO);
-
-		pkt_mnglr_rw_lock_exclusive(&pkt_mnglr_lck_rw);
-
-		if (tmp == NULL && packet_manglers == NULL) {
-			error = ENOMEM;
-			pkt_mnglr_rw_unlock_exclusive(&pkt_mnglr_lck_rw);
-			goto done;
-		}
-		/* Another thread may have won the race */
-		if (packet_manglers != NULL) {
-			FREE(tmp, M_TEMP);
-		} else {
-			packet_manglers = tmp;
-		}
-	}
-
 	if (sac->sc_unit == 0 || sac->sc_unit > MAX_PACKET_MANGLER) {
 		PKT_MNGLR_LOG(LOG_ERR, "bad sc_unit %u", sac->sc_unit);
 		error = EINVAL;
-	} else if (packet_manglers[sac->sc_unit - 1] != NULL) {
+		goto fail;
+	}
+
+	p_pkt_mnglr = zalloc_flags(packet_mangler_zone,
+	    Z_WAITOK | Z_ZERO | Z_NOFAIL);
+
+	pkt_mnglr_rw_lock_exclusive(&pkt_mnglr_lck_rw);
+
+	if (packet_manglers[sac->sc_unit - 1] != NULL) {
 		PKT_MNGLR_LOG(LOG_ERR, "sc_unit %u in use", sac->sc_unit);
 		error = EADDRINUSE;
+		pkt_mnglr_rw_unlock_exclusive(&pkt_mnglr_lck_rw);
+		goto fail_free;
 	} else {
 		/*
 		 * kernel control socket kcunit numbers start at 1
@@ -270,7 +232,6 @@ pkt_mnglr_ctl_connect(kern_ctl_ref kctlref, struct sockaddr_ctl *sac,
 		p_pkt_mnglr->pkt_mnglr_kcref = kctlref;
 		p_pkt_mnglr->pkt_mnglr_kcunit = sac->sc_unit;
 
-		*unitinfo = p_pkt_mnglr;
 		pkt_mnglr_active_count++;
 	}
 
@@ -282,23 +243,34 @@ pkt_mnglr_ctl_connect(kern_ctl_ref kctlref, struct sockaddr_ctl *sac,
 	error = ipf_addv4(&(p_pkt_mnglr->pkt_mnglr_ipfilter), &(p_pkt_mnglr->pkt_mnglr_ipfref));
 	if (error) {
 		PKT_MNGLR_LOG(LOG_ERR, "Could not register packet mangler's IPv4 Filter");
-		goto done;
+		goto fail_locked;
 	}
 	error = ipf_addv6(&(p_pkt_mnglr->pkt_mnglr_ipfilter), &(p_pkt_mnglr->pkt_mnglr_ipfrefv6));
 	if (error) {
 		ipf_remove(p_pkt_mnglr->pkt_mnglr_ipfref);
 		PKT_MNGLR_LOG(LOG_ERR, "Could not register packet mangler's IPv6 Filter");
-		goto done;
+		goto fail_locked;
 	}
 
 	PKT_MNGLR_LOG(LOG_INFO, "Registered packet mangler's IP Filters");
 	p_pkt_mnglr->pkt_mnglr_flags |= PKT_MNGLR_FLG_IPFILTER_ATTACHED;
 	pkt_mnglr_rw_unlock_exclusive(&pkt_mnglr_lck_rw);
 
-done:
-	if (error != 0 && p_pkt_mnglr != NULL) {
+	if (error) {
+fail_locked:
+		pkt_mnglr_active_count--;
+
+		packet_manglers[sac->sc_unit - 1] = NULL;
+		*unitinfo = NULL;
+
+		pkt_mnglr_rw_unlock_exclusive(&pkt_mnglr_lck_rw);
+
+fail_free:
 		zfree(packet_mangler_zone, p_pkt_mnglr);
 	}
+
+fail:
+	*unitinfo = p_pkt_mnglr;
 
 	PKT_MNGLR_LOG(LOG_INFO, "return %d pkt_mnglr_active_count %u kcunit %u",
 	    error, pkt_mnglr_active_count, sac->sc_unit);
@@ -315,11 +287,10 @@ pkt_mnglr_ctl_disconnect(kern_ctl_ref kctlref, u_int32_t kcunit, void *unitinfo)
 
 	PKT_MNGLR_LOG(LOG_INFO, "Disconnecting packet mangler kernel control");
 
-	if (packet_manglers == NULL) {
-		PKT_MNGLR_LOG(LOG_ERR, "no packet filter");
-		error = EINVAL;
+	if (unitinfo == NULL) {
 		goto done;
 	}
+
 	if (kcunit > MAX_PACKET_MANGLER) {
 		PKT_MNGLR_LOG(LOG_ERR, "kcunit %u > MAX_PACKET_MANGLER (%d)",
 		    kcunit, MAX_PACKET_MANGLER);
@@ -328,14 +299,10 @@ pkt_mnglr_ctl_disconnect(kern_ctl_ref kctlref, u_int32_t kcunit, void *unitinfo)
 	}
 
 	p_pkt_mnglr = (struct packet_mangler *)unitinfo;
-	if (p_pkt_mnglr == NULL) {
-		PKT_MNGLR_LOG(LOG_ERR, "Unit info is NULL");
-		goto done;
-	}
 
 	pkt_mnglr_rw_lock_exclusive(&pkt_mnglr_lck_rw);
 	if (packet_manglers[kcunit - 1] != p_pkt_mnglr || p_pkt_mnglr->pkt_mnglr_kcunit != kcunit) {
-		PKT_MNGLR_LOG(LOG_ERR, "bad unit info %u)",
+		PKT_MNGLR_LOG(LOG_ERR, "bad unit info %u",
 		    kcunit);
 		pkt_mnglr_rw_unlock_exclusive(&pkt_mnglr_lck_rw);
 		goto done;
@@ -371,11 +338,6 @@ pkt_mnglr_ctl_getopt(kern_ctl_ref kctlref, u_int32_t kcunit, void *unitinfo,
 
 	pkt_mnglr_rw_lock_shared(&pkt_mnglr_lck_rw);
 
-	if (packet_manglers == NULL) {
-		PKT_MNGLR_LOG(LOG_ERR, "no packet filter");
-		error = EINVAL;
-		goto done;
-	}
 	if (kcunit > MAX_PACKET_MANGLER) {
 		PKT_MNGLR_LOG(LOG_ERR, "kcunit %u > MAX_PACKET_MANGLER (%d)",
 		    kcunit, MAX_PACKET_MANGLER);
@@ -517,11 +479,6 @@ pkt_mnglr_ctl_setopt(kern_ctl_ref kctlref, u_int32_t kcunit, void *unitinfo,
 
 	pkt_mnglr_rw_lock_exclusive(&pkt_mnglr_lck_rw);
 
-	if (packet_manglers == NULL) {
-		PKT_MNGLR_LOG(LOG_ERR, "no packet filter");
-		error = EINVAL;
-		goto done;
-	}
 	if (kcunit > MAX_PACKET_MANGLER) {
 		PKT_MNGLR_LOG(LOG_ERR, "kcunit %u > MAX_PACKET_MANGLER (%d)",
 		    kcunit, MAX_PACKET_MANGLER);
@@ -708,27 +665,6 @@ pkt_mnglr_init(void)
 	_CASSERT(PKT_MNGLR_MAX_FILTER_COUNT == MAX_PACKET_MANGLER);
 
 	/*
-	 * Allocate locks
-	 */
-	pkt_mnglr_lck_grp_attr = lck_grp_attr_alloc_init();
-	if (pkt_mnglr_lck_grp_attr == NULL) {
-		panic("%s: lck_grp_attr_alloc_init failed", __func__);
-		/* NOTREACHED */
-	}
-	pkt_mnglr_lck_grp = lck_grp_alloc_init("packet manglerr",
-	    pkt_mnglr_lck_grp_attr);
-	if (pkt_mnglr_lck_grp == NULL) {
-		panic("%s: lck_grp_alloc_init failed", __func__);
-		/* NOTREACHED */
-	}
-	pkt_mnglr_lck_attr = lck_attr_alloc_init();
-	if (pkt_mnglr_lck_attr == NULL) {
-		panic("%s: lck_attr_alloc_init failed", __func__);
-		/* NOTREACHED */
-	}
-	lck_rw_init(&pkt_mnglr_lck_rw, pkt_mnglr_lck_grp, pkt_mnglr_lck_attr);
-
-	/*
 	 * Register kernel control
 	 */
 	bzero(&kern_ctl, sizeof(kern_ctl));
@@ -824,7 +760,7 @@ pktmnglr_ipfilter_input(void *cookie, mbuf_t *data, int offset, u_int8_t protoco
 	struct ip6_hdr ip6;
 	struct ip ip;
 	struct tcphdr tcp;
-	int ip_pld_len;
+	size_t ip_pld_len;
 	errno_t error = 0;
 
 	if (p_pkt_mnglr == NULL) {
@@ -907,7 +843,7 @@ pktmnglr_ipfilter_input(void *cookie, mbuf_t *data, int offset, u_int8_t protoco
 			/* Don't support IPv6 extension headers */
 			goto input_done;
 		}
-		ip_pld_len = ntohs(ip6.ip6_plen) + sizeof(struct ip6_hdr);
+		ip_pld_len = ntohs(ip6.ip6_plen);
 	} else {
 		goto input_done;
 	}
@@ -920,12 +856,12 @@ pktmnglr_ipfilter_input(void *cookie, mbuf_t *data, int offset, u_int8_t protoco
 
 	switch (protocol) {
 	case IPPROTO_TCP:
-		if (ip_pld_len < (int) sizeof(tcp)) {
-			PKT_MNGLR_LOG(LOG_ERR, "IP total len not big enough for TCP: %d", ip_pld_len);
+		if (ip_pld_len < sizeof(tcp)) {
+			PKT_MNGLR_LOG(LOG_ERR, "IP total len not big enough for TCP: %zu", ip_pld_len);
 			goto drop_it;
 		}
 
-		error = mbuf_copydata(*data, offset, sizeof(tcp), &tcp);
+		error = mbuf_copydata(*data, (size_t)offset, sizeof(tcp), &tcp);
 		if (error) {
 			PKT_MNGLR_LOG(LOG_ERR, "Could not make local TCP header copy");
 			goto input_done;
@@ -958,28 +894,27 @@ pktmnglr_ipfilter_input(void *cookie, mbuf_t *data, int offset, u_int8_t protoco
 	switch (protocol) {
 	case IPPROTO_TCP:
 		if (p_pkt_mnglr->proto_action_mask) {
-			char tcp_opt_buf[TCP_MAX_OPTLEN] = {0};
-			int orig_tcp_optlen;
-			int tcp_optlen = 0;
-			int i = 0, off;
+			unsigned char tcp_opt_buf[TCP_MAX_OPTLEN] = {0};
+			size_t orig_tcp_optlen;
+			size_t tcp_optlen = 0;
+			size_t i = 0, off;
 
 			off = (tcp.th_off << 2);
 
-			if (off < (int) sizeof(struct tcphdr) || off > ip_pld_len) {
-				PKT_MNGLR_LOG(LOG_ERR, "TCP header offset is wrong: %d", off);
+			if (off < sizeof(struct tcphdr) || off > ip_pld_len) {
+				PKT_MNGLR_LOG(LOG_ERR, "TCP header offset is wrong: %zu", off);
 				goto drop_it;
 			}
-
 
 			tcp_optlen = off - sizeof(struct tcphdr);
 
 			PKT_MNGLR_LOG(LOG_INFO, "Packet from F5 is TCP\n");
-			PKT_MNGLR_LOG(LOG_INFO, "Optlen: %d\n", tcp_optlen);
+			PKT_MNGLR_LOG(LOG_INFO, "Optlen: %zu\n", tcp_optlen);
 			orig_tcp_optlen = tcp_optlen;
 			if (orig_tcp_optlen) {
-				error = mbuf_copydata(*data, offset + sizeof(struct tcphdr), orig_tcp_optlen, tcp_opt_buf);
+				error = mbuf_copydata(*data, (size_t)offset + sizeof(struct tcphdr), orig_tcp_optlen, tcp_opt_buf);
 				if (error) {
-					PKT_MNGLR_LOG(LOG_ERR, "Failed to copy tcp options: error %d offset %d optlen %d", error, offset, orig_tcp_optlen);
+					PKT_MNGLR_LOG(LOG_ERR, "Failed to copy tcp options: error %d offset %d optlen %zu", error, offset, orig_tcp_optlen);
 					goto input_done;
 				}
 			}
@@ -991,25 +926,48 @@ pktmnglr_ipfilter_input(void *cookie, mbuf_t *data, int offset, u_int8_t protoco
 					i++;
 					continue;
 				} else if ((tcp_opt_buf[i] != 0) && (tcp_opt_buf[i] != TCP_OPT_MULTIPATH_TCP)) {
+					unsigned char optlen;
+
 					PKT_MNGLR_LOG(LOG_INFO, "Skipping option %x\n", tcp_opt_buf[i]);
 
+					if (tcp_optlen < 2) {
+						PKT_MNGLR_LOG(LOG_ERR, "Received short TCP option");
+						goto drop_it;
+					}
+
 					/* Minimum TCP option size is 2 */
-					if (tcp_opt_buf[i + 1] < 2) {
+					optlen = tcp_opt_buf[i + 1];
+					if (optlen < 2 || optlen > tcp_optlen) {
 						PKT_MNGLR_LOG(LOG_ERR, "Received suspicious TCP option");
 						goto drop_it;
 					}
-					tcp_optlen -= tcp_opt_buf[i + 1];
-					i += tcp_opt_buf[i + 1];
+					tcp_optlen -= optlen;
+					i += optlen;
 					continue;
 				} else if (tcp_opt_buf[i] == TCP_OPT_MULTIPATH_TCP) {
-					int j = 0;
-					unsigned char mptcpoptlen = tcp_opt_buf[i + 1];
-					uint8_t sbtver = tcp_opt_buf[i + MPTCP_SBT_VER_OFFSET];
-					uint8_t subtype = sbtver >> 4;
+					size_t j = 0;
+					unsigned char mptcpoptlen;
+					uint8_t sbtver;
+					uint8_t subtype;
+
+					if (tcp_optlen < 3) {
+						PKT_MNGLR_LOG(LOG_ERR, "Received short MPTCP option");
+						goto drop_it;
+					}
+
+					/* Minimum MPTCP option size is 3 */
+					mptcpoptlen = tcp_opt_buf[i + 1];
+					if (mptcpoptlen < 3 || mptcpoptlen > tcp_optlen) {
+						PKT_MNGLR_LOG(LOG_ERR, "Received suspicious MPTCP option");
+						goto drop_it;
+					}
+
+					sbtver = tcp_opt_buf[i + MPTCP_SBT_VER_OFFSET];
+					subtype = sbtver >> 4;
 
 					PKT_MNGLR_LOG(LOG_INFO, "Got MPTCP option %x\n", tcp_opt_buf[i]);
 					PKT_MNGLR_LOG(LOG_INFO, "Got MPTCP subtype %x\n", subtype);
-					if (subtype == MPTCP_SUBTYPE_DSS) {
+					if (subtype == MPO_DSS) {
 						PKT_MNGLR_LOG(LOG_INFO, "Got DSS option\n");
 						PKT_MNGLR_LOG(LOG_INFO, "Protocol option mask: %d\n", p_pkt_mnglr->proto_action_mask);
 						if (p_pkt_mnglr->proto_action_mask &
@@ -1035,12 +993,12 @@ pktmnglr_ipfilter_input(void *cookie, mbuf_t *data, int offset, u_int8_t protoco
 
 			if (orig_tcp_optlen) {
 				error = mbuf_copyback(*data,
-				    offset + sizeof(struct tcphdr),
+				    (size_t)offset + sizeof(struct tcphdr),
 				    orig_tcp_optlen, tcp_opt_buf, MBUF_WAITOK);
 
 				if (error) {
 					PKT_MNGLR_LOG(LOG_ERR,
-					    "Failed to copy tcp options back: error %d offset %d optlen %d",
+					    "Failed to copy tcp options back: error %d offset %d optlen %zu",
 					    error, offset, orig_tcp_optlen);
 					goto input_done;
 				}

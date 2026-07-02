@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2004-2020 Apple Inc. All rights reserved.
+ * Copyright (c) 2004-2021 Apple Inc. All rights reserved.
  *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
  *
@@ -41,6 +41,9 @@
 #include <net/route.h>
 #include <net/kpi_protocol.h>
 #include <net/net_api_stats.h>
+#if SKYWALK && defined(XNU_TARGET_OS_OSX)
+#include <skywalk/lib//net_filter_event.h>
+#endif /* SKYWALK && XNU_TARGET_OS_OSX */
 
 #include <netinet/in_systm.h>
 #include <netinet/in.h>
@@ -54,6 +57,10 @@
 
 #include <stdbool.h>
 
+#if SKYWALK
+#include <skywalk/core/skywalk_var.h>
+#endif /* SKYWALK */
+
 /*
  * kipf_lock and kipf_ref protect the linkage of the list of IP filters
  * An IP filter can be removed only when kipf_ref is zero
@@ -61,8 +68,8 @@
  * the IP filter is marjed and kipf_delayed_remove is set so that when
  * kipf_ref eventually goes down to zero, the IP filter is removed
  */
-decl_lck_mtx_data(static, kipf_lock_data);
-static lck_mtx_t *kipf_lock = &kipf_lock_data;
+static LCK_GRP_DECLARE(kipf_lock_grp, "IP Filter");
+static LCK_MTX_DECLARE(kipf_lock, &kipf_lock_grp);
 static u_int32_t kipf_ref = 0;
 static u_int32_t kipf_delayed_remove = 0;
 u_int32_t kipf_count = 0;
@@ -81,20 +88,24 @@ extern errno_t ipf_addv6(const struct ipf_filter *filter,
 static errno_t ipf_add(const struct ipf_filter *filter,
     ipfilter_t *filter_ref, struct ipfilter_list *head, bool is_internal);
 
+#if SKYWALK && defined(XNU_TARGET_OS_OSX)
+static bool net_check_compatible_ipf(void);
+#endif /* SKYWALK && XNU_TARGET_OS_OSX */
+
 __private_extern__ void
 ipf_ref(void)
 {
-	lck_mtx_lock(kipf_lock);
+	lck_mtx_lock(&kipf_lock);
 	if (os_inc_overflow(&kipf_ref)) {
 		panic("kipf_ref overflow");
 	}
-	lck_mtx_unlock(kipf_lock);
+	lck_mtx_unlock(&kipf_lock);
 }
 
 __private_extern__ void
 ipf_unref(void)
 {
-	lck_mtx_lock(kipf_lock);
+	lck_mtx_lock(&kipf_lock);
 
 	if (os_dec_overflow(&kipf_ref)) {
 		panic("kipf_ref underflow");
@@ -105,6 +116,9 @@ ipf_unref(void)
 
 		while ((filter = TAILQ_FIRST(&tbr_filters))) {
 			VERIFY(OSDecrementAtomic64(&net_api_stats.nas_ipf_add_count) > 0);
+			if (filter->ipf_flags & IPFF_INTERNAL) {
+				VERIFY(OSDecrementAtomic64(&net_api_stats.nas_ipf_add_os_count) > 0);
+			}
 
 			ipf_detach_func ipf_detach = filter->ipf_filter.ipf_detach;
 			void* cookie = filter->ipf_filter.cookie;
@@ -114,9 +128,9 @@ ipf_unref(void)
 			kipf_delayed_remove--;
 
 			if (ipf_detach) {
-				lck_mtx_unlock(kipf_lock);
+				lck_mtx_unlock(&kipf_lock);
 				ipf_detach(cookie);
-				lck_mtx_lock(kipf_lock);
+				lck_mtx_lock(&kipf_lock);
 				/* In case some filter got to run while we released the lock */
 				if (kipf_ref != 0) {
 					break;
@@ -124,7 +138,11 @@ ipf_unref(void)
 			}
 		}
 	}
-	lck_mtx_unlock(kipf_lock);
+#if SKYWALK && defined(XNU_TARGET_OS_OSX)
+	net_filter_event_mark(NET_FILTER_EVENT_IP,
+	    net_check_compatible_ipf());
+#endif /* SKYWALK && XNU_TARGET_OS_OSX */
+	lck_mtx_unlock(&kipf_lock);
 }
 
 static errno_t
@@ -139,12 +157,9 @@ ipf_add(
 		return EINVAL;
 	}
 
-	MALLOC(new_filter, struct ipfilter *, sizeof(*new_filter), M_IFADDR, M_WAITOK);
-	if (new_filter == NULL) {
-		return ENOMEM;
-	}
+	new_filter = kalloc_type(struct ipfilter, Z_WAITOK | Z_NOFAIL);
 
-	lck_mtx_lock(kipf_lock);
+	lck_mtx_lock(&kipf_lock);
 	new_filter->ipf_filter = *filter;
 	new_filter->ipf_head = head;
 
@@ -153,10 +168,16 @@ ipf_add(
 	OSIncrementAtomic64(&net_api_stats.nas_ipf_add_count);
 	INC_ATOMIC_INT64_LIM(net_api_stats.nas_ipf_add_total);
 	if (is_internal) {
+		new_filter->ipf_flags = IPFF_INTERNAL;
+		OSIncrementAtomic64(&net_api_stats.nas_ipf_add_os_count);
 		INC_ATOMIC_INT64_LIM(net_api_stats.nas_ipf_add_os_total);
 	}
+#if SKYWALK && defined(XNU_TARGET_OS_OSX)
+	net_filter_event_mark(NET_FILTER_EVENT_IP,
+	    net_check_compatible_ipf());
+#endif /* SKYWALK && XNU_TARGET_OS_OSX */
 
-	lck_mtx_unlock(kipf_lock);
+	lck_mtx_unlock(&kipf_lock);
 
 	*filter_ref = (ipfilter_t)new_filter;
 
@@ -236,7 +257,7 @@ ipf_remove(
 
 	head = match->ipf_head;
 
-	lck_mtx_lock(kipf_lock);
+	lck_mtx_lock(&kipf_lock);
 	TAILQ_FOREACH(match, head, ipf_link) {
 		if (match == (struct ipfilter *)filter_ref) {
 			ipf_detach_func ipf_detach = match->ipf_filter.ipf_detach;
@@ -250,17 +271,20 @@ ipf_remove(
 				TAILQ_INSERT_TAIL(&tbr_filters, match, ipf_tbr);
 				match->ipf_filter.ipf_input = ipf_input_detached;
 				match->ipf_filter.ipf_output = ipf_output_detached;
-				lck_mtx_unlock(kipf_lock);
+				lck_mtx_unlock(&kipf_lock);
 			} else {
 				VERIFY(OSDecrementAtomic64(&net_api_stats.nas_ipf_add_count) > 0);
+				if (match->ipf_flags & IPFF_INTERNAL) {
+					VERIFY(OSDecrementAtomic64(&net_api_stats.nas_ipf_add_os_count) > 0);
+				}
 
 				TAILQ_REMOVE(head, match, ipf_link);
-				lck_mtx_unlock(kipf_lock);
+				lck_mtx_unlock(&kipf_lock);
 
 				if (ipf_detach) {
 					ipf_detach(cookie);
 				}
-				FREE(match, M_IFADDR);
+				kfree_type(struct ipfilter, match);
 
 				/* This will force TCP to re-evaluate its use of TSO */
 				OSAddAtomic(-1, &kipf_count);
@@ -269,7 +293,12 @@ ipf_remove(
 			return 0;
 		}
 	}
-	lck_mtx_unlock(kipf_lock);
+#if SKYWALK && defined(XNU_TARGET_OS_OSX)
+	net_filter_event_mark(NET_FILTER_EVENT_IP,
+	    net_check_compatible_ipf());
+#endif /* SKYWALK && XNU_TARGET_OS_OSX */
+
+	lck_mtx_unlock(&kipf_lock);
 
 	return ENOENT;
 }
@@ -315,14 +344,14 @@ ipf_inject_input(
 		switch (proto) {
 		case PF_INET:
 			pkt_dst = &ip->ip_dst;
-			lck_rw_lock_shared(in_ifaddr_rwlock);
+			lck_rw_lock_shared(&in_ifaddr_rwlock);
 			TAILQ_FOREACH(ia, INADDR_HASH(pkt_dst->s_addr), ia_hash) {
 				if (IA_SIN(ia)->sin_addr.s_addr == pkt_dst->s_addr) {
 					m->m_pkthdr.rcvif = ia->ia_ifp;
 					break;
 				}
 			}
-			lck_rw_done(in_ifaddr_rwlock);
+			lck_rw_done(&in_ifaddr_rwlock);
 			break;
 
 		case PF_INET6:
@@ -536,6 +565,8 @@ ipf_injectv6_out(mbuf_t data, ipfilter_t filter_ref, ipf_pktopts_t options)
 	 * of ifscope information is done while searching for a route in
 	 * ip6_output.
 	 */
+	ip6_output_setsrcifscope(m, IFSCOPE_UNKNOWN, NULL);
+	ip6_output_setdstifscope(m, IFSCOPE_UNKNOWN, NULL);
 	error = ip6_output(m, NULL, &ro, IPV6_OUTARGS, im6o, NULL, &ip6oa);
 
 	/* Release the route */
@@ -557,6 +588,10 @@ ipf_inject_output(
 	struct mbuf     *m = (struct mbuf *)data;
 	u_int8_t        vers;
 	errno_t         error = 0;
+
+#if SKYWALK
+	sk_protect_t protect = sk_async_transmit_protect();
+#endif /* SKYWALK */
 
 	/* Make one byte of the header contiguous in the mbuf */
 	if (m->m_len < 1) {
@@ -581,6 +616,10 @@ ipf_inject_output(
 	}
 
 done:
+#if SKYWALK
+	sk_async_transmit_unprotect(protect);
+#endif /* SKYWALK */
+
 	return error;
 }
 
@@ -599,50 +638,13 @@ ipf_get_inject_filter(struct mbuf *m)
 	return filter_ref;
 }
 
-__private_extern__ int
-ipf_init(void)
+#if SKYWALK && defined(XNU_TARGET_OS_OSX)
+bool
+net_check_compatible_ipf(void)
 {
-	int error = 0;
-	lck_grp_attr_t *grp_attributes = 0;
-	lck_attr_t *lck_attributes = 0;
-	lck_grp_t *lck_grp = 0;
-
-	grp_attributes = lck_grp_attr_alloc_init();
-	if (grp_attributes == 0) {
-		printf("ipf_init: lck_grp_attr_alloc_init failed\n");
-		error = ENOMEM;
-		goto done;
+	if (net_api_stats.nas_ipf_add_count > net_api_stats.nas_ipf_add_os_count) {
+		return false;
 	}
-
-	lck_grp = lck_grp_alloc_init("IP Filter", grp_attributes);
-	if (lck_grp == 0) {
-		printf("ipf_init: lck_grp_alloc_init failed\n");
-		error = ENOMEM;
-		goto done;
-	}
-
-	lck_attributes = lck_attr_alloc_init();
-	if (lck_attributes == 0) {
-		printf("ipf_init: lck_attr_alloc_init failed\n");
-		error = ENOMEM;
-		goto done;
-	}
-
-	lck_mtx_init(kipf_lock, lck_grp, lck_attributes);
-
-done:
-	if (lck_grp) {
-		lck_grp_free(lck_grp);
-		lck_grp = 0;
-	}
-	if (grp_attributes) {
-		lck_grp_attr_free(grp_attributes);
-		grp_attributes = 0;
-	}
-	if (lck_attributes) {
-		lck_attr_free(lck_attributes);
-		lck_attributes = 0;
-	}
-
-	return error;
+	return true;
 }
+#endif /* SKYWALK && XNU_TARGET_OS_OSX */

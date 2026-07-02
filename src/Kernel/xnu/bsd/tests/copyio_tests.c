@@ -252,7 +252,7 @@ copyinstr_test(struct copyio_test_data *data)
 	data->thread_ptr = &lencopied;
 
 	err = copyio_test_run_in_thread(copyinstr_from_kernel, data);
-#if defined(__arm__) || defined (__arm64__)
+#if defined (__arm64__)
 	T_EXPECT_EQ_INT(err, EFAULT, "copyinstr() from kernel address in kernel_task thread should return EFAULT");
 #else
 	T_EXPECT_EQ_INT(err, 0, "copyinstr() from kernel address in kernel_task thread should succeed");
@@ -324,7 +324,7 @@ copyoutstr_test(struct copyio_test_data *data)
 	data->thread_ptr = &lencopied;
 
 	err = copyio_test_run_in_thread(copyoutstr_to_kernel, data);
-#if defined(__arm__) || defined (__arm64__)
+#if defined (__arm64__)
 	T_EXPECT_EQ_INT(err, EFAULT, "copyoutstr() to kernel address in kernel_task thread should return EFAULT");
 #else
 	T_EXPECT_EQ_INT(err, 0, "copyoutstr() to kernel address in kernel_task thread should succeed");
@@ -495,8 +495,8 @@ copyio_test(void)
 	mach_vm_offset_t user_addr = 0;
 	kern_return_t ret = KERN_SUCCESS;
 
-	data.buf1 = kalloc(copyio_test_buf_size);
-	data.buf2 = kalloc(copyio_test_buf_size);
+	data.buf1 = kalloc_data(copyio_test_buf_size, Z_WAITOK);
+	data.buf2 = kalloc_data(copyio_test_buf_size, Z_WAITOK);
 	if (!data.buf1 || !data.buf2) {
 		T_FAIL("failed to allocate scratch buffers");
 		ret = KERN_NO_SPACE;
@@ -511,8 +511,8 @@ copyio_test(void)
 	 * not to the point of actually execing yet.
 	 */
 	proc_t proc = current_proc();
-	assert(proc->p_pid == 1);
-	data.user_map = get_task_map_reference(proc->task);
+	assert(proc_getpid(proc) == 1);
+	data.user_map = get_task_map_reference(proc_task(proc));
 
 	user_addr = data.user_addr;
 	ret = mach_vm_allocate_kernel(data.user_map, &user_addr, copyio_test_buf_size + PAGE_SIZE, VM_FLAGS_ANYWHERE, VM_KERN_MEMORY_NONE);
@@ -559,7 +559,7 @@ err_user_lastpage_alloc:
 err_user_alloc:
 	vm_map_deallocate(data.user_map);
 err_kalloc:
-	kfree(data.buf2, copyio_test_buf_size);
-	kfree(data.buf1, copyio_test_buf_size);
+	kfree_data(data.buf2, copyio_test_buf_size);
+	kfree_data(data.buf1, copyio_test_buf_size);
 	return ret;
 }

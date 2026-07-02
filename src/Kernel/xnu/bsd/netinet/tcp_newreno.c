@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2010-2014 Apple Inc. All rights reserved.
+ * Copyright (c) 2010-2021 Apple Inc. All rights reserved.
  *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
  *
@@ -60,26 +60,19 @@
  *      @(#)tcp_input.c 8.12 (Berkeley) 5/24/95
  * $FreeBSD: src/sys/netinet/tcp_input.c,v 1.107.2.16 2001/08/22 00:59:12 silby Exp $
  */
+
+#include "tcp_includes.h"
+
 #include <sys/param.h>
-#include <sys/systm.h>
 #include <sys/kernel.h>
-#include <sys/protosw.h>
 #include <sys/socketvar.h>
 
 #include <net/route.h>
 #include <netinet/in.h>
 #include <netinet/in_systm.h>
 #include <netinet/ip.h>
-
 #include <netinet/ip6.h>
 #include <netinet/ip_var.h>
-#include <netinet/tcp.h>
-#include <netinet/tcp_fsm.h>
-#include <netinet/tcp_timer.h>
-#include <netinet/tcp_var.h>
-#include <netinet/tcpip.h>
-#include <netinet/tcp_cc.h>
-#include <libkern/OSAtomic.h>
 
 int tcp_newreno_init(struct tcpcb *tp);
 int tcp_newreno_cleanup(struct tcpcb *tp);
@@ -91,7 +84,7 @@ void tcp_newreno_post_fr(struct tcpcb *tp, struct tcphdr *th);
 void tcp_newreno_after_idle(struct tcpcb *tp);
 void tcp_newreno_after_timeout(struct tcpcb *tp);
 int tcp_newreno_delay_ack(struct tcpcb *tp, struct tcphdr *th);
-void tcp_newreno_switch_cc(struct tcpcb *tp, uint16_t old_index);
+void tcp_newreno_switch_cc(struct tcpcb *tp);
 
 struct tcp_cc_algo tcp_cc_newreno = {
 	.name = "newreno",
@@ -112,7 +105,7 @@ int
 tcp_newreno_init(struct tcpcb *tp)
 {
 #pragma unused(tp)
-	OSIncrementAtomic((volatile SInt32 *)&tcp_cc_newreno.num_sockets);
+	os_atomic_inc(&tcp_cc_newreno.num_sockets, relaxed);
 	return 0;
 }
 
@@ -120,7 +113,7 @@ int
 tcp_newreno_cleanup(struct tcpcb *tp)
 {
 #pragma unused(tp)
-	OSDecrementAtomic((volatile SInt32 *)&tcp_cc_newreno.num_sockets);
+	os_atomic_dec(&tcp_cc_newreno.num_sockets, relaxed);
 	return 0;
 }
 
@@ -328,10 +321,8 @@ tcp_newreno_delay_ack(struct tcpcb *tp, struct tcphdr *th)
  * window and let newreno work from there.
  */
 void
-tcp_newreno_switch_cc(struct tcpcb *tp, uint16_t old_index)
+tcp_newreno_switch_cc(struct tcpcb *tp)
 {
-#pragma unused(old_index)
-
 	uint32_t cwnd = min(tp->snd_wnd, tp->snd_cwnd);
 	if (tp->snd_cwnd >= tp->snd_ssthresh) {
 		cwnd = cwnd / tp->t_maxseg;
@@ -343,5 +334,5 @@ tcp_newreno_switch_cc(struct tcpcb *tp, uint16_t old_index)
 	/* Start counting bytes for RFC 3465 again */
 	tp->t_bytes_acked = 0;
 
-	OSIncrementAtomic((volatile SInt32 *)&tcp_cc_newreno.num_sockets);
+	os_atomic_inc(&tcp_cc_newreno.num_sockets, relaxed);
 }

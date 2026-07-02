@@ -270,15 +270,15 @@ _bsdthread_create(struct proc *p,
 
 	PTHREAD_TRACE(pthread_thread_create | DBG_FUNC_START, flags, 0, 0, 0);
 
-	kret = pthread_kern->thread_create(ctask, &th);
+	kret = pthread_kern->thread_create_immovable(ctask, &th);
 	if (kret != KERN_SUCCESS)
 		return(ENOMEM);
 	thread_reference(th);
 
 	pthread_kern->thread_set_tag(th, THREAD_TAG_PTHREAD);
 
-	sright = (void *)pthread_kern->convert_thread_to_port(th);
-	th_thport = pthread_kern->ipc_port_copyout_send(sright, pthread_kern->task_get_ipcspace(ctask));
+	sright = (void *)pthread_kern->convert_thread_to_port_pinned(th);
+	th_thport = pthread_kern->ipc_port_copyout_send_pinned(sright, pthread_kern->task_get_ipcspace(ctask));
 	if (!MACH_PORT_VALID(th_thport)) {
 		error = EMFILE; // userland will convert this into a crash
 		goto out;

@@ -5,30 +5,8 @@
 #ifndef __IMG4_FIRMWARE_H
 #define __IMG4_FIRMWARE_H
 
-#include <os/base.h>
-#include <stdint.h>
-#include <stdbool.h>
-#include <sys/cdefs.h>
-
-__BEGIN_DECLS;
-
-#if !KERNEL
-#include <os/stdio.h>
-#endif
-
-#if !_DARWIN_BUILDING_PROJECT_APPLEIMAGE4
-#if __has_include(<os/linker_set.h>) && !KERNEL
-#include <os/linker_set.h>
-#elif XNU_KERNEL_PRIVATE
-// There is no linker set header in the KDK, and the one from the SDK is not
-// safe for kexts to use.
-//
-// <rdar://problem/64576673>
-#include <sys/linker_set.h>
-#else
-#define LINKER_SET_ENTRY(...)
-#endif
-#endif // !_DARWIN_BUILDING_PROJECT_APPLEIMAGE4
+#define __IMG4_INDIRECT 1
+#include <img4/api.h>
 
 /*!
  * @discussion
@@ -43,6 +21,7 @@ __BEGIN_DECLS;
  *        we don't get the transitive #include of <sys/types.h> but we still get
  *        the definitions we need
  */
+#if IMG4_TARGET_XNU
 #if MACH_KERNEL_PRIVATE
 #define _SYS_TYPES_H_ 1
 #include <sys/kernel_types.h>
@@ -52,13 +31,19 @@ __BEGIN_DECLS;
 #include <sys/types.h>
 #endif
 
-#define __IMG4_INDIRECT 1
-#include <img4/api.h>
+#if XNU_KERNEL_PRIVATE
+#include <img4/4xnu.h>
+#endif
+#endif // IMG4_TARGET_XNU
 
-#if IMG4_TAPI
-#include "tapi.h"
+#if IMG4_TARGET_DARWIN
+#include <os/stdio.h>
+#include <sys/types.h>
+#include <img4/4ignition.h>
+#include <img4/4MSU.h>
 #endif
 
+__BEGIN_DECLS
 OS_ASSUME_NONNULL_BEGIN
 
 /*!
@@ -76,6 +61,119 @@ typedef uint32_t img4_4cc_t;
  */
 IMG4_API_AVAILABLE_20200508
 typedef struct _img4_buff img4_buff_t;
+
+/*!
+ * @const IMG4_DGST_STRUCT_VERSION
+ * The version of the {@link img4_dgst_t} structure supported by the
+ * implementation.
+ */
+#define IMG4_DGST_STRUCT_VERSION (0u)
+
+/*!
+ * @const IMG4_DGST_MAX_LEN
+ * The maximum length of a digest representable by an {@link img4_dgst_t}.
+ */
+#define IMG4_DGST_MAX_LEN (48u)
+
+/*!
+ * @typedef img4_dgst_t
+ * A type representing an Image4 identifier which is a digest.
+ *
+ * @field i4d_len
+ * The version of the structure. Initialize to {@link IMG4_DGST_STRUCT_VERSION}.
+ *
+ * @field i4d_len
+ * The length of the digest.
+ *
+ * @field i4d_bytes
+ * The digest bytes.
+ */
+IMG4_API_AVAILABLE_20200508
+typedef struct _img4_dgst {
+	img4_struct_version_t i4d_version;
+	size_t i4d_len;
+	uint8_t i4d_bytes[IMG4_DGST_MAX_LEN];
+} img4_dgst_t;
+
+/*!
+ * @const IMG4_DGST_INIT
+ * A convenience initializer for an {@link img4_dgst_t} structure.
+ */
+#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 199901L
+#define IMG4_DGST_INIT (img4_dgst_t){ \
+	.i4d_version = IMG4_DGST_STRUCT_VERSION, \
+	.i4d_len = 0, \
+	.i4d_bytes = {0}, \
+}
+#elif defined(__cplusplus) && __cplusplus >= 201103L
+#define IMG4_DGST_INIT (img4_dgst_t{ \
+	IMG4_DGST_STRUCT_VERSION, \
+	0, \
+	{0}, \
+})
+#elif defined(__cplusplus)
+#define IMG4_DGST_INIT (img4_nonce_t((img4_nonce_t){ \
+	IMG4_DGST_STRUCT_VERSION, \
+	0, \
+	{0}, \
+}))
+#else
+#define IMG4_DGST_INIT {IMG4_DGST_STRUCT_VERSION}
+#endif
+
+/*!
+ * @struct _img4_cstr
+ * A type representing an Image4 identifier which is a C-string. These
+ * identifiers can be no more than 64 bytes in length, including the null
+ * terminating byte.
+ *
+ * @field i4b_len
+ * The length of the C-string, not including the null terminating byte.
+ *
+ * @field i4b_cstr
+ * The null-terminated C-string.
+ *
+ * @discussion
+ * This structure is intentionally unversioned. It should never evolve into
+ * anything more complex than it is.
+ */
+IMG4_API_AVAILABLE_20210113
+typedef struct _img4_cstr {
+	size_t i4cs_len;
+	char i4cs_cstr[64];
+} img4_cstr_t;
+
+/*!
+ * @const IMG4_CSTR_INIT
+ * A convenience initializer for an {@link img4_cstr_t}.
+ */
+#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 199901L
+#define IMG4_CSTR_INIT (img4_cstr_t){ \
+	.i4cs_len = 0, \
+	.i4cs_cstr = {0}, \
+}
+#elif defined(__cplusplus) && __cplusplus >= 201103L
+#define IMG4_CSTR_INIT (img4_cstr_t{ \
+	0, \
+	{0}, \
+})
+#elif defined(__cplusplus)
+#define IMG4_CSTR_INIT \
+		(img4_cstr_t((img4_cstr_t){ \
+	0, \
+	{0}, \
+}))
+#else
+#define IMG4_CSTR_INIT {0}
+#endif
+
+/*!
+ * @typedef img4_chip_t
+ * An opaque type describing a destination chip environment for the firmware
+ * image.
+ */
+IMG4_API_AVAILABLE_20200508
+typedef struct _img4_chip img4_chip_t;
 
 /*!
  * @typedef img4_firmware_t
@@ -101,14 +199,17 @@ typedef struct _img4_runtime img4_runtime_t;
 
 OS_ASSUME_NONNULL_END
 
-#if !_DARWIN_BUILDING_PROJECT_APPLEIMAGE4 || IMG4_TAPI
-#define __IMG4_INDIRECT 1
 #include <img4/nonce.h>
 #include <img4/object.h>
 #include <img4/chip.h>
+#include <img4/chip_ap.h>
+#include <img4/chip_ap_category.h>
+#include <img4/chip_ap_software.h>
+#include <img4/chip_cryptex1.h>
+#include <img4/chip_sep.h>
+#include <img4/chip_x86.h>
 #include <img4/image.h>
 #include <img4/runtime.h>
-#endif
 
 OS_ASSUME_NONNULL_BEGIN
 
@@ -158,12 +259,21 @@ typedef void (*img4_firmware_authenticated_execute_t)(
 	void *_ctx
 );
 
+#if IMG4_TARGET_EFI
+typedef void (*img4_firmware_authenticated_execute_efi_t)(
+	const img4_firmware_t fw,
+	img4_image_t _Nullable image,
+	EFI_STATUS status,
+	void *_ctx
+);
+#endif
+
 /*!
  * @define IMG4_FIRMWARE_EXECUTION_CONTEXT_STRUCT_VERSION
  * The version of the {@link img4_firmware_execution_context_t} structure
  * supported by the implementation.
  */
-#define IMG4_FIRMWARE_EXECUTION_CONTEXT_STRUCT_VERSION (0u)
+#define IMG4_FIRMWARE_EXECUTION_CONTEXT_STRUCT_VERSION (1u)
 
 /*!
  * @typedef img4_firmware_execution_context_t
@@ -176,6 +286,17 @@ typedef void (*img4_firmware_authenticated_execute_t)(
  * @field i4fex_execute
  * A pointer to the firmware execution function.
  *
+ * @field i4fex_execute_efi
+ * A pointer to the EFI-specific firmware execution function. This is only
+ * available in the EFI environment. If both this field and
+ * {@link i4fex_execute} are specified in the execution context, the
+ * one which is called by the implementation will be undefined.
+ *
+ * This field was added in version 1 of the structure. It was not appended to
+ * the end of the structure since the non-EFI structure did not change, and the
+ * structure did not previously exist in the EFI environment. The version
+ * increment was not strictly necessary, but was done for hygienic reasons.
+ *
  * @field i4fex_context
  * A caller-provided context pointer that will be passed to functions invoked
  * from the execution context.
@@ -184,6 +305,9 @@ IMG4_API_AVAILABLE_20200508
 typedef struct _img4_firmware_execution_context {
 	img4_struct_version_t i4fex_version;
 	img4_firmware_authenticated_execute_t i4fex_execute;
+#if IMG4_TARGET_EFI
+	img4_firmware_authenticated_execute_efi_t i4fex_execute_efi;
+#endif
 	void *i4fex_context;
 } img4_firmware_execution_context_t;
 
@@ -219,6 +343,15 @@ typedef struct _img4_firmware_execution_context {
  *
  * This flag has no effect if {@link IMG4_FIRMWARE_FLAG_SUBSEQUENT_STAGE} is
  * also passed.
+ *
+ * @const IMG4_FIRMWARE_FLAG_PASSTHROUGH
+ * Causes the wrapped payload bytes to be delivered to the image execution
+ * callback. These bytes do not have the Image4 wrapping stripped.
+ *
+ * @const IMG4_FIRMWARE_FLAG_FORCE_ANTI_REPLAY
+ * Force anti-replay enforcement even when performing just manifest evaluation
+ * without executing a firmware. When executing a firmware, this flag need not
+ * be passed in since anti-replay enforcement is always enabled.
  */
 IMG4_API_AVAILABLE_20200508
 OS_CLOSED_OPTIONS(img4_firmware_flags, uint64_t,
@@ -227,6 +360,8 @@ OS_CLOSED_OPTIONS(img4_firmware_flags, uint64_t,
 	IMG4_FIRMWARE_FLAG_BARE = (1 << 1),
 	IMG4_FIRMWARE_FLAG_SUBSEQUENT_STAGE = (1 << 2),
 	IMG4_FIRMWARE_FLAG_RESPECT_AMNM = (1 << 3),
+	IMG4_FIRMWARE_FLAG_PASSTHROUGH = (1 << 4),
+	IMG4_FIRMWARE_FLAG_FORCE_ANTI_REPLAY = (1 << 5),
 );
 
 /*!
@@ -250,7 +385,8 @@ OS_CLOSED_OPTIONS(img4_firmware_flags, uint64_t,
  * Flags modifying the behavior of the object.
  *
  * @result
- * A new firmware object or NULL if there was an allocation failure.
+ * A new firmware object or NULL if there was an allocation failure. If
+ * {@link rt} has a NULL allocation function, NULL is returned.
  *
  * @discussion
  * The resulting object assumes ownership of the given buffer.
@@ -306,7 +442,7 @@ img4_firmware_new(const img4_runtime_t *rt,
  * Firmwares created with this interface cannot be created with the
  * {@link IMG4_FIRMWARE_FLAG_ATTACHED_MANIFEST} flag.
  */
-#if KERNEL
+#if IMG4_TARGET_XNU
 #if !XNU_KERNEL_PRIVATE
 IMG4_API_AVAILABLE_20200508
 OS_EXPORT OS_WARN_RESULT OS_MALLOC OS_NONNULL1 OS_NONNULL2 OS_NONNULL4
@@ -320,7 +456,7 @@ img4_firmware_new_from_vnode_4xnu(const img4_runtime_t *rt,
 #define img4_firmware_new_from_vnode_4xnu(...) \
 		(img4if->i4if_v7.firmware_new_from_vnode_4xnu(__VA_ARGS__))
 #endif // !XNU_KERNEL_PRIVATE
-#endif // !KERNEL
+#endif // IMG4_TARGET_XNU
 
 /*!
  * @function img4_firmware_new_from_fd_4MSM
@@ -350,7 +486,7 @@ img4_firmware_new_from_vnode_4xnu(const img4_runtime_t *rt,
  * This interface is the userspace equivalent of
  * {@link img4_firmware_new_from_vnode_4xnu}, and all the same caveats apply.
  */
-#if !KERNEL
+#if IMG4_TARGET_DARWIN
 IMG4_API_AVAILABLE_20200508
 OS_EXPORT OS_WARN_RESULT OS_MALLOC OS_NONNULL1 OS_NONNULL2
 img4_firmware_t
@@ -438,6 +574,44 @@ img4_firmware_init(img4_firmware_t fw,
 		img4_firmware_flags_t flags);
 #else
 #define img4_firmware_init(...) (img4if->i4if_v7.firmware_init(__VA_ARGS__))
+#endif
+
+/*!
+ * @function img4_firmware_init_sentinel
+ * Initialize a firmware object as a sentinel without any manifest attached.
+ * This firmware has no object tag and is not executable. It is only suitable
+ * for use with {@link img4_firmware_attach_manifest} and
+ * {@link img4_firmware_evaluate} to determine whether a manifest is acceptable
+ * to a particular chip environment.
+ *
+ * @param fw
+ * A pointer to the storage for the firmware object. This pointer should refer
+ * to a region of memory that is sufficient to hold a {@link img4_firmware_t}
+ * object. This size should be queried with the {@link i4rt_object_size}
+ * function of the runtime.
+ *
+ * @param rt
+ * The runtime in which to initialize the object.
+ *
+ * @param flags
+ * Flags modifying the behavior of the object.
+ *
+ * @discussion
+ * Sentinel firmwares do not enforce anti-replay, so
+ * {@link img4_firmware_evaluate} will not return ESTALE when evaluating such
+ * firmwares. Anti-replay enforcement can be enabled by using
+ * {@link IMG4_FIRMWARE_FLAG_FORCE_ANTI_REPLAY}.
+ */
+#if !XNU_KERNEL_PRIVATE
+IMG4_API_AVAILABLE_20211126
+OS_EXPORT OS_NONNULL1 OS_NONNULL2
+void
+img4_firmware_init_sentinel(img4_firmware_t fw,
+		const img4_runtime_t *rt,
+		img4_firmware_flags_t flags);
+#else
+#define img4_firmware_init_sentinel(...) \
+		(img4if->i4if_v17.firmware_init_sentinel(__VA_ARGS__))
 #endif
 
 /*!
@@ -594,6 +768,10 @@ img4_firmware_execute(img4_firmware_t fw,
  *     [ENOEXEC]    The firmware has been corrupted, or the given chip does not
  *                  satisfy the constraints of the corresponding object in the
  *                  attached manifest
+ *     [EPWROFF]    The chip environment has not yet booted; most chip
+ *                  environments are booted and available by the time the caller
+ *                  has begun executing, but some require additional
+ *                  initialization before they can execute objects
  *
  * @discussion
  * This interface should be used when the caller is only concerned with the
@@ -643,7 +821,6 @@ img4_firmware_destroy(img4_firmware_t _Nonnull *_Nullable fw);
 #endif
 
 OS_ASSUME_NONNULL_END
-
-__END_DECLS;
+__END_DECLS
 
 #endif // __IMG4_FIRMWARE_H

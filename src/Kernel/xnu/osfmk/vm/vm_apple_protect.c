@@ -48,6 +48,8 @@
 #include <kern/ipc_kobject.h>
 #include <os/refcnt.h>
 
+#include <sys/kdebug_triage.h>
+
 #include <ipc/ipc_port.h>
 #include <ipc/ipc_space.h>
 
@@ -101,14 +103,6 @@ kern_return_t apple_protect_pager_data_return(memory_object_t mem_obj,
 kern_return_t apple_protect_pager_data_initialize(memory_object_t mem_obj,
     memory_object_offset_t offset,
     memory_object_cluster_size_t data_cnt);
-kern_return_t apple_protect_pager_data_unlock(memory_object_t mem_obj,
-    memory_object_offset_t offset,
-    memory_object_size_t size,
-    vm_prot_t desired_access);
-kern_return_t apple_protect_pager_synchronize(memory_object_t mem_obj,
-    memory_object_offset_t offset,
-    memory_object_size_t length,
-    vm_sync_t sync_flags);
 kern_return_t apple_protect_pager_map(memory_object_t mem_obj,
     vm_prot_t prot);
 kern_return_t apple_protect_pager_last_unmap(memory_object_t mem_obj);
@@ -134,11 +128,8 @@ const struct memory_object_pager_ops apple_protect_pager_ops = {
 	.memory_object_data_request = apple_protect_pager_data_request,
 	.memory_object_data_return = apple_protect_pager_data_return,
 	.memory_object_data_initialize = apple_protect_pager_data_initialize,
-	.memory_object_data_unlock = apple_protect_pager_data_unlock,
-	.memory_object_synchronize = apple_protect_pager_synchronize,
 	.memory_object_map = apple_protect_pager_map,
 	.memory_object_last_unmap = apple_protect_pager_last_unmap,
-	.memory_object_data_reclaim = NULL,
 	.memory_object_backing_object = apple_protect_pager_backing_object,
 	.memory_object_pager_name = "apple_protect"
 };
@@ -318,16 +309,6 @@ apple_protect_pager_data_initialize(
 	return KERN_FAILURE;
 }
 
-kern_return_t
-apple_protect_pager_data_unlock(
-	__unused memory_object_t        mem_obj,
-	__unused memory_object_offset_t offset,
-	__unused memory_object_size_t           size,
-	__unused vm_prot_t              desired_access)
-{
-	return KERN_FAILURE;
-}
-
 /*
  * apple_protect_pager_data_request()
  *
@@ -456,7 +437,6 @@ retry_src_fault:
 		    NULL,
 		    &error_code,
 		    FALSE,
-		    FALSE,
 		    &fault_info);
 		switch (kr) {
 		case VM_FAULT_SUCCESS:
@@ -467,6 +447,7 @@ retry_src_fault:
 			if (vm_page_wait(interruptible)) {
 				goto retry_src_fault;
 			}
+			ktriage_record(thread_tid(current_thread()), KDBG_TRIAGE_EVENTID(KDBG_TRIAGE_SUBSYS_APPLE_PROTECT_PAGER, KDBG_TRIAGE_RESERVED, KDBG_TRIAGE_APPLE_PROTECT_PAGER_MEMORY_SHORTAGE), 0 /* arg */);
 			OS_FALLTHROUGH;
 		case VM_FAULT_INTERRUPTED:
 			retval = MACH_SEND_INTERRUPTED;
@@ -869,7 +850,7 @@ apple_protect_pager_deallocate_internal(
 			memory_object_control_deallocate(pager->ap_pgr_hdr.mo_control);
 			pager->ap_pgr_hdr.mo_control = MEMORY_OBJECT_CONTROL_NULL;
 		}
-		kfree(pager, sizeof(*pager));
+		kfree_type(struct apple_protect_pager, pager);
 		pager = APPLE_PROTECT_PAGER_NULL;
 	} else {
 		/* there are still plenty of references:  keep going... */
@@ -912,20 +893,6 @@ apple_protect_pager_terminate(
 	PAGER_DEBUG(PAGER_ALL, ("apple_protect_pager_terminate: %p\n", mem_obj));
 
 	return KERN_SUCCESS;
-}
-
-/*
- *
- */
-kern_return_t
-apple_protect_pager_synchronize(
-	__unused memory_object_t                mem_obj,
-	__unused memory_object_offset_t offset,
-	__unused memory_object_size_t           length,
-	__unused vm_sync_t              sync_flags)
-{
-	panic("apple_protect_pager_synchronize: memory_object_synchronize no longer supported\n");
-	return KERN_FAILURE;
 }
 
 /*
@@ -1054,10 +1021,7 @@ apple_protect_pager_create(
 	kern_return_t           kr;
 	struct pager_crypt_info *old_crypt_info;
 
-	pager = (apple_protect_pager_t) kalloc(sizeof(*pager));
-	if (pager == APPLE_PROTECT_PAGER_NULL) {
-		return APPLE_PROTECT_PAGER_NULL;
-	}
+	pager = kalloc_type(struct apple_protect_pager, Z_WAITOK | Z_NOFAIL);
 
 	/*
 	 * The vm_map call takes both named entry ports and raw memory
@@ -1159,7 +1123,7 @@ apple_protect_pager_create(
 #endif /* CRYPT_INFO_DEBUG */
 		crypt_info_deallocate(pager->crypt_info);
 		pager->crypt_info = NULL;
-		kfree(pager, sizeof(*pager));
+		kfree_type(struct apple_protect_pager, pager);
 		/* ... and go with the winner */
 		pager = pager2;
 		/* let the winner make sure the pager gets ready */
@@ -1331,7 +1295,7 @@ apple_protect_pager_setup(
 #endif /* CRYPT_INFO_DEBUG */
 		} else {
 			/* allocate a new crypt_info for new pager */
-			new_crypt_info = kalloc(sizeof(*new_crypt_info));
+			new_crypt_info = kalloc_type(struct pager_crypt_info, Z_WAITOK);
 			*new_crypt_info = *crypt_info;
 			new_crypt_info->crypt_refcnt = 1;
 #if CRYPT_INFO_DEBUG
@@ -1514,7 +1478,43 @@ crypt_info_deallocate(
 		    __FUNCTION__,
 		    crypt_info);
 #endif /* CRYPT_INFO_DEBUG */
-		kfree(crypt_info, sizeof(*crypt_info));
-		crypt_info = NULL;
+		kfree_type(struct pager_crypt_info, crypt_info);
 	}
+}
+
+static uint64_t
+apple_protect_pager_purge(
+	apple_protect_pager_t pager)
+{
+	uint64_t pages_purged;
+	vm_object_t object;
+
+	pages_purged = 0;
+	object = memory_object_to_vm_object((memory_object_t) pager);
+	assert(object != VM_OBJECT_NULL);
+	vm_object_lock(object);
+	pages_purged = object->resident_page_count;
+	vm_object_reap_pages(object, REAP_DATA_FLUSH);
+	pages_purged -= object->resident_page_count;
+//	printf("     %s:%d pager %p object %p purged %llu left %d\n", __FUNCTION__, __LINE__, pager, object, pages_purged, object->resident_page_count);
+	vm_object_unlock(object);
+	return pages_purged;
+}
+
+uint64_t
+apple_protect_pager_purge_all(void)
+{
+	uint64_t pages_purged;
+	apple_protect_pager_t pager;
+
+	pages_purged = 0;
+	lck_mtx_lock(&apple_protect_pager_lock);
+	queue_iterate(&apple_protect_pager_queue, pager, apple_protect_pager_t, pager_queue) {
+		pages_purged += apple_protect_pager_purge(pager);
+	}
+	lck_mtx_unlock(&apple_protect_pager_lock);
+#if DEVELOPMENT || DEBUG
+	printf("   %s:%d pages purged: %llu\n", __FUNCTION__, __LINE__, pages_purged);
+#endif /* DEVELOPMENT || DEBUG */
+	return pages_purged;
 }

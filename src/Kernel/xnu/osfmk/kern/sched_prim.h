@@ -101,6 +101,10 @@ extern void             sched_rtlocal_queue_shutdown(processor_t processor);
 
 extern int64_t          sched_rtlocal_runq_count_sum(void);
 
+extern thread_t         sched_rtlocal_steal_thread(processor_set_t stealing_pset, uint64_t earliest_deadline);
+
+extern thread_t         sched_rt_choose_thread(processor_set_t pset);
+
 extern void             sched_check_spill(processor_set_t pset, thread_t thread);
 
 extern bool             sched_thread_should_yield(processor_t processor, thread_t thread);
@@ -128,10 +132,10 @@ extern boolean_t        thread_unblock(
 	wait_result_t   wresult);
 
 /* Unblock and dispatch thread */
-extern kern_return_t    thread_go(
+extern void thread_go(
 	thread_t                thread,
-	wait_result_t   wresult,
-	waitq_options_t option);
+	wait_result_t           wresult,
+	bool                    try_handoff);
 
 /* Check if direct handoff is allowed */
 extern boolean_t
@@ -189,11 +193,29 @@ extern void             sched_set_kernel_thread_priority(
 /* Set the thread's true scheduling mode */
 extern void             sched_set_thread_mode(thread_t thread,
     sched_mode_t mode);
+
+/*
+ * Set the thread's scheduling mode taking into account that the thread may have
+ * been demoted.
+ * */
+extern void             sched_set_thread_mode_user(thread_t thread,
+    sched_mode_t mode);
+
+/*
+ * Get the thread's scheduling mode taking into account that the thread may have
+ * been demoted.
+ * */
+extern sched_mode_t     sched_get_thread_mode_user(thread_t thread);
+
+
 /* Demote the true scheduler mode */
 extern void             sched_thread_mode_demote(thread_t thread,
     uint32_t reason);
 /* Un-demote the true scheduler mode */
 extern void             sched_thread_mode_undemote(thread_t thread,
+    uint32_t reason);
+/* Check for a specific demotion */
+extern bool             sched_thread_mode_has_demotion(thread_t thread,
     uint32_t reason);
 
 extern void sched_thread_promote_reason(thread_t thread, uint32_t reason, uintptr_t trace_obj);
@@ -263,10 +285,19 @@ extern processor_t              thread_bind(
 extern bool pset_has_stealable_threads(
 	processor_set_t         pset);
 
+extern bool pset_has_stealable_rt_threads(
+	processor_set_t         pset);
+
 extern processor_set_t choose_starting_pset(
 	pset_node_t  node,
 	thread_t     thread,
 	processor_t *processor_hint);
+
+extern int pset_available_cpu_count(
+	processor_set_t pset);
+
+extern bool pset_is_recommended(
+	processor_set_t pset);
 
 extern pset_node_t sched_choose_node(
 	thread_t     thread);
@@ -282,7 +313,9 @@ extern void sched_SMT_balance(
 	processor_set_t pset);
 
 extern void thread_quantum_init(
-	thread_t thread);
+	thread_t thread,
+	uint64_t now);
+
 
 extern void             run_queue_init(
 	run_queue_t             runq);
@@ -318,6 +351,8 @@ extern void sched_pset_made_schedulable(
 	processor_set_t pset,
 	boolean_t drop_lock);
 
+extern void sched_cpu_init_completed(void);
+
 /*
  * Enum to define various events which need IPIs. The IPI policy
  * engine decides what kind of IPI to use based on destination
@@ -329,6 +364,7 @@ typedef enum {
 	SCHED_IPI_EVENT_SMT_REBAL   = 0x3,
 	SCHED_IPI_EVENT_SPILL       = 0x4,
 	SCHED_IPI_EVENT_REBALANCE   = 0x5,
+	SCHED_IPI_EVENT_RT_PREEMPT  = 0x6,
 } sched_ipi_event_t;
 
 
@@ -348,8 +384,7 @@ typedef enum {
  * - Once the pset lock is dropped, the scheduler invokes sched_ipi_perform()
  *   routine which actually sends the appropriate IPI to the destination core.
  */
-extern sched_ipi_type_t sched_ipi_action(processor_t dst, thread_t thread,
-    boolean_t dst_idle, sched_ipi_event_t event);
+extern sched_ipi_type_t sched_ipi_action(processor_t dst, thread_t thread, sched_ipi_event_t event);
 extern void sched_ipi_perform(processor_t dst, sched_ipi_type_t ipi);
 
 /* sched_ipi_policy() is the global default IPI policy for all schedulers */
@@ -358,7 +393,7 @@ extern sched_ipi_type_t sched_ipi_policy(processor_t dst, thread_t thread,
 
 /* sched_ipi_deferred_policy() is the global default deferred IPI policy for all schedulers */
 extern sched_ipi_type_t sched_ipi_deferred_policy(processor_set_t pset,
-    processor_t dst, sched_ipi_event_t event);
+    processor_t dst, thread_t thread, sched_ipi_event_t event);
 
 #if defined(CONFIG_SCHED_TIMESHARE_CORE)
 
@@ -478,11 +513,11 @@ MACRO_BEGIN                                                                     
 	}                                                                       \
 MACRO_END
 
-#define SCHED_DEBUG_CHOOSE_PROCESSOR_KERNEL_DEBUG_CONSTANT(...)                 \
+#define SCHED_DEBUG_CHOOSE_PROCESSOR_KERNEL_DEBUG_CONSTANT_IST(...)             \
 MACRO_BEGIN                                                                     \
 	if (__improbable(sched_debug_flags &                                    \
 	    SCHED_DEBUG_FLAG_CHOOSE_PROCESSOR_TRACEPOINTS)) {                   \
-	        KERNEL_DEBUG_CONSTANT(__VA_ARGS__);                             \
+	        KERNEL_DEBUG_CONSTANT_IST(KDEBUG_TRACE, __VA_ARGS__);           \
 	}                                                                       \
 MACRO_END
 
@@ -497,6 +532,8 @@ extern perfcontrol_class_t thread_get_perfcontrol_class(
 /* Generic routine for Non-AMP schedulers to calculate parallelism */
 extern uint32_t sched_qos_max_parallelism(int qos, uint64_t options);
 
+extern void check_monotonic_time(uint64_t ctime);
+
 #endif /* MACH_KERNEL_PRIVATE */
 
 __BEGIN_DECLS
@@ -505,11 +542,34 @@ __BEGIN_DECLS
 
 extern void thread_bind_cluster_type(thread_t, char cluster_type, bool soft_bind);
 
+__options_decl(thread_bind_option_t, uint64_t, {
+	/* Unbind a previously cluster bound thread */
+	THREAD_UNBIND                   = 0x1,
+	/*
+	 * Soft bind the thread to the cluster; soft binding means the thread will be
+	 * moved to an available cluster if the bound cluster is de-recommended/offline.
+	 */
+	THREAD_BIND_SOFT                = 0x2,
+	/*
+	 * Bind thread to the cluster only if it is eligible to run on that cluster. If
+	 * the thread is not eligible to run on the cluster, thread_bind_cluster_id()
+	 * returns KERN_INVALID_POLICY.
+	 */
+	THREAD_BIND_ELIGIBLE_ONLY       = 0x4,
+});
+extern kern_return_t thread_bind_cluster_id(thread_t thread, uint32_t cluster_id, thread_bind_option_t options);
+
 extern int sched_get_rt_n_backup_processors(void);
 extern void sched_set_rt_n_backup_processors(int n);
 
+extern int sched_get_rt_deadline_epsilon(void);
+extern void sched_set_rt_deadline_epsilon(int new_epsilon_us);
+
 /* Toggles a global override to turn off CPU Throttling */
 extern void     sys_override_cpu_throttle(boolean_t enable_override);
+
+extern int sched_get_powered_cores(void);
+extern void sched_set_powered_cores(int n);
 
 /*
  ****************** Only exported until BSD stops using ********************
@@ -543,7 +603,7 @@ thread_t thread_prepare_for_handoff(thread_t thread, thread_handoff_option_t opt
 /* Attempt to context switch to a specific runnable thread */
 extern wait_result_t thread_handoff_deallocate(thread_t thread, thread_handoff_option_t option);
 
-__attribute__((nonnull(1, 2)))
+__attribute__((nonnull(2)))
 extern void thread_handoff_parameter(thread_t thread,
     thread_continue_t continuation, void *parameter, thread_handoff_option_t) __dead2;
 
@@ -552,6 +612,109 @@ extern struct waitq     *assert_wait_queue(event_t event);
 extern kern_return_t thread_wakeup_one_with_pri(event_t event, int priority);
 
 extern thread_t thread_wakeup_identify(event_t event, int priority);
+
+/*
+ * sched_cond_t:
+ *
+ * A atomic condition variable used to synchronize wake/block operations on threads.
+ * Bits defined below are reserved for use by sched_prim. Remaining
+ * bits may be used by caller for additional synchronization semantics.
+ */
+__options_decl(sched_cond_t, uint32_t, {
+	SCHED_COND_INIT = 0x0000,    /* initialize all bits to zero (inactive and not awoken) */
+	SCHED_COND_ACTIVE = 0x0001,  /* target thread is active */
+	SCHED_COND_WAKEUP = 0x0002   /* wakeup has been issued for target thread */
+});
+typedef _Atomic sched_cond_t sched_cond_atomic_t;
+
+/*
+ * sched_cond_init:
+ *
+ * Initialize an atomic condition variable. Note that this does not occur atomically and should be
+ * performed during thread initialization, before the condition is observable by other threads.
+ */
+extern void sched_cond_init(
+	sched_cond_atomic_t *cond);
+
+/*
+ * sched_cond_signal:
+ *
+ * Wakeup the specified thread if it is waiting on this event and it has not already been issued a wakeup.
+ *
+ * parameters:
+ *      thread    thread to awaken
+ *      cond      atomic condition variable
+ */
+extern kern_return_t sched_cond_signal(
+	sched_cond_atomic_t *cond,
+	thread_t thread);
+
+/*
+ * sched_cond_wait_parameter:
+ *
+ * Assert wait and block on cond if no wakeup has been issued.
+ * If a wakeup has been issued on cond since the last `sched_cond_ack`, clear_wait and
+ * return `THREAD_AWAKENED`.
+ *
+ * `sched_cond_wait_parameter` must be paired with `sched_cond_ack`.
+ *
+ * NOTE: `continuation` will only be jumped to if a wakeup has not been issued
+ *
+ * parameters:
+ *      cond             atomic condition variable to synchronize on
+ *      interruptible    interruptible value to pass to assert_wait
+ *      continuation     continuation if block succeeds
+ *      parameter
+ */
+extern wait_result_t sched_cond_wait_parameter(
+	sched_cond_atomic_t *cond,
+	wait_interrupt_t interruptible,
+	thread_continue_t continuation,
+	void *parameter);
+
+/*
+ * sched_cond_wait:
+ *
+ * Assert wait and block on cond if no wakeup has been issued.
+ * If a wakeup has been issued on cond since the last `sched_cond_ack`, clear_wait and
+ * return `THREAD_AWAKENED`.
+ *
+ * `sched_cond_wait` must be paired with `sched_cond_ack`.
+ *
+ * NOTE: `continuation` will only be jumped to if a wakeup has not been issued
+ *
+ * parameters:
+ *      cond             atomic condition variable to synchronize on
+ *      interruptible    interruptible value to pass to assert_wait
+ *      continuation     continuation if block succeeds
+ */
+extern wait_result_t sched_cond_wait(
+	sched_cond_atomic_t *cond,
+	wait_interrupt_t interruptible,
+	thread_continue_t continuation);
+
+/*
+ * sched_cond_ack:
+ *
+ * Acknowledge an issued wakeup by clearing WAKEUP and setting ACTIVE (via XOR).
+ * It is the callers responsibility to ensure that the ACTIVE bit is always low prior to calling
+ * (i.e. by calling `sched_cond_wait` prior to any rerun or block).
+ * Synchronization schemes that allow for WAKEUP bit to be reset prior to wakeup
+ * (e.g. a cancellation mechanism) should check that WAKEUP was indeed cleared.
+ *
+ * e.g.
+ * ```
+ * if (sched_cond_ack(&my_state) & SCHED_THREAD_WAKEUP) {
+ *     // WAKEUP bit was no longer set by the time this thread woke up
+ *     do_cancellation_policy();
+ * }
+ * ```
+ *
+ * parameters:
+ *      cond:    atomic condition variable
+ */
+extern sched_cond_t sched_cond_ack(
+	sched_cond_atomic_t *cond);
 
 #endif  /* XNU_KERNEL_PRIVATE */
 
@@ -563,6 +726,8 @@ extern void             thread_set_pending_block_hint(
 
 #define QOS_PARALLELISM_COUNT_LOGICAL   0x1
 #define QOS_PARALLELISM_REALTIME        0x2
+#define QOS_PARALLELISM_CLUSTER_SHARED_RESOURCE              0x4
+
 extern uint32_t qos_max_parallelism(int qos, uint64_t options);
 #endif /* KERNEL_PRIVATE */
 
@@ -613,6 +778,7 @@ extern wait_result_t    assert_wait_deadline_with_leeway(
 	wait_timeout_urgency_t  urgency,
 	uint64_t                        deadline,
 	uint64_t                        leeway);
+
 
 /* Wake up thread (or threads) waiting on a particular event */
 extern kern_return_t    thread_wakeup_prim(
@@ -819,6 +985,7 @@ struct sched_dispatch_table {
 	void    (*rt_queue_shutdown)(processor_t processor);
 	void    (*rt_runq_scan)(sched_update_scan_context_t scan_context);
 	int64_t (*rt_runq_count_sum)(void);
+	thread_t (*rt_steal_thread)(processor_set_t pset, uint64_t earliest_deadline);
 
 	uint32_t (*qos_max_parallelism)(int qos, uint64_t options);
 	void    (*check_spill)(processor_set_t pset, thread_t thread);
@@ -838,6 +1005,10 @@ struct sched_dispatch_table {
 	/* Routine to inform the scheduler when CLPC changes a thread group recommendation */
 	void (*thread_group_recommendation_change)(struct thread_group *tg, cluster_type_t new_recommendation);
 #endif
+	/* Routine to inform the scheduler when all CPUs have finished initializing */
+	void (*cpu_init_completed)(void);
+	/* Routine to check if a thread is eligible to execute on a specific pset */
+	bool (*thread_eligible_for_pset)(thread_t thread, processor_set_t pset);
 };
 
 #if defined(CONFIG_SCHED_TRADITIONAL)
@@ -869,6 +1040,8 @@ extern const struct sched_dispatch_table sched_clutch_dispatch;
 extern const struct sched_dispatch_table sched_edge_dispatch;
 #endif
 
+extern void sched_set_max_unsafe_rt_quanta(int max);
+extern void sched_set_max_unsafe_fixed_quanta(int max);
 
 #endif  /* MACH_KERNEL_PRIVATE */
 

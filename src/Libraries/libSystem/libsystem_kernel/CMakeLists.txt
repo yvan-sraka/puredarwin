@@ -25,14 +25,21 @@
 # - /usr/local/lib/loaderd/libsystem_kernel.a (copy of /usr/local/lib/dyld/libsystem_kernel.a)
 # - /usr/local/lib/dyld_stub/libsystem_kernel.a (copy of /usr/local/lib/dyld/libsystem_kernel.a)
 
+# Syscall stub architecture matches the PureDarwin target (see cmake/mig.cmake).
+if(PUREDARWIN_TARGET_ARCH STREQUAL "arm64")
+    set(LIBSYSTEM_KERNEL_SYSCALL_ARCH "arm64")
+else()
+    set(LIBSYSTEM_KERNEL_SYSCALL_ARCH "x86_64")
+endif()
+
 add_custom_command(OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/syscalls.a
     COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_CURRENT_BINARY_DIR}/sys
-    COMMAND ${CMAKE_COMMAND} -E env ARCHS=x86_64
+    COMMAND ${CMAKE_COMMAND} -E env ARCHS=${LIBSYSTEM_KERNEL_SYSCALL_ARCH}
         ${CMAKE_CURRENT_SOURCE_DIR}/scripts/create-syscalls.pl
         ${PUREDARWIN_SOURCE_DIR}/src/Kernel/xnu/bsd/kern/syscalls.master
         ${CMAKE_CURRENT_SOURCE_DIR}/custom ${CMAKE_CURRENT_SOURCE_DIR}/Platforms
         MacOSX ${CMAKE_CURRENT_BINARY_DIR}/sys
-    COMMAND ${CMAKE_COMMAND} -E env ARCHS=x86_64
+    COMMAND ${CMAKE_COMMAND} -E env ARCHS=${LIBSYSTEM_KERNEL_SYSCALL_ARCH}
         ${CMAKE_CURRENT_SOURCE_DIR}/scripts/compile-syscalls.pl
         ${CMAKE_CURRENT_BINARY_DIR}/sys/stubs.list ${CMAKE_CURRENT_BINARY_DIR}/syscalls.a
         -I${PUREDARWIN_BINARY_DIR}/src/Kernel/xnu/xnu_header_install/usr/include
@@ -168,8 +175,6 @@ target_sources(libsystem_kernel_static PRIVATE
     wrappers/legacy/munmap.c
     wrappers/legacy/recvfrom.c
     wrappers/legacy/recvmsg.c
-    wrappers/legacy/select.c
-    wrappers/legacy/select-pre1050.c
     wrappers/legacy/sendmsg.c
     wrappers/legacy/sendto.c
     wrappers/legacy/setattrlist.c
@@ -211,7 +216,7 @@ target_include_directories(libsystem_kernel_static PRIVATE ${CMAKE_CURRENT_BINAR
 target_compile_options(libsystem_kernel_static PRIVATE -fdollars-in-identifiers -no-cpp-precomp -fno-common -fno-stack-protector -fno-stack-check -momit-leaf-frame-pointer -Wno-nullability-completeness -Wno-implicit-function-declaration)
 
 # We define LIBSYSCALL_INTERFACE to pass to the MIG compiler below. This will indicate we don't want 'internal' versions of the given MIG files.
-target_compile_definitions(libsystem_kernel_static PRIVATE _FORTIFY_SOURCE=0 __DARWIN_VERS_1050=1 NO_SYSCALL_LEGACY SYSCALL_PRE1050 LIBSYSCALL_INTERFACE)
+target_compile_definitions(libsystem_kernel_static PRIVATE _FORTIFY_SOURCE=0 __DARWIN_VERS_1050=1 NO_SYSCALL_LEGACY LIBSYSCALL_INTERFACE)
 
 target_link_libraries(libsystem_kernel_static PRIVATE xnu_private_headers libsystem_kernel_private_headers libsyscall_traps)
 target_link_libraries(libsystem_kernel_static PUBLIC xnu_headers pthread_common_headers AvailabilityHeaders)
@@ -417,7 +422,7 @@ target_include_directories(libsystem_kernel PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/
 target_link_libraries(libsystem_kernel PRIVATE libsystem_kernel_private_headers)
 
 target_compile_options(libsystem_kernel PRIVATE -fdollars-in-identifiers -no-cpp-precomp -fno-common -fno-stack-protector -fno-stack-check -momit-leaf-frame-pointer -Wno-nullability-completeness -Wno-implicit-function-declaration)
-target_compile_definitions(libsystem_kernel PRIVATE _FORTIFY_SOURCE=0 __DARWIN_VERS_1050=1 NO_SYSCALL_LEGACY SYSCALL_PRE1050)
+target_compile_definitions(libsystem_kernel PRIVATE _FORTIFY_SOURCE=0 __DARWIN_VERS_1050=1 NO_SYSCALL_LEGACY)
 
 target_link_libraries(libsystem_kernel PRIVATE libsystem_kernel_static)
 target_link_libraries(libsystem_kernel PRIVATE CrashReporterClient)

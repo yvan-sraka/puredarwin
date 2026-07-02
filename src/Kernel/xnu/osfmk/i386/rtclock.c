@@ -307,7 +307,6 @@ rtclock_init(void)
 
 		rtc_timer_init();
 		clock_timebase_init();
-		ml_init_lock_timeout();
 		ml_init_delay_spin_threshold(10);
 	}
 
@@ -417,7 +416,7 @@ clock_timebase_info(
 /*
  * Real-time clock device interrupt.
  */
-void
+int
 rtclock_intr(
 	x86_saved_state_t       *tregs)
 {
@@ -449,6 +448,8 @@ rtclock_intr(
 
 	/* call the generic etimer */
 	timer_intr(user_mode, rip);
+
+	return 0;
 }
 
 

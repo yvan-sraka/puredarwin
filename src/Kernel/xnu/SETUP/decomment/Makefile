@@ -17,6 +17,8 @@ LDFLAGS = -isysroot $(HOST_SDKROOT) -mmacosx-version-min=$(HOST_OS_VERSION)
 decomment: $(OBJS)
 	@$(LOG_HOST_LD) "$@"
 	$(_v)$(HOST_CC) $(LDFLAGS) -o $@ $^
+	@$(LOG_HOST_CODESIGN) "$@"
+	$(_v)env CODESIGN_ALLOCATE=$(HOST_CODESIGN_ALLOCATE) $(HOST_CODESIGN) -s - $@
 
 %.o: %.c
 	@$(LOG_HOST_CC) "$@"

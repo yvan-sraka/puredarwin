@@ -115,8 +115,7 @@ TAILQ_HEAD(dqfreelist, dquot) dqfreelist;
  */
 TAILQ_HEAD(dqdirtylist, dquot) dqdirtylist;
 
-ZONE_VIEW_DEFINE(ZV_DQUOT, "FS quota entries", KHEAP_ID_DEFAULT,
-    sizeof(struct dquot));
+KALLOC_TYPE_DEFINE(KT_DQUOT, struct dquot, KT_PRIV_ACCT);
 
 static int  dqlookup(struct quotafile *, u_int32_t, struct      dqblk *, u_int32_t *);
 static int  dqsync_locked(struct dquot *dq);
@@ -558,7 +557,7 @@ relookup:
 			 * but we found the dq we were looking for in
 			 * the cache the 2nd time through so free it
 			 */
-			zfree(ZV_DQUOT, ndq);
+			zfree(KT_DQUOT, ndq);
 		}
 		*dqp = dq;
 
@@ -587,7 +586,7 @@ relookup:
 			 */
 			dq_list_unlock();
 
-			ndq = (struct dquot *)zalloc_flags(ZV_DQUOT,
+			ndq = (struct dquot *)zalloc_flags(KT_DQUOT,
 			    Z_WAITOK | Z_ZERO);
 
 			listlockval = dq_list_lock();
@@ -618,7 +617,7 @@ relookup:
 				 * but we're now at the limit of our cache size
 				 * so free it
 				 */
-				zfree(ZV_DQUOT, ndq);
+				zfree(KT_DQUOT, ndq);
 			}
 			tablefull("dquot");
 			*dqp = NODQUOT;
@@ -701,7 +700,7 @@ relookup:
 		 * but we didn't need it, so free it after
 		 * we've droped the quota list lock
 		 */
-		zfree(ZV_DQUOT, ndq);
+		zfree(KT_DQUOT, ndq);
 	}
 
 	error = dqlookup(qfp, id, &dq->dq_dqb, &dq->dq_index);

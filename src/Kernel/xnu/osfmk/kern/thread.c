@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2000-2020 Apple Inc. All rights reserved.
+ * Copyright (c) 2000-2021 Apple Inc. All rights reserved.
  *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
  *
@@ -86,6 +86,7 @@
 #include <mach/policy.h>
 #include <mach/thread_info.h>
 #include <mach/thread_special_ports.h>
+#include <mach/thread_act.h>
 #include <mach/thread_status.h>
 #include <mach/time_value.h>
 #include <mach/vm_param.h>
@@ -105,9 +106,9 @@
 #include <kern/misc_protos.h>
 #include <kern/processor.h>
 #include <kern/queue.h>
+#include <kern/restartable.h>
 #include <kern/sched.h>
 #include <kern/sched_prim.h>
-#include <kern/sync_lock.h>
 #include <kern/syscall_subr.h>
 #include <kern/task.h>
 #include <kern/thread.h>
@@ -122,16 +123,20 @@
 #include <kern/policy_internal.h>
 #include <kern/turnstile.h>
 #include <kern/sched_clutch.h>
+#include <kern/recount.h>
+#include <kern/smr.h>
+#include <kern/ast.h>
+#include <kern/compact_id.h>
 
 #include <corpses/task_corpse.h>
 #if KPC
 #include <kern/kpc.h>
 #endif
 
-#if MONOTONIC
+#if CONFIG_PERVASIVE_CPI
 #include <kern/monotonic.h>
 #include <machine/monotonic.h>
-#endif /* MONOTONIC */
+#endif /* CONFIG_PERVASIVE_CPI */
 
 #include <ipc/ipc_kmsg.h>
 #include <ipc/ipc_port.h>
@@ -144,9 +149,7 @@
 #include <sys/bsdtask_info.h>
 #include <mach/sdt.h>
 #include <san/kasan.h>
-#if CONFIG_KSANCOV
-#include <san/ksancov.h>
-#endif
+#include <san/kcov_stksz.h>
 
 #include <stdatomic.h>
 
@@ -169,17 +172,26 @@
 #include <security/mac_mach_internal.h>
 #endif
 
+#include <pthread/workqueue_trace.h>
+
 LCK_GRP_DECLARE(thread_lck_grp, "thread");
 
-ZONE_DECLARE(thread_zone, "threads", sizeof(struct thread), ZC_ZFREE_CLEARMEM);
+static SECURITY_READ_ONLY_LATE(zone_t) thread_zone;
+ZONE_DEFINE_ID(ZONE_ID_THREAD_RO, "threads_ro", struct thread_ro, ZC_READONLY);
 
-ZONE_DECLARE(thread_qos_override_zone, "thread qos override",
-    sizeof(struct thread_qos_override), ZC_NOENCRYPT);
+static void thread_port_with_flavor_no_senders(ipc_port_t, mach_port_mscount_t);
+
+IPC_KOBJECT_DEFINE(IKOT_THREAD_CONTROL);
+IPC_KOBJECT_DEFINE(IKOT_THREAD_READ,
+    .iko_op_no_senders = thread_port_with_flavor_no_senders);
+IPC_KOBJECT_DEFINE(IKOT_THREAD_INSPECT,
+    .iko_op_no_senders = thread_port_with_flavor_no_senders);
 
 static struct mpsc_daemon_queue thread_stack_queue;
 static struct mpsc_daemon_queue thread_terminate_queue;
 static struct mpsc_daemon_queue thread_deallocate_queue;
 static struct mpsc_daemon_queue thread_exception_queue;
+static struct mpsc_daemon_queue thread_backtrace_queue;
 
 decl_simple_lock_data(static, crashed_threads_lock);
 static queue_head_t             crashed_threads_queue;
@@ -189,6 +201,13 @@ struct thread_exception_elt {
 	exception_type_t        exception_type;
 	task_t                  exception_task;
 	thread_t                exception_thread;
+};
+
+struct thread_backtrace_elt {
+	struct mpsc_queue_chain link;
+	exception_type_t        exception_type;
+	kcdata_object_t         obj;
+	exception_port_t        exc_ports[BT_EXC_PORTS_COUNT]; /* send rights */
 };
 
 static SECURITY_READ_ONLY_LATE(struct thread) thread_template = {
@@ -209,20 +228,55 @@ static SECURITY_READ_ONLY_LATE(struct thread) thread_template = {
 	/* timers are initialized in thread_bootstrap */
 };
 
+#define CTID_SIZE_BIT           20
+#define CTID_MASK               ((1u << CTID_SIZE_BIT) - 1)
+#define CTID_MAX_THREAD_NUMBER  (CTID_MASK - 1)
+static_assert(CTID_MAX_THREAD_NUMBER <= COMPACT_ID_MAX);
+
+#ifndef __LITTLE_ENDIAN__
+#error "ctid relies on the ls bits of uint32_t to be populated"
+#endif
+
+__startup_data
 static struct thread init_thread;
+static SECURITY_READ_ONLY_LATE(uint32_t) ctid_nonce;
+COMPACT_ID_TABLE_DEFINE(static, ctid_table);
+
+__startup_func
+static void
+thread_zone_startup(void)
+{
+	size_t size = sizeof(struct thread);
+
+#ifdef MACH_BSD
+	size += roundup(uthread_size, _Alignof(struct thread));
+#endif
+	thread_zone = zone_create_ext("threads", size,
+	    ZC_SEQUESTER | ZC_ZFREE_CLEARMEM, ZONE_ID_THREAD, NULL);
+}
+STARTUP(ZALLOC, STARTUP_RANK_FOURTH, thread_zone_startup);
+
 static void thread_deallocate_enqueue(thread_t thread);
 static void thread_deallocate_complete(thread_t thread);
+
+static void ctid_table_remove(thread_t thread);
+static void ctid_table_add(thread_t thread);
+static void ctid_table_init(void);
 
 #ifdef MACH_BSD
 extern void proc_exit(void *);
 extern mach_exception_data_type_t proc_encode_exit_exception_code(void *);
 extern uint64_t get_dispatchqueue_offset_from_proc(void *);
 extern uint64_t get_return_to_kernel_offset_from_proc(void *p);
+extern uint64_t get_wq_quantum_offset_from_proc(void *);
 extern int      proc_selfpid(void);
 extern void     proc_name(int, char*, int);
 extern char *   proc_name_address(void *p);
+exception_type_t get_exception_from_corpse_crashinfo(kcdata_descriptor_t corpse_info);
+extern void kdebug_proc_name_args(struct proc *proc, long args[static 4]);
 #endif /* MACH_BSD */
 
+extern bool bsdthread_part_of_cooperative_workqueue(struct uthread *uth);
 extern int disable_exc_resource;
 extern int audio_active;
 extern int debug_task;
@@ -240,7 +294,6 @@ void jetsam_on_ledger_cpulimit_exceeded(void);
 #endif
 
 extern int task_thread_soft_limit;
-extern int exc_via_corpse_forking;
 
 #if DEVELOPMENT || DEBUG
 extern int exc_resource_threads_enabled;
@@ -288,23 +341,76 @@ init_thread_from_template(thread_t thread)
 #pragma clang diagnostic pop
 }
 
+static void
+thread_ro_create(task_t parent_task, thread_t th, thread_ro_t tro_tpl)
+{
+#if __x86_64__
+	th->t_task = parent_task;
+#endif
+	tro_tpl->tro_owner = th;
+	tro_tpl->tro_task  = parent_task;
+	th->t_tro = zalloc_ro(ZONE_ID_THREAD_RO, Z_WAITOK | Z_ZERO | Z_NOFAIL);
+	zalloc_ro_update_elem(ZONE_ID_THREAD_RO, th->t_tro, tro_tpl);
+}
+
+static void
+thread_ro_destroy(thread_t th)
+{
+	thread_ro_t tro = get_thread_ro(th);
+#if MACH_BSD
+	struct ucred *cred = tro->tro_cred;
+#endif
+
+	zfree_ro(ZONE_ID_THREAD_RO, tro);
+#if MACH_BSD
+	if (cred) {
+		uthread_cred_free(cred);
+	}
+#endif
+}
+
+#if MACH_BSD
+extern void kauth_cred_set(struct ucred **, struct ucred *);
+
+void
+thread_ro_update_cred(thread_ro_t tro, struct ucred *ucred)
+{
+	struct ucred *my_cred = tro->tro_cred;
+	if (my_cred != ucred) {
+		kauth_cred_set(&my_cred, ucred);
+		zalloc_ro_update_field(ZONE_ID_THREAD_RO, tro, tro_cred, &my_cred);
+	}
+}
+
+void
+thread_ro_update_flags(thread_ro_t tro, thread_ro_flags_t add, thread_ro_flags_t clr)
+{
+	thread_ro_flags_t flags = (tro->tro_flags & ~clr) | add;
+	zalloc_ro_update_field(ZONE_ID_THREAD_RO, tro, tro_flags, &flags);
+}
+#endif
+
+__startup_func
 thread_t
 thread_bootstrap(void)
 {
 	/*
 	 *	Fill in a template thread for fast initialization.
 	 */
-	timer_init(&thread_template.user_timer);
-	timer_init(&thread_template.system_timer);
-	timer_init(&thread_template.ptime);
 	timer_init(&thread_template.runnable_timer);
 
 	init_thread_from_template(&init_thread);
 	/* fiddle with init thread to skip asserts in set_sched_pri */
 	init_thread.sched_pri = MAXPRI_KERNEL;
-#if DEBUG || DEVELOPMENT
-	queue_init(&init_thread.t_temp_alloc_list);
-#endif /* DEBUG || DEVELOPMENT */
+
+	/*
+	 * We can't quite use ctid yet, on ARM thread_bootstrap() is called
+	 * before we can call random or anything,
+	 * so we just make it barely work and it will get fixed up
+	 * when the first thread is actually made.
+	 */
+	*compact_id_resolve(&ctid_table, 0) = &init_thread;
+	init_thread.ctid = CTID_MASK;
 
 	return &init_thread;
 }
@@ -318,10 +424,6 @@ thread_machine_init_template(void)
 void
 thread_init(void)
 {
-	stack_init();
-
-	thread_policy_init();
-
 	/*
 	 *	Initialize any machine-dependent
 	 *	per-thread structures necessary.
@@ -342,7 +444,7 @@ thread_corpse_continue(void)
 {
 	thread_t thread = current_thread();
 
-	thread_terminate_internal(thread, TH_TERMINATE_OPTION_NONE);
+	thread_terminate_internal(thread);
 
 	/*
 	 * Handle the thread termination directly
@@ -370,13 +472,11 @@ thread_terminate_continue(void)
 void
 thread_terminate_self(void)
 {
-	thread_t                thread = current_thread();
-	task_t                  task;
+	thread_t    thread = current_thread();
+	thread_ro_t tro    = get_thread_ro(thread);
+	task_t      task   = tro->tro_task;
+	void *bsd_info = get_bsdtask_info(task);
 	int threadcnt;
-
-	if (thread->t_temp_alloc_count) {
-		kheap_temp_leak_panic(thread);
-	}
 
 	pal_thread_terminate_self(thread);
 
@@ -395,7 +495,21 @@ thread_terminate_self(void)
 
 	thread_depress_abort_locked(thread);
 
+	/*
+	 * Before we take the thread_lock right above,
+	 * act_set_ast_reset_pcs() might not yet observe
+	 * that the thread is inactive, and could have
+	 * requested an IPI Ack.
+	 *
+	 * Once we unlock the thread, we know that
+	 * act_set_ast_reset_pcs() can't fail to notice
+	 * that thread->active is false,
+	 * and won't set new ones.
+	 */
+	thread_reset_pcs_ack_IPI(thread);
+
 	thread_unlock(thread);
+
 	splx(s);
 
 #if CONFIG_TASKWATCH
@@ -414,39 +528,42 @@ thread_terminate_self(void)
 
 	bank_swap_thread_bank_ledger(thread, NULL);
 
-	if (kdebug_enable && bsd_hasthreadname(thread->uthread)) {
+	if (kdebug_enable && bsd_hasthreadname(get_bsdthread_info(thread))) {
 		char threadname[MAXTHREADNAMESIZE];
-		bsd_getthreadname(thread->uthread, threadname);
+		bsd_getthreadname(get_bsdthread_info(thread), threadname);
 		kernel_debug_string_simple(TRACE_STRING_THREADNAME_PREV, threadname);
 	}
 
-	task = thread->task;
-	uthread_cleanup(task, thread->uthread, task->bsd_info);
+	uthread_cleanup(get_bsdthread_info(thread), tro);
 
-	if (kdebug_enable && task->bsd_info && !task_is_exec_copy(task)) {
+	if (kdebug_enable && bsd_info && !task_is_exec_copy(task)) {
 		/* trace out pid before we sign off */
 		long dbg_arg1 = 0;
 		long dbg_arg2 = 0;
 
-		kdbg_trace_data(thread->task->bsd_info, &dbg_arg1, &dbg_arg2);
-#if MONOTONIC
+		kdbg_trace_data(get_bsdtask_info(task), &dbg_arg1, &dbg_arg2);
+#if CONFIG_PERVASIVE_CPI
 		if (kdebug_debugid_enabled(DBG_MT_INSTRS_CYCLES_THR_EXIT)) {
-			uint64_t counts[MT_CORE_NFIXED];
-			uint64_t thread_user_time;
-			uint64_t thread_system_time;
-			thread_user_time = timer_grab(&thread->user_timer);
-			thread_system_time = timer_grab(&thread->system_timer);
-			mt_fixed_thread_counts(thread, counts);
+			struct recount_usage usage = { 0 };
+			struct recount_usage perf_only = { 0 };
+			boolean_t intrs_end = ml_set_interrupts_enabled(FALSE);
+			recount_current_thread_usage_perf_only(&usage, &perf_only);
+			ml_set_interrupts_enabled(intrs_end);
 			KDBG_RELEASE(DBG_MT_INSTRS_CYCLES_THR_EXIT,
-#ifdef MT_CORE_INSTRS
-			    counts[MT_CORE_INSTRS],
-#else /* defined(MT_CORE_INSTRS) */
-			    0,
-#endif/* !defined(MT_CORE_INSTRS) */
-			    counts[MT_CORE_CYCLES],
-			    thread_system_time, thread_user_time);
+			    usage.ru_instructions,
+			    usage.ru_cycles,
+			    usage.ru_system_time_mach,
+			    usage.ru_user_time_mach);
+#if __AMP__
+			KDBG_RELEASE(DBG_MT_P_INSTRS_CYCLES_THR_EXIT,
+			    perf_only.ru_instructions,
+			    perf_only.ru_cycles,
+			    perf_only.ru_system_time_mach,
+			    perf_only.ru_user_time_mach);
+
+#endif // __AMP__
 		}
-#endif/* MONOTONIC */
+#endif/* CONFIG_PERVASIVE_CPI */
 		KDBG_RELEASE(TRACE_DATA_THREAD_TERMINATE_PID, dbg_arg1, dbg_arg2);
 	}
 
@@ -459,48 +576,64 @@ thread_terminate_self(void)
 	 */
 	threadcnt = os_atomic_dec(&task->active_thread_count, relaxed);
 
+#if CONFIG_COALITIONS
+	/*
+	 * Leave the coalitions when last thread of task is exiting and the
+	 * task is not a corpse.
+	 */
+	if (threadcnt == 0 && !task->corpse_info) {
+		coalitions_remove_task(task);
+	}
+#endif
+
 	/*
 	 * If we are the last thread to terminate and the task is
 	 * associated with a BSD process, perform BSD process exit.
 	 */
-	if (threadcnt == 0 && task->bsd_info != NULL && !task_is_exec_copy(task)) {
+	if (threadcnt == 0 && bsd_info != NULL) {
 		mach_exception_data_type_t subcode = 0;
 		if (kdebug_enable) {
 			/* since we're the last thread in this process, trace out the command name too */
-			long args[4] = {};
-			kdbg_trace_string(thread->task->bsd_info, &args[0], &args[1], &args[2], &args[3]);
-#if MONOTONIC
+			long args[4] = { 0 };
+			kdebug_proc_name_args(bsd_info, args);
+#if CONFIG_PERVASIVE_CPI
 			if (kdebug_debugid_enabled(DBG_MT_INSTRS_CYCLES_PROC_EXIT)) {
-				uint64_t counts[MT_CORE_NFIXED];
-				uint64_t task_user_time;
-				uint64_t task_system_time;
-				mt_fixed_task_counts(task, counts);
-				/* since the thread time is not yet added to the task */
-				task_user_time = task->total_user_time + timer_grab(&thread->user_timer);
-				task_system_time = task->total_system_time + timer_grab(&thread->system_timer);
-				KDBG_RELEASE((DBG_MT_INSTRS_CYCLES_PROC_EXIT),
-#ifdef MT_CORE_INSTRS
-				    counts[MT_CORE_INSTRS],
-#else /* defined(MT_CORE_INSTRS) */
-				    0,
-#endif/* !defined(MT_CORE_INSTRS) */
-				    counts[MT_CORE_CYCLES],
-				    task_system_time, task_user_time);
+				struct recount_usage usage = { 0 };
+				struct recount_usage perf_only = { 0 };
+				recount_current_task_usage_perf_only(&usage, &perf_only);
+				KDBG_RELEASE(DBG_MT_INSTRS_CYCLES_PROC_EXIT,
+				    usage.ru_instructions,
+				    usage.ru_cycles,
+				    usage.ru_system_time_mach,
+				    usage.ru_user_time_mach);
+#if __AMP__
+				KDBG_RELEASE(DBG_MT_P_INSTRS_CYCLES_PROC_EXIT,
+				    perf_only.ru_instructions,
+				    perf_only.ru_cycles,
+				    perf_only.ru_system_time_mach,
+				    perf_only.ru_user_time_mach);
+#endif // __AMP__
 			}
-#endif/* MONOTONIC */
+#endif/* CONFIG_PERVASIVE_CPI */
 			KDBG_RELEASE(TRACE_STRING_PROC_EXIT, args[0], args[1], args[2], args[3]);
 		}
 
 		/* Get the exit reason before proc_exit */
-		subcode = proc_encode_exit_exception_code(task->bsd_info);
-		proc_exit(task->bsd_info);
+		subcode = proc_encode_exit_exception_code(bsd_info);
+		proc_exit(bsd_info);
+		bsd_info = NULL;
 		/*
 		 * if there is crash info in task
 		 * then do the deliver action since this is
 		 * last thread for this task.
 		 */
 		if (task->corpse_info) {
-			task_deliver_crash_notification(task, current_thread(), EXC_RESOURCE, subcode);
+			/* reset all except task name port */
+			ipc_task_reset(task);
+			/* enable all task ports (name port unchanged) */
+			ipc_task_enable(task);
+			exception_type_t etype = get_exception_from_corpse_crashinfo(task->corpse_info);
+			task_deliver_crash_notification(task, current_thread(), etype, subcode);
 		}
 	}
 
@@ -512,14 +645,12 @@ thread_terminate_self(void)
 		task_unlock(task);
 	}
 
-	uthread_cred_free(thread->uthread);
-
 	s = splsched();
 	thread_lock(thread);
 
 	/*
 	 * Ensure that the depress timer is no longer enqueued,
-	 * so the timer (stored in the thread) can be safely deallocated
+	 * so the timer can be safely deallocated
 	 *
 	 * TODO: build timer_call_cancel_wait
 	 */
@@ -548,10 +679,10 @@ thread_terminate_self(void)
 	 *	Cancel wait timer, and wait for
 	 *	concurrent expirations.
 	 */
-	if (thread->wait_timer_is_set) {
-		thread->wait_timer_is_set = FALSE;
+	if (thread->wait_timer_armed) {
+		thread->wait_timer_armed = false;
 
-		if (timer_call_cancel(&thread->wait_timer)) {
+		if (timer_call_cancel(thread->wait_timer)) {
 			thread->wait_timer_active--;
 		}
 	}
@@ -566,8 +697,10 @@ thread_terminate_self(void)
 
 		if (delay_us > USEC_PER_SEC) {
 			panic("wait timer failed to inactivate!"
-			    "thread: %p wait_timer_active: %d",
-			    thread, thread->wait_timer_active);
+			    "thread: %p, wait_timer_active: %d, "
+			    "wait_timer_armed: %d",
+			    thread, thread->wait_timer_active,
+			    thread->wait_timer_armed);
 		}
 
 		s = splsched();
@@ -588,17 +721,23 @@ thread_terminate_self(void)
 	thread->state |= TH_TERMINATE;
 	thread_mark_wait_locked(thread, THREAD_UNINT);
 
-	assert((thread->sched_flags & TH_SFLAG_WAITQ_PROMOTED) == 0);
-	assert((thread->sched_flags & TH_SFLAG_RW_PROMOTED) == 0);
-	assert((thread->sched_flags & TH_SFLAG_EXEC_PROMOTED) == 0);
-	assert((thread->sched_flags & TH_SFLAG_PROMOTED) == 0);
-	assert((thread->sched_flags & TH_SFLAG_THREAD_GROUP_AUTO_JOIN) == 0);
 	assert(thread->th_work_interval_flags == TH_WORK_INTERVAL_FLAGS_NONE);
 	assert(thread->kern_promotion_schedpri == 0);
-	assert(thread->waiting_for_mutex == NULL);
-	assert(thread->rwlock_count == 0);
+	if (thread->rwlock_count > 0) {
+		panic("rwlock_count is %d for thread %p, possibly it still holds a rwlock", thread->rwlock_count, thread);
+	}
+	assert(thread->priority_floor_count == 0);
 	assert(thread->handoff_thread == THREAD_NULL);
 	assert(thread->th_work_interval == NULL);
+	assert(thread->t_rr_state.trr_value == 0);
+
+	assert3u(0, ==, thread->sched_flags &
+	    (TH_SFLAG_WAITQ_PROMOTED |
+	    TH_SFLAG_RW_PROMOTED |
+	    TH_SFLAG_EXEC_PROMOTED |
+	    TH_SFLAG_FLOOR_PROMOTED |
+	    TH_SFLAG_PROMOTED |
+	    TH_SFLAG_DEPRESS));
 
 	thread_unlock(thread);
 	/* splsched */
@@ -616,7 +755,7 @@ thread_ref_release(thread_t thread)
 
 	assert_thread_magic(thread);
 
-	return os_ref_release(&thread->ref_count) == 0;
+	return os_ref_release_raw(&thread->ref_count, &thread_refgrp) == 0;
 }
 
 /* Drop a thread refcount safely without triggering a zfree */
@@ -645,31 +784,27 @@ thread_deallocate_complete(
 
 	assert_thread_magic(thread);
 
-	assert(os_ref_get_count(&thread->ref_count) == 0);
+	assert(os_ref_get_count_raw(&thread->ref_count) == 0);
 
 	if (!(thread->state & TH_TERMINATE2)) {
-		panic("thread_deallocate: thread not properly terminated\n");
+		panic("thread_deallocate: thread not properly terminated");
 	}
 
 	assert(thread->runq == PROCESSOR_NULL);
+	assert(!(thread->state & TH_WAKING));
 
 #if KPC
 	kpc_thread_destroy(thread);
-#endif
+#endif /* KPC */
 
 	ipc_thread_terminate(thread);
 
 	proc_thread_qos_deallocate(thread);
 
-	task = thread->task;
+	task = get_threadtask(thread);
 
 #ifdef MACH_BSD
-	{
-		void *ut = thread->uthread;
-
-		thread->uthread = NULL;
-		uthread_zone_free(ut);
-	}
+	uthread_destroy(get_bsdthread_info(thread));
 #endif /* MACH_BSD */
 
 	if (thread->t_ledger) {
@@ -683,24 +818,33 @@ thread_deallocate_complete(
 	if (thread->turnstile) {
 		turnstile_deallocate(thread->turnstile);
 	}
+	turnstile_compact_id_put(thread->ctsid);
 
 	if (IPC_VOUCHER_NULL != thread->ith_voucher) {
 		ipc_voucher_release(thread->ith_voucher);
 	}
 
-	if (thread->thread_io_stats) {
-		kheap_free(KHEAP_DATA_BUFFERS, thread->thread_io_stats,
-		    sizeof(struct io_stat_info));
+	kfree_data(thread->thread_io_stats, sizeof(struct io_stat_info));
+#if CONFIG_PREADOPT_TG
+	if (thread->old_preadopt_thread_group) {
+		thread_group_release(thread->old_preadopt_thread_group);
 	}
+
+	if (thread->preadopt_thread_group) {
+		thread_group_release(thread->preadopt_thread_group);
+	}
+#endif /* CONFIG_PREADOPT_TG */
 
 	if (thread->kernel_stack != 0) {
 		stack_free(thread);
 	}
 
+	recount_thread_deinit(&thread->th_recount);
+
 	lck_mtx_destroy(&thread->mutex, &thread_lck_grp);
 	machine_thread_destroy(thread);
 
-	task_deallocate(task);
+	task_deallocate_grp(task, TASK_GRP_INTERNAL);
 
 #if MACH_ASSERT
 	assert_thread_magic(thread);
@@ -713,6 +857,12 @@ thread_deallocate_complete(
 	terminated_threads_count--;
 	lck_mtx_unlock(&tasks_threads_lock);
 
+	timer_call_free(thread->depress_timer);
+	timer_call_free(thread->wait_timer);
+
+	ctid_table_remove(thread);
+
+	thread_ro_destroy(thread);
 	zfree(thread_zone, thread);
 }
 
@@ -763,7 +913,7 @@ thread_exception_queue_invoke(mpsc_queue_chain_t elm,
 	thread = elt->exception_thread;
 	assert_thread_magic(thread);
 
-	kfree(elt, sizeof(*elt));
+	kfree_type(struct thread_exception_elt, elt);
 
 	/* wait for all the threads in the task to terminate */
 	task_lock(task);
@@ -779,6 +929,39 @@ thread_exception_queue_invoke(mpsc_queue_chain_t elm,
 	task_deliver_crash_notification(task, thread, etype, 0);
 }
 
+static void
+thread_backtrace_queue_invoke(mpsc_queue_chain_t elm,
+    __assert_only mpsc_daemon_queue_t dq)
+{
+	struct thread_backtrace_elt *elt;
+	kcdata_object_t obj;
+	exception_port_t exc_ports[BT_EXC_PORTS_COUNT]; /* send rights */
+	exception_type_t etype;
+
+	assert(dq == &thread_backtrace_queue);
+	elt = mpsc_queue_element(elm, struct thread_backtrace_elt, link);
+
+	obj = elt->obj;
+	memcpy(exc_ports, elt->exc_ports, sizeof(ipc_port_t) * BT_EXC_PORTS_COUNT);
+	etype = elt->exception_type;
+
+	kfree_type(struct thread_backtrace_elt, elt);
+
+	/* Deliver to backtrace exception ports */
+	exception_deliver_backtrace(obj, exc_ports, etype);
+
+	/*
+	 * Release port right and kcdata object refs given by
+	 * task_enqueue_exception_with_corpse()
+	 */
+
+	for (unsigned int i = 0; i < BT_EXC_PORTS_COUNT; i++) {
+		ipc_port_release_send(exc_ports[i]);
+	}
+
+	kcdata_object_release(obj);
+}
+
 /*
  *	thread_exception_enqueue:
  *
@@ -791,12 +974,28 @@ thread_exception_enqueue(
 	exception_type_t etype)
 {
 	assert(EXC_RESOURCE == etype || EXC_GUARD == etype);
-	struct thread_exception_elt *elt = kalloc(sizeof(*elt));
+	struct thread_exception_elt *elt = kalloc_type(struct thread_exception_elt, Z_WAITOK | Z_NOFAIL);
 	elt->exception_type = etype;
 	elt->exception_task = task;
 	elt->exception_thread = thread;
 
 	mpsc_daemon_enqueue(&thread_exception_queue, &elt->link,
+	    MPSC_QUEUE_DISABLE_PREEMPTION);
+}
+
+void
+thread_backtrace_enqueue(
+	kcdata_object_t  obj,
+	exception_port_t ports[static BT_EXC_PORTS_COUNT],
+	exception_type_t etype)
+{
+	struct thread_backtrace_elt *elt = kalloc_type(struct thread_backtrace_elt, Z_WAITOK | Z_NOFAIL);
+	elt->obj = obj;
+	elt->exception_type = etype;
+
+	memcpy(elt->exc_ports, ports, sizeof(ipc_port_t) * BT_EXC_PORTS_COUNT);
+
+	mpsc_daemon_enqueue(&thread_backtrace_queue, &elt->link,
 	    MPSC_QUEUE_DISABLE_PREEMPTION);
 }
 
@@ -814,11 +1013,7 @@ thread_copy_resource_info(
 	dst_thread->c_switch = src_thread->c_switch;
 	dst_thread->p_switch = src_thread->p_switch;
 	dst_thread->ps_switch = src_thread->ps_switch;
-	dst_thread->precise_user_kernel_time = src_thread->precise_user_kernel_time;
-	dst_thread->user_timer = src_thread->user_timer;
-	dst_thread->user_timer_save = src_thread->user_timer_save;
-	dst_thread->system_timer = src_thread->system_timer;
-	dst_thread->system_timer_save = src_thread->system_timer_save;
+	dst_thread->sched_time_save = src_thread->sched_time_save;
 	dst_thread->runnable_timer = src_thread->runnable_timer;
 	dst_thread->vtimer_user_save = src_thread->vtimer_user_save;
 	dst_thread->vtimer_prof_save = src_thread->vtimer_prof_save;
@@ -827,6 +1022,7 @@ thread_copy_resource_info(
 	dst_thread->syscalls_unix = src_thread->syscalls_unix;
 	dst_thread->syscalls_mach = src_thread->syscalls_mach;
 	ledger_rollup(dst_thread->t_threadledger, src_thread->t_threadledger);
+	recount_thread_copy(&dst_thread->th_recount, &src_thread->th_recount);
 	*dst_thread->thread_io_stats = *src_thread->thread_io_stats;
 }
 
@@ -835,7 +1031,7 @@ thread_terminate_queue_invoke(mpsc_queue_chain_t e,
     __assert_only mpsc_daemon_queue_t dq)
 {
 	thread_t thread = mpsc_queue_element(e, struct thread, mpsc_links);
-	task_t task = thread->task;
+	task_t task = get_threadtask(thread);
 
 	assert(dq == &thread_terminate_queue);
 
@@ -859,16 +1055,9 @@ thread_terminate_queue_invoke(mpsc_queue_chain_t e,
 		return;
 	}
 
+	recount_task_rollup_thread(&task->tk_recount, &thread->th_recount);
 
-	task->total_user_time += timer_grab(&thread->user_timer);
-	task->total_ptime += timer_grab(&thread->ptime);
 	task->total_runnable_time += timer_grab(&thread->runnable_timer);
-	if (thread->precise_user_kernel_time) {
-		task->total_system_time += timer_grab(&thread->system_timer);
-	} else {
-		task->total_user_time += timer_grab(&thread->system_timer);
-	}
-
 	task->c_switch += thread->c_switch;
 	task->p_switch += thread->p_switch;
 	task->ps_switch += thread->ps_switch;
@@ -879,12 +1068,7 @@ thread_terminate_queue_invoke(mpsc_queue_chain_t e,
 	task->task_timer_wakeups_bin_1 += thread->thread_timer_wakeups_bin_1;
 	task->task_timer_wakeups_bin_2 += thread->thread_timer_wakeups_bin_2;
 	task->task_gpu_ns += ml_gpu_stat(thread);
-	task->task_energy += ml_energy_stat(thread);
 	task->decompressions += thread->decompressions;
-
-#if MONOTONIC
-	mt_terminate_update(task, thread);
-#endif /* MONOTONIC */
 
 	thread_update_qos_cpu_time(thread);
 
@@ -907,6 +1091,34 @@ thread_terminate_queue_invoke(mpsc_queue_chain_t e,
 	queue_enter(&terminated_threads, thread, thread_t, threads);
 	terminated_threads_count++;
 	lck_mtx_unlock(&tasks_threads_lock);
+
+#if MACH_BSD
+	/*
+	 * The thread no longer counts against the task's thread count,
+	 * we can now wake up any pending joiner.
+	 *
+	 * Note that the inheritor will be set to `thread` which is
+	 * incorrect once it is on the termination queue, however
+	 * the termination queue runs at MINPRI_KERNEL which is higher
+	 * than any user thread, so this isn't a priority inversion.
+	 */
+	if (thread_get_tag(thread) & THREAD_TAG_USER_JOIN) {
+		struct uthread *uth = get_bsdthread_info(thread);
+		mach_port_name_t kport = uthread_joiner_port(uth);
+
+		/*
+		 * Clear the port low two bits to tell pthread that thread is gone.
+		 */
+#ifndef NO_PORT_GEN
+		kport &= ~MACH_PORT_MAKE(0, IE_BITS_GEN_MASK + IE_BITS_GEN_ONE);
+#else
+		kport |= MACH_PORT_MAKE(0, ~(IE_BITS_GEN_MASK + IE_BITS_GEN_ONE));
+#endif
+		(void)copyoutmap_atomic32(task->map, kport,
+		    uthread_joiner_address(uth));
+		uthread_joiner_wake(task, uth);
+	}
+#endif
 
 	thread_deallocate(thread);
 }
@@ -1039,32 +1251,49 @@ thread_daemon_init(void)
 	thread_deallocate_daemon_register_queue(&thread_deallocate_queue,
 	    thread_deallocate_queue_invoke);
 
+	smr_register_mpsc_queue();
+
+	ipc_object_deallocate_register_queue();
+
 	simple_lock_init(&crashed_threads_lock, 0);
 	queue_init(&crashed_threads_queue);
 
 	result = mpsc_daemon_queue_init_with_thread(&thread_stack_queue,
 	    thread_stack_queue_invoke, BASEPRI_PREEMPT_HIGH,
-	    "daemon.thread-stack");
+	    "daemon.thread-stack", MPSC_DAEMON_INIT_NONE);
 	if (result != KERN_SUCCESS) {
 		panic("thread_daemon_init: thread_stack_daemon");
 	}
 
 	result = mpsc_daemon_queue_init_with_thread(&thread_exception_queue,
 	    thread_exception_queue_invoke, MINPRI_KERNEL,
-	    "daemon.thread-exception");
+	    "daemon.thread-exception", MPSC_DAEMON_INIT_NONE);
+
 	if (result != KERN_SUCCESS) {
 		panic("thread_daemon_init: thread_exception_daemon");
+	}
+
+	result = mpsc_daemon_queue_init_with_thread(&thread_backtrace_queue,
+	    thread_backtrace_queue_invoke, MINPRI_KERNEL,
+	    "daemon.thread-backtrace", MPSC_DAEMON_INIT_NONE);
+
+	if (result != KERN_SUCCESS) {
+		panic("thread_daemon_init: thread_backtrace_daemon");
 	}
 }
 
 __options_decl(thread_create_internal_options_t, uint32_t, {
 	TH_OPTION_NONE          = 0x00,
-	TH_OPTION_NOCRED        = 0x01,
 	TH_OPTION_NOSUSP        = 0x02,
 	TH_OPTION_WORKQ         = 0x04,
-	TH_OPTION_IMMOVABLE     = 0x08,
-	TH_OPTION_PINNED        = 0x10,
+	TH_OPTION_MAINTHREAD    = 0x08,
 });
+
+void
+main_thread_set_immovable_pinned(thread_t thread)
+{
+	ipc_main_thread_set_immovable_pinned(thread);
+}
 
 /*
  * Create a new thread.
@@ -1081,82 +1310,86 @@ thread_create_internal(
 	thread_create_internal_options_t        options,
 	thread_t                                *out_thread)
 {
-	thread_t                                new_thread;
-	static thread_t                         first_thread;
+	thread_t                  new_thread;
 	ipc_thread_init_options_t init_options = IPC_THREAD_INIT_NONE;
+	struct thread_ro          tro_tpl = { };
+	bool first_thread = false;
+	kern_return_t kr = KERN_FAILURE;
 
 	/*
 	 *	Allocate a thread and initialize static fields
 	 */
-	if (first_thread == THREAD_NULL) {
-		new_thread = first_thread = current_thread();
-	} else {
-		new_thread = (thread_t)zalloc(thread_zone);
-	}
-	if (new_thread == THREAD_NULL) {
-		return KERN_RESOURCE_SHORTAGE;
-	}
+	new_thread = zalloc_flags(thread_zone, Z_WAITOK | Z_NOFAIL);
 
-	if (new_thread != first_thread) {
+	if (__improbable(current_thread() == &init_thread)) {
+		/*
+		 * The first thread ever is a global, but because we want to be
+		 * able to zone_id_require() threads, we have to stop using the
+		 * global piece of memory we used to boostrap the kernel and
+		 * jump to a proper thread from a zone.
+		 *
+		 * This is why that one thread will inherit its original
+		 * state differently.
+		 *
+		 * Also remember this thread in `vm_pageout_scan_thread`
+		 * as this is what the first thread ever becomes.
+		 *
+		 * Also pre-warm the depress timer since the VM pageout scan
+		 * daemon might need to use it.
+		 */
+		assert(vm_pageout_scan_thread == THREAD_NULL);
+		vm_pageout_scan_thread = new_thread;
+
+		first_thread = true;
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wnontrivial-memaccess"
+		/* work around 74481146 */
+		memcpy(new_thread, &init_thread, sizeof(*new_thread));
+#pragma clang diagnostic pop
+
+		/*
+		 * Make the ctid table functional
+		 */
+		ctid_table_init();
+		new_thread->ctid = 0;
+	} else {
 		init_thread_from_template(new_thread);
 	}
 
-	if (options & TH_OPTION_PINNED) {
-		init_options |= IPC_THREAD_INIT_PINNED;
+	if (options & TH_OPTION_MAINTHREAD) {
+		init_options |= IPC_THREAD_INIT_MAINTHREAD;
 	}
 
-	if (options & TH_OPTION_IMMOVABLE) {
-		init_options |= IPC_THREAD_INIT_IMMOVABLE;
-	}
+	os_ref_init_count_raw(&new_thread->ref_count, &thread_refgrp, 2);
+	machine_thread_create(new_thread, parent_task, first_thread);
 
-	os_ref_init_count(&new_thread->ref_count, &thread_refgrp, 2);
-#if DEBUG || DEVELOPMENT
-	queue_init(&new_thread->t_temp_alloc_list);
-#endif /* DEBUG || DEVELOPMENT */
+	machine_thread_process_signature(new_thread, parent_task);
 
 #ifdef MACH_BSD
-	new_thread->uthread = uthread_alloc(parent_task, new_thread, (options & TH_OPTION_NOCRED) != 0);
-	if (new_thread->uthread == NULL) {
-#if MACH_ASSERT
-		new_thread->thread_magic = 0;
-#endif /* MACH_ASSERT */
-
-		zfree(thread_zone, new_thread);
-		return KERN_RESOURCE_SHORTAGE;
+	uthread_init(parent_task, get_bsdthread_info(new_thread),
+	    &tro_tpl, (options & TH_OPTION_WORKQ) != 0);
+	if (!task_is_a_corpse(parent_task)) {
+		/*
+		 * uthread_init will set tro_cred (with a +1)
+		 * and tro_proc for live tasks.
+		 */
+		assert(tro_tpl.tro_cred && tro_tpl.tro_proc);
 	}
 #endif  /* MACH_BSD */
-
-	if (machine_thread_create(new_thread, parent_task) != KERN_SUCCESS) {
-#ifdef MACH_BSD
-		void *ut = new_thread->uthread;
-
-		new_thread->uthread = NULL;
-		/* cred free may not be necessary */
-		uthread_cleanup(parent_task, ut, parent_task->bsd_info);
-		uthread_cred_free(ut);
-		uthread_zone_free(ut);
-#endif  /* MACH_BSD */
-
-#if MACH_ASSERT
-		new_thread->thread_magic = 0;
-#endif /* MACH_ASSERT */
-
-		zfree(thread_zone, new_thread);
-		return KERN_FAILURE;
-	}
-
-	new_thread->task = parent_task;
 
 	thread_lock_init(new_thread);
 	wake_lock_init(new_thread);
 
 	lck_mtx_init(&new_thread->mutex, &thread_lck_grp, LCK_ATTR_NULL);
 
-	ipc_thread_init(new_thread, init_options);
+	ipc_thread_init(parent_task, new_thread, &tro_tpl, init_options);
+
+	thread_ro_create(parent_task, new_thread, &tro_tpl);
 
 	new_thread->continuation = continuation;
 	new_thread->parameter = parameter;
 	new_thread->inheritor_flags = TURNSTILE_UPDATE_FLAGS_NONE;
+	new_thread->requested_policy = default_thread_requested_policy;
 	priority_queue_init(&new_thread->sched_inheritor_queue);
 	priority_queue_init(&new_thread->base_inheritor_queue);
 #if CONFIG_SCHED_CLUTCH
@@ -1166,19 +1399,24 @@ thread_create_internal(
 
 #if CONFIG_SCHED_EDGE
 	new_thread->th_bound_cluster_enqueued = false;
+	for (cluster_shared_rsrc_type_t shared_rsrc_type = CLUSTER_SHARED_RSRC_TYPE_MIN; shared_rsrc_type < CLUSTER_SHARED_RSRC_TYPE_COUNT; shared_rsrc_type++) {
+		new_thread->th_shared_rsrc_enqueued[shared_rsrc_type] = false;
+		new_thread->th_shared_rsrc_heavy_user[shared_rsrc_type] = false;
+		new_thread->th_shared_rsrc_heavy_perf_control[shared_rsrc_type] = false;
+	}
 #endif /* CONFIG_SCHED_EDGE */
+	new_thread->th_bound_cluster_id = THREAD_BOUND_CLUSTER_NONE;
 
 	/* Allocate I/O Statistics structure */
-	new_thread->thread_io_stats = kheap_alloc(KHEAP_DATA_BUFFERS,
-	    sizeof(struct io_stat_info), Z_WAITOK | Z_ZERO);
-	assert(new_thread->thread_io_stats != NULL);
+	new_thread->thread_io_stats = kalloc_data(sizeof(struct io_stat_info),
+	    Z_WAITOK | Z_ZERO | Z_NOFAIL);
 
-#if KASAN
+#if KASAN_CLASSIC
 	kasan_init_thread(&new_thread->kasan_data);
-#endif
+#endif /* KASAN_CLASSIC */
 
-#if CONFIG_KSANCOV
-	new_thread->ksancov_data = NULL;
+#if CONFIG_KCOV
+	kcov_init_thread(&new_thread->kcov_data);
 #endif
 
 #if CONFIG_IOSCHED
@@ -1195,7 +1433,7 @@ thread_create_internal(
 	    thread_limit > 0 &&
 	    parent_task->thread_count >= thread_limit &&
 	    !parent_task->task_has_crossed_thread_limit &&
-	    !(parent_task->t_flags & TF_CORPSE)) {
+	    !(task_is_a_corpse(parent_task))) {
 		int thread_count = parent_task->thread_count;
 		parent_task->task_has_crossed_thread_limit = TRUE;
 		task_unlock(parent_task);
@@ -1218,36 +1456,26 @@ thread_create_internal(
 		task_unlock(parent_task);
 		lck_mtx_unlock(&tasks_threads_lock);
 
-#ifdef MACH_BSD
-		{
-			void *ut = new_thread->uthread;
-
-			new_thread->uthread = NULL;
-			uthread_cleanup(parent_task, ut, parent_task->bsd_info);
-			/* cred free may not be necessary */
-			uthread_cred_free(ut);
-			uthread_zone_free(ut);
-		}
-#endif  /* MACH_BSD */
 		ipc_thread_disable(new_thread);
 		ipc_thread_terminate(new_thread);
-		kheap_free(KHEAP_DATA_BUFFERS, new_thread->thread_io_stats,
+		kfree_data(new_thread->thread_io_stats,
 		    sizeof(struct io_stat_info));
 		lck_mtx_destroy(&new_thread->mutex, &thread_lck_grp);
-		machine_thread_destroy(new_thread);
-		zfree(thread_zone, new_thread);
-		return KERN_FAILURE;
+		kr = KERN_FAILURE;
+		goto out_thread_cleanup;
 	}
 
 	/* Protected by the tasks_threads_lock */
 	new_thread->thread_id = ++thread_unique_id;
 
+	ctid_table_add(new_thread);
+
 	/* New threads inherit any default state on the task */
 	machine_thread_inherit_taskwide(new_thread, parent_task);
 
-	task_reference_internal(parent_task);
+	task_reference_grp(parent_task, TASK_GRP_INTERNAL);
 
-	if (new_thread->task->rusage_cpu_flags & TASK_RUSECPU_FLAGS_PERTHR_LIMIT) {
+	if (parent_task->rusage_cpu_flags & TASK_RUSECPU_FLAGS_PERTHR_LIMIT) {
 		/*
 		 * This task has a per-thread CPU limit; make sure this new thread
 		 * gets its limit set too, before it gets out of the kernel.
@@ -1265,10 +1493,12 @@ thread_create_internal(
 	new_thread->t_deduct_bank_ledger_time = 0;
 	new_thread->t_deduct_bank_ledger_energy = 0;
 
-	new_thread->t_ledger = new_thread->task->ledger;
+	new_thread->t_ledger = parent_task->ledger;
 	if (new_thread->t_ledger) {
 		ledger_reference(new_thread->t_ledger);
 	}
+
+	recount_thread_init(&new_thread->th_recount);
 
 #if defined(CONFIG_SCHED_MULTIQ)
 	/* Cache the task's sched_group */
@@ -1278,8 +1508,8 @@ thread_create_internal(
 	/* Cache the task's map */
 	new_thread->map = parent_task->map;
 
-	timer_call_setup(&new_thread->wait_timer, thread_timer_expire, new_thread);
-	timer_call_setup(&new_thread->depress_timer, thread_depress_expire, new_thread);
+	new_thread->depress_timer = timer_call_alloc(thread_depress_expire, new_thread);
+	new_thread->wait_timer = timer_call_alloc(thread_timer_expire, new_thread);
 
 #if KPC
 	kpc_thread_create(new_thread);
@@ -1343,6 +1573,7 @@ thread_create_internal(
 	}
 	new_thread->corpse_dup = FALSE;
 	new_thread->turnstile = turnstile_alloc();
+	new_thread->ctsid = turnstile_compact_id_get();
 
 
 	*out_thread = new_thread;
@@ -1350,7 +1581,7 @@ thread_create_internal(
 	if (kdebug_enable) {
 		long args[4] = {};
 
-		kdbg_trace_data(parent_task->bsd_info, &args[1], &args[3]);
+		kdbg_trace_data(get_bsdtask_info(parent_task), &args[1], &args[3]);
 
 		/*
 		 * Starting with 26604425, exec'ing creates a new task/thread.
@@ -1371,15 +1602,33 @@ thread_create_internal(
 		KDBG_RELEASE(TRACE_DATA_NEWTHREAD, (uintptr_t)thread_tid(new_thread),
 		    args[1], args[2], args[3]);
 
-		kdbg_trace_string(parent_task->bsd_info, &args[0], &args[1],
-		    &args[2], &args[3]);
+		kdebug_proc_name_args(get_bsdtask_info(parent_task), args);
 		KDBG_RELEASE(TRACE_STRING_NEWTHREAD, args[0], args[1], args[2],
 		    args[3]);
 	}
 
 	DTRACE_PROC1(lwp__create, thread_t, *out_thread);
 
-	return KERN_SUCCESS;
+	kr = KERN_SUCCESS;
+	goto done;
+
+out_thread_cleanup:
+#ifdef MACH_BSD
+	{
+		struct uthread *ut = get_bsdthread_info(new_thread);
+
+		uthread_cleanup(ut, &tro_tpl);
+		uthread_destroy(ut);
+	}
+#endif  /* MACH_BSD */
+
+	machine_thread_destroy(new_thread);
+
+	thread_ro_destroy(new_thread);
+	zfree(thread_zone, new_thread);
+
+done:
+	return kr;
 }
 
 static kern_return_t
@@ -1427,41 +1676,13 @@ thread_create_with_options_internal(
 	return KERN_SUCCESS;
 }
 
-/* No prototype, since task_server.h has the _from_user version if KERNEL_SERVER */
-kern_return_t
-thread_create(
-	task_t                          task,
-	thread_t                        *new_thread);
-
-kern_return_t
-thread_create(
-	task_t                          task,
-	thread_t                        *new_thread)
-{
-	return thread_create_with_options_internal(task, new_thread, FALSE, TH_OPTION_NONE,
-	           (thread_continue_t)thread_bootstrap_return);
-}
-
-/*
- * Create a thread that has its itk_self pinned
- * Deprecated, should be cleanup once rdar://70892168 lands
- */
-kern_return_t
-thread_create_pinned(
-	task_t                          task,
-	thread_t                        *new_thread)
-{
-	return thread_create_with_options_internal(task, new_thread, FALSE,
-	           TH_OPTION_PINNED | TH_OPTION_IMMOVABLE, (thread_continue_t)thread_bootstrap_return);
-}
-
 kern_return_t
 thread_create_immovable(
 	task_t                          task,
 	thread_t                        *new_thread)
 {
 	return thread_create_with_options_internal(task, new_thread, FALSE,
-	           TH_OPTION_IMMOVABLE, (thread_continue_t)thread_bootstrap_return);
+	           TH_OPTION_NONE, (thread_continue_t)thread_bootstrap_return);
 }
 
 kern_return_t
@@ -1469,6 +1690,7 @@ thread_create_from_user(
 	task_t                          task,
 	thread_t                        *new_thread)
 {
+	/* All thread ports are created immovable by default */
 	return thread_create_with_options_internal(task, new_thread, TRUE, TH_OPTION_NONE,
 	           (thread_continue_t)thread_bootstrap_return);
 }
@@ -1491,11 +1713,12 @@ thread_create_waiting_internal(
 	thread_continue_t       continuation,
 	event_t                 event,
 	block_hint_t            block_hint,
-	int                     options,
+	thread_create_internal_options_t options,
 	thread_t                *new_thread)
 {
 	kern_return_t result;
 	thread_t thread;
+	wait_interrupt_t wait_interrupt = THREAD_INTERRUPTIBLE;
 
 	if (task == TASK_NULL || task == kernel_task) {
 		return KERN_INVALID_ARGUMENT;
@@ -1518,8 +1741,10 @@ thread_create_waiting_internal(
 	if (options & TH_OPTION_WORKQ) {
 		thread->static_param = true;
 		event = workq_thread_init_and_wq_lock(task, thread);
+	} else if (options & TH_OPTION_MAINTHREAD) {
+		wait_interrupt = THREAD_UNINT;
 	}
-	thread_start_in_assert_wait(thread, event, THREAD_INTERRUPTIBLE);
+	thread_start_in_assert_wait(thread, event, wait_interrupt);
 	thread_mtx_unlock(thread);
 
 	task_unlock(task);
@@ -1531,25 +1756,14 @@ thread_create_waiting_internal(
 }
 
 kern_return_t
-thread_create_waiting(
+main_thread_create_waiting(
 	task_t                          task,
 	thread_continue_t               continuation,
 	event_t                         event,
-	th_create_waiting_options_t     options,
 	thread_t                        *new_thread)
 {
-	thread_create_internal_options_t ci_options = TH_OPTION_NONE;
-
-	assert((options & ~TH_CREATE_WAITING_OPTION_MASK) == 0);
-	if (options & TH_CREATE_WAITING_OPTION_PINNED) {
-		ci_options |= TH_OPTION_PINNED;
-	}
-	if (options & TH_CREATE_WAITING_OPTION_IMMOVABLE) {
-		ci_options |= TH_OPTION_IMMOVABLE;
-	}
-
 	return thread_create_waiting_internal(task, continuation, event,
-	           kThreadWaitNone, ci_options, new_thread);
+	           kThreadWaitNone, TH_OPTION_MAINTHREAD, new_thread);
 }
 
 
@@ -1589,7 +1803,7 @@ thread_create_running_internal2(
 
 	if (from_user) {
 		result = machine_thread_state_convert_from_user(thread, flavor,
-		    new_state, new_state_count);
+		    new_state, new_state_count, NULL, 0, TSSF_FLAGS_NONE);
 	}
 	if (result == KERN_SUCCESS) {
 		result = machine_thread_set_state(thread, flavor, new_state,
@@ -1664,10 +1878,10 @@ thread_create_workq_waiting(
 	/*
 	 * Create thread, but don't pin control port just yet, in case someone calls
 	 * task_threads() and deallocates pinned port before kernel copyout happens,
-	 * which will result in pinned port guard exception. Instead, pin and make
-	 * it immovable atomically at copyout during workq_setup_and_run().
+	 * which will result in pinned port guard exception. Instead, pin and copyout
+	 * atomically during workq_setup_and_run().
 	 */
-	int options = TH_OPTION_NOCRED | TH_OPTION_NOSUSP | TH_OPTION_WORKQ | TH_OPTION_IMMOVABLE;
+	int options = TH_OPTION_NOSUSP | TH_OPTION_WORKQ;
 	return thread_create_waiting_internal(task, continuation, NULL,
 	           kThreadWaitParkedWorkQueue, options, new_thread);
 }
@@ -1690,7 +1904,7 @@ kernel_thread_create(
 	task_t                          task = kernel_task;
 
 	result = thread_create_internal(task, priority, continuation, parameter,
-	    TH_OPTION_NOCRED | TH_OPTION_NONE, &thread);
+	    TH_OPTION_NONE, &thread);
 	if (result != KERN_SUCCESS) {
 		return result;
 	}
@@ -1981,7 +2195,7 @@ thread_info_internal(
 		extended_info->pth_priority = thread->base_pri;
 		extended_info->pth_maxpriority = thread->max_priority;
 
-		bsd_getthreadname(thread->uthread, extended_info->pth_name);
+		bsd_getthreadname(get_bsdthread_info(thread), extended_info->pth_name);
 
 		thread_unlock(thread);
 		splx(s);
@@ -2012,105 +2226,46 @@ thread_info_internal(
 	return KERN_INVALID_ARGUMENT;
 }
 
+static void
+_convert_mach_to_time_value(uint64_t time_mach, time_value_t *time)
+{
+	clock_sec_t  secs;
+	clock_usec_t usecs;
+	absolutetime_to_microtime(time_mach, &secs, &usecs);
+	time->seconds = (typeof(time->seconds))secs;
+	time->microseconds = usecs;
+}
+
 void
 thread_read_times(
-	thread_t                thread,
-	time_value_t    *user_time,
-	time_value_t    *system_time,
-	time_value_t    *runnable_time)
+	thread_t      thread,
+	time_value_t *user_time,
+	time_value_t *system_time,
+	time_value_t *runnable_time)
 {
-	clock_sec_t             secs;
-	clock_usec_t    usecs;
-	uint64_t                tval_user, tval_system;
-
-	tval_user = timer_grab(&thread->user_timer);
-	tval_system = timer_grab(&thread->system_timer);
-
-	if (thread->precise_user_kernel_time) {
-		absolutetime_to_microtime(tval_user, &secs, &usecs);
-		user_time->seconds = (typeof(user_time->seconds))secs;
-		user_time->microseconds = usecs;
-
-		absolutetime_to_microtime(tval_system, &secs, &usecs);
-		system_time->seconds = (typeof(system_time->seconds))secs;
-		system_time->microseconds = usecs;
-	} else {
-		/* system_timer may represent either sys or user */
-		tval_user += tval_system;
-		absolutetime_to_microtime(tval_user, &secs, &usecs);
-		user_time->seconds = (typeof(user_time->seconds))secs;
-		user_time->microseconds = usecs;
-
-		system_time->seconds = 0;
-		system_time->microseconds = 0;
+	if (user_time && system_time) {
+		struct recount_times_mach times = recount_thread_times(thread);
+		_convert_mach_to_time_value(times.rtm_user, user_time);
+		_convert_mach_to_time_value(times.rtm_system, system_time);
 	}
 
 	if (runnable_time) {
-		uint64_t tval_runnable = timer_grab(&thread->runnable_timer);
-		absolutetime_to_microtime(tval_runnable, &secs, &usecs);
-		runnable_time->seconds = (typeof(runnable_time->seconds))secs;
-		runnable_time->microseconds = usecs;
+		uint64_t runnable_time_mach = timer_grab(&thread->runnable_timer);
+		_convert_mach_to_time_value(runnable_time_mach, runnable_time);
 	}
 }
 
 uint64_t
 thread_get_runtime_self(void)
 {
-	boolean_t interrupt_state;
-	uint64_t runtime;
-	thread_t thread = NULL;
-	processor_t processor = NULL;
-
-	thread = current_thread();
-
-	/* Not interrupt safe, as the scheduler may otherwise update timer values underneath us */
-	interrupt_state = ml_set_interrupts_enabled(FALSE);
-	processor = current_processor();
-	timer_update(processor->thread_timer, mach_absolute_time());
-	runtime = (timer_grab(&thread->user_timer) + timer_grab(&thread->system_timer));
+	/*
+	 * Must be guaranteed to stay on the same CPU and not be updated by the
+	 * scheduler.
+	 */
+	boolean_t interrupt_state = ml_set_interrupts_enabled(FALSE);
+	uint64_t time_mach = recount_current_thread_time_mach();
 	ml_set_interrupts_enabled(interrupt_state);
-
-	return runtime;
-}
-
-kern_return_t
-thread_assign(
-	__unused thread_t                       thread,
-	__unused processor_set_t        new_pset)
-{
-	return KERN_FAILURE;
-}
-
-/*
- *	thread_assign_default:
- *
- *	Special version of thread_assign for assigning threads to default
- *	processor set.
- */
-kern_return_t
-thread_assign_default(
-	thread_t                thread)
-{
-	return thread_assign(thread, &pset0);
-}
-
-/*
- *	thread_get_assignment
- *
- *	Return current assignment for this thread.
- */
-kern_return_t
-thread_get_assignment(
-	thread_t                thread,
-	processor_set_t *pset)
-{
-	if (thread == NULL) {
-		return KERN_INVALID_ARGUMENT;
-	}
-
-	*pset = &pset0;
-
-	return KERN_SUCCESS;
+	return time_mach;
 }
 
 /*
@@ -2164,6 +2319,11 @@ thread_wire(
 	return thread_wire_internal(host_priv, thread, wired, NULL);
 }
 
+boolean_t
+is_external_pageout_thread(void)
+{
+	return current_thread() == pgo_iothread_external_state.pgo_iothread;
+}
 
 boolean_t
 is_vm_privileged(void)
@@ -2192,19 +2352,78 @@ set_vm_privilege(boolean_t privileged)
 }
 
 void
-set_thread_rwlock_boost(void)
+thread_floor_boost_set_promotion_locked(thread_t thread)
 {
-	current_thread()->rwlock_count++;
+	assert(thread->priority_floor_count > 0);
+
+	if (!(thread->sched_flags & TH_SFLAG_FLOOR_PROMOTED)) {
+		sched_thread_promote_reason(thread, TH_SFLAG_FLOOR_PROMOTED, 0);
+	}
 }
 
+/*!  @function thread_priority_floor_start
+ *   @abstract boost the current thread priority to floor.
+ *   @discussion Increase the priority of the current thread to at least MINPRI_FLOOR.
+ *       The boost will be mantained until a corresponding thread_priority_floor_end()
+ *       is called. Every call of thread_priority_floor_start() needs to have a corresponding
+ *       call to thread_priority_floor_end() from the same thread.
+ *       No thread can return to userspace before calling thread_priority_floor_end().
+ *
+ *       NOTE: avoid to use this function. Try to use gate_t or sleep_with_inheritor()
+ *       instead.
+ *   @result a token to be given to the corresponding thread_priority_floor_end()
+ */
+thread_pri_floor_t
+thread_priority_floor_start(void)
+{
+	thread_pri_floor_t ret;
+	thread_t thread = current_thread();
+	__assert_only uint16_t prev_priority_floor_count;
+
+	assert(thread->priority_floor_count < UINT16_MAX);
+	prev_priority_floor_count = thread->priority_floor_count++;
+#if MACH_ASSERT
+	/*
+	 * Set the ast to check that the
+	 * priority_floor_count is going to be set to zero when
+	 * going back to userspace.
+	 * Set it only once when we increment it for the first time.
+	 */
+	if (prev_priority_floor_count == 0) {
+		act_set_debug_assert();
+	}
+#endif
+
+	ret.thread = thread;
+	return ret;
+}
+
+/*!  @function thread_priority_floor_end
+ *   @abstract ends the floor boost.
+ *   @param token the token obtained from thread_priority_floor_start()
+ *   @discussion ends the priority floor boost started with thread_priority_floor_start()
+ */
 void
-clear_thread_rwlock_boost(void)
+thread_priority_floor_end(thread_pri_floor_t *token)
 {
 	thread_t thread = current_thread();
 
-	if ((thread->rwlock_count-- == 1) && (thread->sched_flags & TH_SFLAG_RW_PROMOTED)) {
-		lck_rw_clear_promotion(thread, 0);
+	assert(thread->priority_floor_count > 0);
+	assertf(token->thread == thread, "thread_priority_floor_end called from a different thread from thread_priority_floor_start %p %p", thread, token->thread);
+
+	if ((thread->priority_floor_count-- == 1) && (thread->sched_flags & TH_SFLAG_FLOOR_PROMOTED)) {
+		spl_t s = splsched();
+		thread_lock(thread);
+
+		if (thread->sched_flags & TH_SFLAG_FLOOR_PROMOTED) {
+			sched_thread_unpromote_reason(thread, TH_SFLAG_FLOOR_PROMOTED, 0);
+		}
+
+		thread_unlock(thread);
+		splx(s);
 	}
+
+	token->thread = NULL;
 }
 
 /*
@@ -2220,7 +2439,7 @@ thread_guard_violation(thread_t thread,
 	 * that the guard_exc_* fields in the thread structure are set only by the
 	 * current thread and therefore, don't require a lock.
 	 */
-	if (thread->task == kernel_task) {
+	if (get_threadtask(thread) == kernel_task) {
 		return;
 	}
 
@@ -2246,6 +2465,10 @@ thread_guard_violation(thread_t thread,
 	ast_propagate(thread);
 	splx(s);
 }
+
+#if CONFIG_DEBUG_SYSCALL_REJECTION
+extern void rejected_syscall_guard_ast(thread_t __unused t, mach_exception_data_type_t code, mach_exception_data_type_t subcode);
+#endif /* CONFIG_DEBUG_SYSCALL_REJECTION */
 
 /*
  *	guard_ast:
@@ -2285,6 +2508,11 @@ guard_ast(thread_t t)
 	case GUARD_TYPE_VIRT_MEMORY:
 		virt_memory_guard_ast(t, code, subcode);
 		break;
+#if CONFIG_DEBUG_SYSCALL_REJECTION
+	case GUARD_TYPE_REJECTED_SC:
+		rejected_syscall_guard_ast(t, code, subcode);
+		break;
+#endif /* CONFIG_DEBUG_SYSCALL_REJECTION */
 	default:
 		panic("guard_exc_info %llx %llx", code, subcode);
 	}
@@ -2371,8 +2599,9 @@ SENDING_NOTIFICATION__THIS_THREAD_IS_CONSUMING_TOO_MUCH_CPU(void)
 
 #ifdef MACH_BSD
 	pid = proc_selfpid();
-	if (task->bsd_info != NULL) {
-		procname = proc_name_address(task->bsd_info);
+	void *bsd_info = get_bsdtask_info(task);
+	if (bsd_info != NULL) {
+		procname = proc_name_address(bsd_info);
 	}
 #endif
 
@@ -2464,6 +2693,8 @@ SENDING_NOTIFICATION__THIS_THREAD_IS_CONSUMING_TOO_MUCH_CPU(void)
 	}
 }
 
+bool os_variant_has_internal_diagnostics(const char *subsystem);
+
 #if DEVELOPMENT || DEBUG
 void __attribute__((noinline))
 SENDING_NOTIFICATION__TASK_HAS_TOO_MANY_THREADS(task_t task, int thread_count)
@@ -2483,7 +2714,13 @@ SENDING_NOTIFICATION__TASK_HAS_TOO_MANY_THREADS(task_t task, int thread_count)
 
 	if (disable_exc_resource) {
 		printf("process %s[%d] crossed thread count high watermark (%d), EXC_RESOURCE "
-		    "supressed by a boot-arg. \n", procname, pid, thread_count);
+		    "supressed by a boot-arg.\n", procname, pid, thread_count);
+		return;
+	}
+
+	if (!os_variant_has_internal_diagnostics("com.apple.xnu")) {
+		printf("process %s[%d] crossed thread count high watermark (%d), EXC_RESOURCE "
+		    "supressed, internal diagnostics disabled.\n", procname, pid, thread_count);
 		return;
 	}
 
@@ -2493,7 +2730,7 @@ SENDING_NOTIFICATION__TASK_HAS_TOO_MANY_THREADS(task_t task, int thread_count)
 		return;
 	}
 
-	if (exc_via_corpse_forking == 0) {
+	if (!exc_via_corpse_forking) {
 		printf("process %s[%d] crossed thread count high watermark (%d), EXC_RESOURCE "
 		    "supressed due to corpse forking being disabled.\n", procname, pid,
 		    thread_count);
@@ -2507,47 +2744,48 @@ SENDING_NOTIFICATION__TASK_HAS_TOO_MANY_THREADS(task_t task, int thread_count)
 	EXC_RESOURCE_ENCODE_FLAVOR(code[0], FLAVOR_THREADS_HIGH_WATERMARK);
 	EXC_RESOURCE_THREADS_ENCODE_THREADS(code[0], thread_count);
 
-	task_enqueue_exception_with_corpse(task, EXC_RESOURCE, code, EXCEPTION_CODE_MAX, NULL);
+	task_enqueue_exception_with_corpse(task, EXC_RESOURCE, code, EXCEPTION_CODE_MAX, NULL, FALSE);
 }
 #endif /* DEVELOPMENT || DEBUG */
 
 void
 thread_update_io_stats(thread_t thread, int size, int io_flags)
 {
+	task_t task = get_threadtask(thread);
 	int io_tier;
 
-	if (thread->thread_io_stats == NULL || thread->task->task_io_stats == NULL) {
+	if (thread->thread_io_stats == NULL || task->task_io_stats == NULL) {
 		return;
 	}
 
 	if (io_flags & DKIO_READ) {
 		UPDATE_IO_STATS(thread->thread_io_stats->disk_reads, size);
-		UPDATE_IO_STATS_ATOMIC(thread->task->task_io_stats->disk_reads, size);
+		UPDATE_IO_STATS_ATOMIC(task->task_io_stats->disk_reads, size);
 	}
 
 	if (io_flags & DKIO_META) {
 		UPDATE_IO_STATS(thread->thread_io_stats->metadata, size);
-		UPDATE_IO_STATS_ATOMIC(thread->task->task_io_stats->metadata, size);
+		UPDATE_IO_STATS_ATOMIC(task->task_io_stats->metadata, size);
 	}
 
 	if (io_flags & DKIO_PAGING) {
 		UPDATE_IO_STATS(thread->thread_io_stats->paging, size);
-		UPDATE_IO_STATS_ATOMIC(thread->task->task_io_stats->paging, size);
+		UPDATE_IO_STATS_ATOMIC(task->task_io_stats->paging, size);
 	}
 
 	io_tier = ((io_flags & DKIO_TIER_MASK) >> DKIO_TIER_SHIFT);
 	assert(io_tier < IO_NUM_PRIORITIES);
 
 	UPDATE_IO_STATS(thread->thread_io_stats->io_priority[io_tier], size);
-	UPDATE_IO_STATS_ATOMIC(thread->task->task_io_stats->io_priority[io_tier], size);
+	UPDATE_IO_STATS_ATOMIC(task->task_io_stats->io_priority[io_tier], size);
 
 	/* Update Total I/O Counts */
 	UPDATE_IO_STATS(thread->thread_io_stats->total_io, size);
-	UPDATE_IO_STATS_ATOMIC(thread->task->task_io_stats->total_io, size);
+	UPDATE_IO_STATS_ATOMIC(task->task_io_stats->total_io, size);
 
 	if (!(io_flags & DKIO_READ)) {
-		DTRACE_IO3(physical_writes, struct task *, thread->task, uint32_t, size, int, io_flags);
-		ledger_credit(thread->task->ledger, task_ledgers.physical_writes, size);
+		DTRACE_IO3(physical_writes, struct task *, task, uint32_t, size, int, io_flags);
+		ledger_credit(task->ledger, task_ledgers.physical_writes, size);
 	}
 }
 
@@ -2575,6 +2813,63 @@ init_thread_ledgers(void)
 
 	ledger_template_complete(t);
 	thread_ledger_template = t;
+}
+
+/*
+ * Returns the amount of (abs) CPU time that remains before the limit would be
+ * hit or the amount of time left in the current interval, whichever is smaller.
+ * This value changes as CPU time is consumed and the ledgers refilled.
+ * Used to limit the quantum of a thread.
+ */
+uint64_t
+thread_cpulimit_remaining(uint64_t now)
+{
+	thread_t thread = current_thread();
+
+	if ((thread->options &
+	    (TH_OPT_PROC_CPULIMIT | TH_OPT_PRVT_CPULIMIT)) == 0) {
+		return UINT64_MAX;
+	}
+
+	/* Amount of time left in the current interval. */
+	const uint64_t interval_remaining =
+	    ledger_get_interval_remaining(thread->t_threadledger, thread_ledgers.cpu_time, now);
+
+	/* Amount that can be spent until the limit is hit. */
+	const uint64_t remaining =
+	    ledger_get_remaining(thread->t_threadledger, thread_ledgers.cpu_time);
+
+	return MIN(interval_remaining, remaining);
+}
+
+/*
+ * Returns true if a new interval should be started.
+ */
+bool
+thread_cpulimit_interval_has_expired(uint64_t now)
+{
+	thread_t thread = current_thread();
+
+	if ((thread->options &
+	    (TH_OPT_PROC_CPULIMIT | TH_OPT_PRVT_CPULIMIT)) == 0) {
+		return false;
+	}
+
+	return ledger_get_interval_remaining(thread->t_threadledger,
+	           thread_ledgers.cpu_time, now) == 0;
+}
+
+/*
+ * Balances the ledger and sets the last refill time to `now`.
+ */
+void
+thread_cpulimit_restart(uint64_t now)
+{
+	thread_t thread = current_thread();
+
+	assert3u(thread->options & (TH_OPT_PROC_CPULIMIT | TH_OPT_PRVT_CPULIMIT), !=, 0);
+
+	ledger_restart(thread->t_threadledger, thread_ledgers.cpu_time, now);
 }
 
 /*
@@ -2634,8 +2929,6 @@ thread_get_cpulimit(int *action, uint8_t *percentage, uint64_t *interval_ns)
 
 /*
  * Set CPU usage limit on a thread.
- *
- * Calling with percentage of 0 will unset the limit for this thread.
  */
 int
 thread_set_cpulimit(int action, uint8_t percentage, uint64_t interval_ns)
@@ -2646,6 +2939,15 @@ thread_set_cpulimit(int action, uint8_t percentage, uint64_t interval_ns)
 	uint64_t        abstime = 0;
 
 	assert(percentage <= 100);
+	assert(percentage > 0 || action == THREAD_CPULIMIT_DISABLE);
+
+	/*
+	 * Disallow any change to the CPU limit if the TH_OPT_FORCED_LEDGER
+	 * flag is set.
+	 */
+	if ((thread->options & TH_OPT_FORCED_LEDGER) != 0) {
+		return KERN_FAILURE;
+	}
 
 	if (action == THREAD_CPULIMIT_DISABLE) {
 		/*
@@ -2741,6 +3043,16 @@ thread_tid(
 	return thread != THREAD_NULL? thread->thread_id: 0;
 }
 
+uint64_t
+uthread_tid(
+	struct uthread *uth)
+{
+	if (uth) {
+		return thread_tid(get_machthread(uth));
+	}
+	return 0;
+}
+
 uint16_t
 thread_set_tag(thread_t th, uint16_t tag)
 {
@@ -2759,12 +3071,139 @@ thread_last_run_time(thread_t th)
 	return th->last_run_time;
 }
 
+/*
+ * Shared resource contention management
+ *
+ * The scheduler attempts to load balance the shared resource intensive
+ * workloads across clusters to ensure that the resource is not heavily
+ * contended. The kernel relies on external agents (userspace or
+ * performance controller) to identify shared resource heavy threads.
+ * The load balancing is achieved based on the scheduler configuration
+ * enabled on the platform.
+ */
+
+
+#if CONFIG_SCHED_EDGE
+
+/*
+ * On the Edge scheduler, the load balancing is achieved by looking
+ * at cluster level shared resource loads and migrating resource heavy
+ * threads dynamically to under utilized cluster. Therefore, when a
+ * thread is indicated as a resource heavy thread, the policy set
+ * routine simply adds a flag to the thread which is looked at by
+ * the scheduler on thread migration decisions.
+ */
+
+boolean_t
+thread_shared_rsrc_policy_get(thread_t thread, cluster_shared_rsrc_type_t type)
+{
+	return thread->th_shared_rsrc_heavy_user[type] || thread->th_shared_rsrc_heavy_perf_control[type];
+}
+
+__options_decl(sched_edge_rsrc_heavy_thread_state, uint32_t, {
+	SCHED_EDGE_RSRC_HEAVY_THREAD_SET = 1,
+	SCHED_EDGE_RSRC_HEAVY_THREAD_CLR = 2,
+});
+
+kern_return_t
+thread_shared_rsrc_policy_set(thread_t thread, __unused uint32_t index, cluster_shared_rsrc_type_t type, shared_rsrc_policy_agent_t agent)
+{
+	spl_t s = splsched();
+	thread_lock(thread);
+
+	bool user = (agent == SHARED_RSRC_POLICY_AGENT_DISPATCH) || (agent == SHARED_RSRC_POLICY_AGENT_SYSCTL);
+	bool *thread_flags = (user) ? thread->th_shared_rsrc_heavy_user : thread->th_shared_rsrc_heavy_perf_control;
+	if (thread_flags[type]) {
+		thread_unlock(thread);
+		splx(s);
+		return KERN_FAILURE;
+	}
+
+	thread_flags[type] = true;
+	thread_unlock(thread);
+	splx(s);
+
+	KDBG(MACHDBG_CODE(DBG_MACH_SCHED_CLUTCH, MACH_SCHED_EDGE_RSRC_HEAVY_THREAD) | DBG_FUNC_NONE, SCHED_EDGE_RSRC_HEAVY_THREAD_SET, thread_tid(thread), type, agent);
+	if (thread == current_thread()) {
+		if (agent == SHARED_RSRC_POLICY_AGENT_PERFCTL_QUANTUM) {
+			ast_on(AST_PREEMPT);
+		} else {
+			assert(agent != SHARED_RSRC_POLICY_AGENT_PERFCTL_CSW);
+			thread_block(THREAD_CONTINUE_NULL);
+		}
+	}
+	return KERN_SUCCESS;
+}
+
+kern_return_t
+thread_shared_rsrc_policy_clear(thread_t thread, cluster_shared_rsrc_type_t type, shared_rsrc_policy_agent_t agent)
+{
+	spl_t s = splsched();
+	thread_lock(thread);
+
+	bool user = (agent == SHARED_RSRC_POLICY_AGENT_DISPATCH) || (agent == SHARED_RSRC_POLICY_AGENT_SYSCTL);
+	bool *thread_flags = (user) ? thread->th_shared_rsrc_heavy_user : thread->th_shared_rsrc_heavy_perf_control;
+	if (!thread_flags[type]) {
+		thread_unlock(thread);
+		splx(s);
+		return KERN_FAILURE;
+	}
+
+	thread_flags[type] = false;
+	thread_unlock(thread);
+	splx(s);
+
+	KDBG(MACHDBG_CODE(DBG_MACH_SCHED_CLUTCH, MACH_SCHED_EDGE_RSRC_HEAVY_THREAD) | DBG_FUNC_NONE, SCHED_EDGE_RSRC_HEAVY_THREAD_CLR, thread_tid(thread), type, agent);
+	if (thread == current_thread()) {
+		if (agent == SHARED_RSRC_POLICY_AGENT_PERFCTL_QUANTUM) {
+			ast_on(AST_PREEMPT);
+		} else {
+			assert(agent != SHARED_RSRC_POLICY_AGENT_PERFCTL_CSW);
+			thread_block(THREAD_CONTINUE_NULL);
+		}
+	}
+	return KERN_SUCCESS;
+}
+
+#else /* CONFIG_SCHED_EDGE */
+
+/*
+ * On non-Edge schedulers, the shared resource contention
+ * is managed by simply binding threads to specific clusters
+ * based on the worker index passed by the agents marking
+ * this thread as resource heavy threads. The thread binding
+ * approach does not provide any rebalancing opportunities;
+ * it can also suffer from scheduling delays if the cluster
+ * where the thread is bound is contended.
+ */
+
+boolean_t
+thread_shared_rsrc_policy_get(__unused thread_t thread, __unused cluster_shared_rsrc_type_t type)
+{
+	return false;
+}
+
+kern_return_t
+thread_shared_rsrc_policy_set(thread_t thread, uint32_t index, __unused cluster_shared_rsrc_type_t type, __unused shared_rsrc_policy_agent_t agent)
+{
+	return thread_bind_cluster_id(thread, index, THREAD_BIND_SOFT | THREAD_BIND_ELIGIBLE_ONLY);
+}
+
+kern_return_t
+thread_shared_rsrc_policy_clear(thread_t thread, __unused cluster_shared_rsrc_type_t type, __unused shared_rsrc_policy_agent_t agent)
+{
+	return thread_bind_cluster_id(thread, 0, THREAD_UNBIND);
+}
+
+#endif /* CONFIG_SCHED_EDGE */
+
 uint64_t
 thread_dispatchqaddr(
 	thread_t                thread)
 {
 	uint64_t        dispatchqueue_addr;
 	uint64_t        thread_handle;
+	task_t          task;
 
 	if (thread == THREAD_NULL) {
 		return 0;
@@ -2775,15 +3214,42 @@ thread_dispatchqaddr(
 		return 0;
 	}
 
+	task = get_threadtask(thread);
+	void *bsd_info = get_bsdtask_info(task);
 	if (thread->inspection == TRUE) {
-		dispatchqueue_addr = thread_handle + get_task_dispatchqueue_offset(thread->task);
-	} else if (thread->task->bsd_info) {
-		dispatchqueue_addr = thread_handle + get_dispatchqueue_offset_from_proc(thread->task->bsd_info);
+		dispatchqueue_addr = thread_handle + get_task_dispatchqueue_offset(task);
+	} else if (bsd_info) {
+		dispatchqueue_addr = thread_handle + get_dispatchqueue_offset_from_proc(bsd_info);
 	} else {
 		dispatchqueue_addr = 0;
 	}
 
 	return dispatchqueue_addr;
+}
+
+
+uint64_t
+thread_wqquantum_addr(thread_t thread)
+{
+	uint64_t thread_handle;
+	task_t   task;
+
+	if (thread == THREAD_NULL) {
+		return 0;
+	}
+
+	thread_handle = thread->machine.cthread_self;
+	if (thread_handle == 0) {
+		return 0;
+	}
+	task = get_threadtask(thread);
+
+	uint64_t wq_quantum_expiry_offset = get_wq_quantum_offset_from_proc(get_bsdtask_info(task));
+	if (wq_quantum_expiry_offset == 0) {
+		return 0;
+	}
+
+	return wq_quantum_expiry_offset + thread_handle;
 }
 
 uint64_t
@@ -2793,6 +3259,8 @@ thread_rettokern_addr(
 	uint64_t        rettokern_addr;
 	uint64_t        rettokern_offset;
 	uint64_t        thread_handle;
+	task_t          task;
+	void            *bsd_info;
 
 	if (thread == THREAD_NULL) {
 		return 0;
@@ -2802,9 +3270,11 @@ thread_rettokern_addr(
 	if (thread_handle == 0) {
 		return 0;
 	}
+	task = get_threadtask(thread);
+	bsd_info = get_bsdtask_info(task);
 
-	if (thread->task->bsd_info) {
-		rettokern_offset = get_return_to_kernel_offset_from_proc(thread->task->bsd_info);
+	if (bsd_info) {
+		rettokern_offset = get_return_to_kernel_offset_from_proc(bsd_info);
 
 		/* Return 0 if return to kernel offset is not initialized. */
 		if (rettokern_offset == 0) {
@@ -2824,31 +3294,32 @@ thread_rettokern_addr(
  * within the osfmk component.
  */
 
-#undef thread_mtx_lock
-void thread_mtx_lock(thread_t thread);
 void
 thread_mtx_lock(thread_t thread)
 {
 	lck_mtx_lock(&thread->mutex);
 }
 
-#undef thread_mtx_unlock
-void thread_mtx_unlock(thread_t thread);
 void
 thread_mtx_unlock(thread_t thread)
 {
 	lck_mtx_unlock(&thread->mutex);
 }
 
-#undef thread_reference
-void thread_reference(thread_t thread);
 void
 thread_reference(
 	thread_t        thread)
 {
 	if (thread != THREAD_NULL) {
-		thread_reference_internal(thread);
+		zone_id_require(ZONE_ID_THREAD, sizeof(struct thread), thread);
+		os_ref_retain_raw(&thread->ref_count, &thread_refgrp);
 	}
+}
+
+void
+thread_require(thread_t thread)
+{
+	zone_id_require(ZONE_ID_THREAD, sizeof(struct thread), thread);
 }
 
 #undef thread_should_halt
@@ -3036,7 +3507,7 @@ thread_swap_mach_voucher(
 	 * a call to release it has been added here.
 	 */
 	ipc_voucher_release(*in_out_old_voucher);
-	return KERN_NOT_SUPPORTED;
+	OS_ANALYZER_SUPPRESS("81787115") return KERN_NOT_SUPPORTED;
 }
 
 /*
@@ -3046,20 +3517,23 @@ kern_return_t
 thread_get_current_voucher_origin_pid(
 	int32_t      *pid)
 {
-	uint32_t buf_size;
-	kern_return_t kr;
-	thread_t thread = current_thread();
+	return thread_get_voucher_origin_pid(current_thread(), pid);
+}
 
-	buf_size = sizeof(*pid);
-	kr = mach_voucher_attr_command(thread->ith_voucher,
-	    MACH_VOUCHER_ATTR_KEY_BANK,
-	    BANK_ORIGINATOR_PID,
-	    NULL,
-	    0,
-	    (mach_voucher_attr_content_t)pid,
-	    &buf_size);
-
-	return kr;
+/*
+ *  thread_get_current_voucher_origin_pid - get the pid of the originator of the current voucher.
+ */
+kern_return_t
+thread_get_voucher_origin_pid(thread_t thread, int32_t *pid)
+{
+	uint32_t buf_size = sizeof(*pid);
+	return mach_voucher_attr_command(thread->ith_voucher,
+	           MACH_VOUCHER_ATTR_KEY_BANK,
+	           BANK_ORIGINATOR_PID,
+	           NULL,
+	           0,
+	           (mach_voucher_attr_content_t)pid,
+	           &buf_size);
 }
 
 #if CONFIG_THREAD_GROUPS
@@ -3088,11 +3562,179 @@ thread_get_current_voucher_thread_group(thread_t thread)
 
 #endif /* CONFIG_THREAD_GROUPS */
 
+#if CONFIG_COALITIONS
+
+uint64_t
+thread_get_current_voucher_resource_coalition_id(thread_t thread)
+{
+	uint64_t id = 0;
+	assert(thread == current_thread());
+	if (thread->ith_voucher != NULL) {
+		id = bank_get_bank_ledger_resource_coalition_id(thread->ith_voucher);
+	}
+	return id;
+}
+
+#endif /* CONFIG_COALITIONS */
+
+extern struct workqueue *
+proc_get_wqptr(void *proc);
+
+static bool
+task_supports_cooperative_workqueue(task_t task)
+{
+	void *bsd_info = get_bsdtask_info(task);
+
+	assert(task == current_task());
+	if (bsd_info == NULL) {
+		return false;
+	}
+
+	uint64_t wq_quantum_expiry_offset = get_wq_quantum_offset_from_proc(bsd_info);
+	/* userspace may not yet have called workq_open yet */
+	struct workqueue *wq = proc_get_wqptr(bsd_info);
+
+	return (wq != NULL) && (wq_quantum_expiry_offset != 0);
+}
+
+/* Not safe to call from scheduler paths - should only be called on self */
+bool
+thread_supports_cooperative_workqueue(thread_t thread)
+{
+	struct uthread *uth = get_bsdthread_info(thread);
+	task_t task = get_threadtask(thread);
+
+	assert(thread == current_thread());
+
+	return task_supports_cooperative_workqueue(task) &&
+	       bsdthread_part_of_cooperative_workqueue(uth);
+}
+
+static inline bool
+thread_has_armed_workqueue_quantum(thread_t thread)
+{
+	return thread->workq_quantum_deadline != 0;
+}
+
+/*
+ * The workq quantum is a lazy timer that is evaluated at 2 specific times in
+ * the scheduler:
+ *
+ * - context switch time
+ * - scheduler quantum expiry time.
+ *
+ * We're currently expressing the workq quantum with a 0.5 scale factor of the
+ * scheduler quantum. It is possible that if the workq quantum is rearmed
+ * shortly after the scheduler quantum begins, we could have a large delay
+ * between when the workq quantum next expires and when it actually is noticed.
+ *
+ * A potential future improvement for the wq quantum expiry logic is to compare
+ * it to the next actual scheduler quantum deadline and expire it if it is
+ * within a certain leeway.
+ */
+static inline uint64_t
+thread_workq_quantum_size(thread_t thread)
+{
+	return (uint64_t) (SCHED(initial_quantum_size)(thread) / 2);
+}
+
+/*
+ * Always called by thread on itself - either at AST boundary after processing
+ * an existing quantum expiry, or when a new quantum is armed before the thread
+ * goes out to userspace to handle a thread request
+ */
+void
+thread_arm_workqueue_quantum(thread_t thread)
+{
+	/*
+	 * If the task is not opted into wq quantum notification, or if the thread
+	 * is not part of the cooperative workqueue, don't even bother with tracking
+	 * the quantum or calculating expiry
+	 */
+	if (!thread_supports_cooperative_workqueue(thread)) {
+		assert(thread->workq_quantum_deadline == 0);
+		return;
+	}
+
+	assert(current_thread() == thread);
+	assert(thread_get_tag(thread) & THREAD_TAG_WORKQUEUE);
+
+	uint64_t current_runtime = thread_get_runtime_self();
+	uint64_t deadline = thread_workq_quantum_size(thread) + current_runtime;
+
+	/*
+	 * The update of a workqueue quantum should always be followed by the update
+	 * of the AST - see explanation in kern/thread.h for synchronization of this
+	 * field
+	 */
+	thread->workq_quantum_deadline = deadline;
+
+	/* We're arming a new quantum, clear any previous expiry notification */
+	act_clear_astkevent(thread, AST_KEVENT_WORKQ_QUANTUM_EXPIRED);
+
+	WQ_TRACE(TRACE_wq_quantum_arm, current_runtime, deadline, 0, 0);
+
+	WORKQ_QUANTUM_HISTORY_WRITE_ENTRY(thread, thread->workq_quantum_deadline, true);
+}
+
+/* Called by a thread on itself when it is about to park */
+void
+thread_disarm_workqueue_quantum(thread_t thread)
+{
+	/* The update of a workqueue quantum should always be followed by the update
+	 * of the AST - see explanation in kern/thread.h for synchronization of this
+	 * field */
+	thread->workq_quantum_deadline = 0;
+	act_clear_astkevent(thread, AST_KEVENT_WORKQ_QUANTUM_EXPIRED);
+
+	WQ_TRACE(TRACE_wq_quantum_disarm, 0, 0, 0, 0);
+
+	WORKQ_QUANTUM_HISTORY_WRITE_ENTRY(thread, thread->workq_quantum_deadline, false);
+}
+
+/* This is called at context switch time on a thread that may not be self,
+ * and at AST time
+ */
+bool
+thread_has_expired_workqueue_quantum(thread_t thread, bool should_trace)
+{
+	if (!thread_has_armed_workqueue_quantum(thread)) {
+		return false;
+	}
+	/* We do not do a thread_get_runtime_self() here since this function is
+	 * called from context switch time or during scheduler quantum expiry and
+	 * therefore, we may not be evaluating it on the current thread/self.
+	 *
+	 * In addition, the timers on the thread have just been updated recently so
+	 * we don't need to update them again.
+	 */
+	uint64_t runtime = recount_thread_time_mach(thread);
+	bool expired = runtime > thread->workq_quantum_deadline;
+
+	if (expired && should_trace) {
+		WQ_TRACE(TRACE_wq_quantum_expired, runtime, thread->workq_quantum_deadline, 0, 0);
+	}
+
+	return expired;
+}
+
+/*
+ * Called on a thread that is being context switched out or during quantum
+ * expiry on self. Only called from scheduler paths.
+ */
+void
+thread_evaluate_workqueue_quantum_expiry(thread_t thread)
+{
+	if (thread_has_expired_workqueue_quantum(thread, true)) {
+		act_set_astkevent(thread, AST_KEVENT_WORKQ_QUANTUM_EXPIRED);
+	}
+}
+
 boolean_t
 thread_has_thread_name(thread_t th)
 {
-	if ((th) && (th->uthread)) {
-		return bsd_hasthreadname(th->uthread);
+	if (th) {
+		return bsd_hasthreadname(get_bsdthread_info(th));
 	}
 
 	/*
@@ -3105,8 +3747,8 @@ thread_has_thread_name(thread_t th)
 void
 thread_set_thread_name(thread_t th, const char* name)
 {
-	if ((th) && (th->uthread) && name) {
-		bsd_setthreadname(th->uthread, name);
+	if (th && name) {
+		bsd_setthreadname(get_bsdthread_info(th), name);
 	}
 }
 
@@ -3116,8 +3758,8 @@ thread_get_thread_name(thread_t th, char* name)
 	if (!name) {
 		return;
 	}
-	if ((th) && (th->uthread)) {
-		bsd_getthreadname(th->uthread, name);
+	if (th) {
+		bsd_getthreadname(get_bsdthread_info(th), name);
 	} else {
 		name[0] = '\0';
 	}
@@ -3146,6 +3788,25 @@ thread_enable_send_importance(thread_t thread, boolean_t enable)
 	} else {
 		thread->options &= ~TH_OPT_SEND_IMPORTANCE;
 	}
+}
+
+kern_return_t
+thread_get_ipc_propagate_attr(thread_t thread, struct thread_attr_for_ipc_propagation *attr)
+{
+	int iotier;
+	int qos;
+
+	if (thread == NULL || attr == NULL) {
+		return KERN_INVALID_ARGUMENT;
+	}
+
+	iotier = proc_get_effective_thread_policy(thread, TASK_POLICY_IO);
+	qos = proc_get_effective_thread_policy(thread, TASK_POLICY_QOS);
+
+	attr->tafip_iotier = iotier;
+	attr->tafip_qos = qos;
+
+	return KERN_SUCCESS;
 }
 
 /*
@@ -3203,33 +3864,34 @@ thread_kern_get_kernel_maxpri(void)
 	return MAXPRI_KERNEL;
 }
 /*
- *	thread_port_with_flavor_notify
+ *	thread_port_with_flavor_no_senders
  *
  *	Called whenever the Mach port system detects no-senders on
  *	the thread inspect or read port. These ports are allocated lazily and
  *	should be deallocated here when there are no senders remaining.
  */
-void
-thread_port_with_flavor_notify(mach_msg_header_t *msg)
+static void
+thread_port_with_flavor_no_senders(
+	ipc_port_t          port,
+	mach_port_mscount_t mscount __unused)
 {
-	mach_no_senders_notification_t *notification = (void *)msg;
-	ipc_port_t port = notification->not_header.msgh_remote_port;
+	thread_ro_t tro;
 	thread_t thread;
 	mach_thread_flavor_t flavor;
 	ipc_kobject_type_t kotype;
 
-	ip_lock(port);
+	ip_mq_lock(port);
 	if (port->ip_srights > 0) {
-		ip_unlock(port);
+		ip_mq_unlock(port);
 		return;
 	}
-	thread = (thread_t)ipc_kobject_get(port);
 	kotype = ip_kotype(port);
+	assert((IKOT_THREAD_READ == kotype) || (IKOT_THREAD_INSPECT == kotype));
+	thread = ipc_kobject_get_locked(port, kotype);
 	if (thread != THREAD_NULL) {
-		assert((IKOT_THREAD_READ == kotype) || (IKOT_THREAD_INSPECT == kotype));
-		thread_reference_internal(thread);
+		thread_reference(thread);
 	}
-	ip_unlock(port);
+	ip_mq_unlock(port);
 
 	if (thread == THREAD_NULL) {
 		/* The thread is exiting or disabled; it will eventually deallocate the port */
@@ -3243,7 +3905,8 @@ thread_port_with_flavor_notify(mach_msg_header_t *msg)
 	}
 
 	thread_mtx_lock(thread);
-	ip_lock(port);
+	ip_mq_lock(port);
+
 	/*
 	 * If the port is no longer active, then ipc_thread_terminate() ran
 	 * and destroyed the kobject already. Just deallocate the task
@@ -3257,23 +3920,23 @@ thread_port_with_flavor_notify(mach_msg_header_t *msg)
 	 * that vends out send rights to this port could resurrect it between
 	 * this notification being generated and actually being handled here.
 	 */
+	tro = get_thread_ro(thread);
 	if (!ip_active(port) ||
-	    thread->ith_thread_ports[flavor] != port ||
+	    tro->tro_ports[flavor] != port ||
 	    port->ip_srights > 0) {
-		ip_unlock(port);
+		ip_mq_unlock(port);
 		thread_mtx_unlock(thread);
 		thread_deallocate(thread);
 		return;
 	}
 
-	assert(thread->ith_thread_ports[flavor] == port);
-	thread->ith_thread_ports[flavor] = IP_NULL;
-	ipc_kobject_set_atomically(port, IKO_NULL, IKOT_NONE);
-	ip_unlock(port);
+	assert(tro->tro_ports[flavor] == port);
+	zalloc_ro_clear_field(ZONE_ID_THREAD_RO, tro, tro_ports[flavor]);
 	thread_mtx_unlock(thread);
-	thread_deallocate(thread);
 
-	ipc_port_dealloc_kernel(port);
+	ipc_kobject_dealloc_port_and_unlock(port, 0, kotype);
+
+	thread_deallocate(thread);
 }
 
 /*
@@ -3306,6 +3969,101 @@ thread_self_region_page_shift_set(
 	 */
 	current_thread()->thread_region_page_shift = pgshift;
 }
+
+__startup_func
+static void
+ctid_table_init(void)
+{
+	/*
+	 * Pretend the early boot setup didn't exist,
+	 * and pick a mangling nonce.
+	 */
+	*compact_id_resolve(&ctid_table, 0) = THREAD_NULL;
+	ctid_nonce = (uint32_t)early_random() & CTID_MASK;
+}
+
+
+/*
+ * This maps the [0, CTID_MAX_THREAD_NUMBER] range
+ * to [1, CTID_MAX_THREAD_NUMBER + 1 == CTID_MASK]
+ * so that in mangled form, '0' is an invalid CTID.
+ */
+static ctid_t
+ctid_mangle(compact_id_t cid)
+{
+	return (cid == ctid_nonce ? CTID_MASK : cid) ^ ctid_nonce;
+}
+
+static compact_id_t
+ctid_unmangle(ctid_t ctid)
+{
+	ctid ^= ctid_nonce;
+	return ctid == CTID_MASK ? ctid_nonce : ctid;
+}
+
+void
+ctid_table_add(thread_t thread)
+{
+	compact_id_t cid;
+
+	cid = compact_id_get(&ctid_table, CTID_MAX_THREAD_NUMBER, thread);
+	thread->ctid = ctid_mangle(cid);
+}
+
+void
+ctid_table_remove(thread_t thread)
+{
+	__assert_only thread_t value;
+
+	value = compact_id_put(&ctid_table, ctid_unmangle(thread->ctid));
+	assert3p(value, ==, thread);
+	thread->ctid = 0;
+}
+
+thread_t
+ctid_get_thread_unsafe(ctid_t ctid)
+{
+	if (ctid) {
+		return *compact_id_resolve(&ctid_table, ctid_unmangle(ctid));
+	}
+	return THREAD_NULL;
+}
+
+thread_t
+ctid_get_thread(ctid_t ctid)
+{
+	thread_t thread = THREAD_NULL;
+
+	if (ctid) {
+		thread = *compact_id_resolve(&ctid_table, ctid_unmangle(ctid));
+		assert(thread && thread->ctid == ctid);
+	}
+	return thread;
+}
+
+ctid_t
+thread_get_ctid(thread_t thread)
+{
+	return thread->ctid;
+}
+
+/*
+ * Adjust code signature dependent thread state.
+ *
+ * Called to allow code signature dependent adjustments to the thread
+ * state. Note that this is usually called twice for the main thread:
+ * Once at thread creation by thread_create, when the signature is
+ * potentially not attached yet (which is usually the case for the
+ * first/main thread of a task), and once after the task's signature
+ * has actually been attached.
+ *
+ */
+kern_return_t
+thread_process_signature(thread_t thread, task_t task)
+{
+	return machine_thread_process_signature(thread, task);
+}
+
 
 #if CONFIG_DTRACE
 uint32_t
@@ -3359,7 +4117,7 @@ dtrace_get_thread_inprobe(thread_t thread)
 }
 
 vm_offset_t
-dtrace_get_kernel_stack(thread_t thread)
+thread_get_kernel_stack(thread_t thread)
 {
 	if (thread != THREAD_NULL) {
 		return thread->kernel_stack;
@@ -3376,29 +4134,66 @@ kasan_get_thread_data(thread_t thread)
 }
 #endif
 
-#if CONFIG_KSANCOV
-void **
-__sanitizer_get_thread_data(thread_t thread)
+#if CONFIG_KCOV
+kcov_thread_data_t *
+kcov_get_thread_data(thread_t thread)
 {
-	return &thread->ksancov_data;
+	return &thread->kcov_data;
 }
 #endif
+
+#if CONFIG_STKSZ
+/*
+ * Returns base of a thread's kernel stack.
+ *
+ * Coverage sanitizer instruments every function including those that participates in stack handoff between threads.
+ * There is a window in which CPU still holds old values but stack has been handed over to anoher thread already.
+ * In this window kernel_stack is 0 but CPU still uses the original stack (until contex switch occurs). The original
+ * kernel_stack value is preserved in ksancov_stack during this window.
+ */
+vm_offset_t
+kcov_stksz_get_thread_stkbase(thread_t thread)
+{
+	if (thread != THREAD_NULL) {
+		kcov_thread_data_t *data = kcov_get_thread_data(thread);
+		if (data->ktd_stksz.kst_stack) {
+			return data->ktd_stksz.kst_stack;
+		} else {
+			return thread->kernel_stack;
+		}
+	} else {
+		return 0;
+	}
+}
+
+vm_offset_t
+kcov_stksz_get_thread_stksize(thread_t thread)
+{
+	if (thread != THREAD_NULL) {
+		return kernel_stack_size;
+	} else {
+		return 0;
+	}
+}
+
+void
+kcov_stksz_set_thread_stack(thread_t thread, vm_offset_t stack)
+{
+	kcov_thread_data_t *data = kcov_get_thread_data(thread);
+	data->ktd_stksz.kst_stack = stack;
+}
+#endif /* CONFIG_STKSZ */
 
 int64_t
 dtrace_calc_thread_recent_vtime(thread_t thread)
 {
-	if (thread != THREAD_NULL) {
-		processor_t             processor = current_processor();
-		uint64_t                                abstime = mach_absolute_time();
-		timer_t                                 timer;
-
-		timer = processor->thread_timer;
-
-		return timer_grab(&(thread->system_timer)) + timer_grab(&(thread->user_timer)) +
-		       (abstime - timer->tstamp);          /* XXX need interrupts off to prevent missed time? */
-	} else {
+	if (thread == THREAD_NULL) {
 		return 0;
 	}
+
+	struct recount_usage usage = { 0 };
+	recount_current_thread_usage(&usage);
+	return (int64_t)(usage.ru_system_time_mach + usage.ru_user_time_mach);
 }
 
 void
@@ -3431,31 +4226,6 @@ dtrace_set_thread_inprobe(thread_t thread, uint16_t inprobe)
 	if (thread != THREAD_NULL) {
 		thread->t_dtrace_inprobe = inprobe;
 	}
-}
-
-vm_offset_t
-dtrace_set_thread_recover(thread_t thread, vm_offset_t recover)
-{
-	vm_offset_t prev = 0;
-
-	if (thread != THREAD_NULL) {
-		prev = thread->recover;
-		thread->recover = recover;
-	}
-	return prev;
-}
-
-vm_offset_t
-dtrace_sign_and_set_thread_recover(thread_t thread, vm_offset_t recover)
-{
-#if defined(HAS_APPLE_PAC)
-	return dtrace_set_thread_recover(thread,
-	           (vm_address_t)ptrauth_sign_unauthenticated((void *)recover,
-	           ptrauth_key_function_pointer,
-	           ptrauth_blend_discriminator(&thread->recover, PAC_DISCRIMINATOR_RECOVER)));
-#else /* defined(HAS_APPLE_PAC) */
-	return dtrace_set_thread_recover(thread, recover);
-#endif /* defined(HAS_APPLE_PAC) */
 }
 
 void

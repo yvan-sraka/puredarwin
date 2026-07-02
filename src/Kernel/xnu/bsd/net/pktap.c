@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2012-2020 Apple Inc. All rights reserved.
+ * Copyright (c) 2012-2021 Apple Inc. All rights reserved.
  *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
  *
@@ -117,10 +117,14 @@ do { \
 /*
  * pktap_lck_rw protects the global list of pktap interfaces
  */
-decl_lck_rw_data(static, pktap_lck_rw_data);
-static lck_rw_t *pktap_lck_rw = &pktap_lck_rw_data;
-static lck_grp_t *pktap_lck_grp = NULL;
-static lck_attr_t *pktap_lck_attr = NULL;
+static LCK_GRP_DECLARE(pktap_lck_grp, "pktap");
+#if PKTAP_DEBUG
+static LCK_ATTR_DECLARE(pktap_lck_attr, LCK_ATTR_DEBUG, 0);
+#else
+static LCK_ATTR_DECLARE(pktap_lck_attr, 0, 0);
+#endif
+static LCK_RW_DECLARE_ATTR(pktap_lck_rw, &pktap_lck_grp, &pktap_lck_attr);
+
 
 static LIST_HEAD(pktap_list, pktap_softc) pktap_list =
     LIST_HEAD_INITIALIZER(pktap_list);
@@ -136,9 +140,7 @@ static struct if_clone pktap_cloner =
     pktap_clone_create,
     pktap_clone_destroy,
     0,
-    PKTAP_MAXUNIT,
-    PKTAP_ZONE_MAX_ELEM,
-    sizeof(struct pktap_softc));
+    PKTAP_MAXUNIT);
 
 errno_t pktap_if_output(ifnet_t, mbuf_t);
 errno_t pktap_demux(ifnet_t, mbuf_t, char *, protocol_family_t *);
@@ -191,7 +193,6 @@ __private_extern__ void
 pktap_init(void)
 {
 	int error = 0;
-	lck_grp_attr_t *lck_grp_attr = NULL;
 
 	_CASSERT_OFFFSETOF_FIELD(pktap_header, pktap_v2_hdr, pth_flags);
 
@@ -200,20 +201,11 @@ pktap_init(void)
 
 	pktap_inited = 1;
 
-	lck_grp_attr = lck_grp_attr_alloc_init();
-	pktap_lck_grp = lck_grp_alloc_init("pktap", lck_grp_attr);
-	pktap_lck_attr = lck_attr_alloc_init();
-#if PKTAP_DEBUG
-	lck_attr_setdebug(pktap_lck_attr);
-#endif /* PKTAP_DEBUG */
-	lck_rw_init(pktap_lck_rw, pktap_lck_grp, pktap_lck_attr);
-	lck_grp_attr_free(lck_grp_attr);
-
 	LIST_INIT(&pktap_list);
 
 	error = if_clone_attach(&pktap_cloner);
 	if (error != 0) {
-		panic("%s: if_clone_attach() failed, error %d\n",
+		panic("%s: if_clone_attach() failed, error %d",
 		    __func__, error);
 	}
 }
@@ -227,12 +219,7 @@ pktap_clone_create(struct if_clone *ifc, u_int32_t unit, __unused void *params)
 
 	PKTAP_LOG(PKTP_LOG_FUNC, "unit %u\n", unit);
 
-	pktap = if_clone_softc_allocate(&pktap_cloner);
-	if (pktap == NULL) {
-		printf("%s: _MALLOC failed\n", __func__);
-		error = ENOMEM;
-		goto done;
-	}
+	pktap = kalloc_type(struct pktap_softc, Z_WAITOK_ZERO_NOFAIL);
 	pktap->pktp_unit = unit;
 
 	/*
@@ -299,12 +286,12 @@ pktap_clone_create(struct if_clone *ifc, u_int32_t unit, __unused void *params)
 
 	/* Take a reference and add to the global list */
 	ifnet_reference(pktap->pktp_ifp);
-	lck_rw_lock_exclusive(pktap_lck_rw);
+	lck_rw_lock_exclusive(&pktap_lck_rw);
 	LIST_INSERT_HEAD(&pktap_list, pktap, pktp_link);
-	lck_rw_done(pktap_lck_rw);
+	lck_rw_done(&pktap_lck_rw);
 done:
 	if (error != 0 && pktap != NULL) {
-		if_clone_softc_deallocate(&pktap_cloner, pktap);
+		kfree_type(struct pktap_softc, pktap);
 	}
 	return error;
 }
@@ -686,18 +673,18 @@ pktap_detach(ifnet_t ifp)
 
 	PKTAP_LOG(PKTP_LOG_FUNC, "%s\n", ifp->if_xname);
 
-	lck_rw_lock_exclusive(pktap_lck_rw);
+	lck_rw_lock_exclusive(&pktap_lck_rw);
 
 	pktap = ifp->if_softc;
 	ifp->if_softc = NULL;
 	LIST_REMOVE(pktap, pktp_link);
 
-	lck_rw_done(pktap_lck_rw);
+	lck_rw_done(&pktap_lck_rw);
 
 	/* Drop reference as it's no more on the global list */
 	ifnet_release(ifp);
 
-	if_clone_softc_deallocate(&pktap_cloner, pktap);
+	kfree_type(struct pktap_softc, pktap);
 	/* This is for the reference taken by ifnet_attach() */
 	(void) ifnet_release(ifp);
 }
@@ -1074,8 +1061,8 @@ pktap_fill_proc_info(struct pktap_header *hdr, protocol_family_t proto,
 				wildcard = 1;
 			}
 			if (pcbinfo != NULL) {
-				inp = in6_pcblookup_hash(pcbinfo, faddr, fport,
-				    laddr, lport, wildcard, outgoing ? NULL : ifp);
+				inp = in6_pcblookup_hash(pcbinfo, faddr, fport, ip6_input_getdstifscope(m),
+				    laddr, lport, ip6_input_getsrcifscope(m), wildcard, outgoing ? NULL : ifp);
 
 				if (inp == NULL && hdr->pth_iftype != IFT_LOOP) {
 					PKTAP_LOG(PKTP_LOG_NOPCB,
@@ -1125,7 +1112,7 @@ pktap_bpf_tap(struct ifnet *ifp, protocol_family_t proto, struct mbuf *m,
 		return;
 	}
 
-	lck_rw_lock_shared(pktap_lck_rw);
+	lck_rw_lock_shared(&pktap_lck_rw);
 
 	/*
 	 * No need to take the ifnet_lock as the struct ifnet field if_bpf is
@@ -1278,6 +1265,9 @@ pktap_bpf_tap(struct ifnet *ifp, protocol_family_t proto, struct mbuf *m,
 				if (m->m_pkthdr.pkt_flags & PKTF_TCP_REXMT) {
 					hdr->pth_flags |= PTH_FLAG_REXMIT;
 				}
+				if (m->m_pkthdr.pkt_flags & PKTF_WAKE_PKT) {
+					hdr->pth_flags |= PTH_FLAG_WAKE_PKT;
+				}
 
 				pktap_fill_proc_info(hdr, proto, m, pre, outgoing, ifp);
 
@@ -1300,7 +1290,7 @@ pktap_bpf_tap(struct ifnet *ifp, protocol_family_t proto, struct mbuf *m,
 		}
 	}
 done:
-	lck_rw_done(pktap_lck_rw);
+	lck_rw_done(&pktap_lck_rw);
 }
 
 __private_extern__ void
@@ -1354,6 +1344,169 @@ pktap_output(struct ifnet *ifp, protocol_family_t proto, struct mbuf *m,
 	pktap_bpf_tap(ifp, proto, m, pre, post, 1);
 }
 
+#if SKYWALK
+
+typedef void (*tap_packet_func)(ifnet_t interface, u_int32_t dlt,
+    kern_packet_t packet, void *header, size_t header_len);
+
+static void
+pktap_bpf_tap_packet(struct ifnet *ifp, protocol_family_t proto, uint32_t dlt,
+    pid_t pid, const char * pname, pid_t epid, const char * epname,
+    kern_packet_t pkt, const void * header, size_t header_length,
+    uint8_t ipproto, uint32_t flowid, uint32_t flags, tap_packet_func tap_func)
+{
+	struct {
+		struct pktap_header     pkth;
+		union {
+			uint8_t         llhdr[16];
+			uint32_t        proto;
+		} extra;
+	} hdr_buffer;
+	struct pktap_header     *hdr;
+	size_t                  hdr_size;
+	struct pktap_softc      *pktap;
+	uint32_t                pre_length = 0;
+
+	/*
+	 * Skip the coprocessor interface
+	 */
+	if (!intcoproc_unrestricted && IFNET_IS_INTCOPROC(ifp)) {
+		return;
+	}
+
+	if (proto != AF_INET && proto != AF_INET6) {
+		PKTAP_LOG(PKTP_LOG_ERROR,
+		    "unsupported protocol %d\n",
+		    proto);
+		return;
+	}
+
+	/* assume that we'll be tapping using PKTAP */
+	hdr = &hdr_buffer.pkth;
+	bzero(&hdr_buffer, sizeof(hdr_buffer));
+	hdr->pth_length = sizeof(struct pktap_header);
+	hdr->pth_type_next = PTH_TYPE_PACKET;
+	hdr->pth_dlt = dlt;
+	hdr->pth_pid = pid;
+	if (pid != epid) {
+		hdr->pth_epid = epid;
+	} else {
+		hdr->pth_epid = -1;
+	}
+	if (pname != NULL) {
+		strlcpy(hdr->pth_comm, pname, sizeof(hdr->pth_comm));
+	}
+	if (epname != NULL) {
+		strlcpy(hdr->pth_ecomm, epname, sizeof(hdr->pth_ecomm));
+	}
+	strlcpy(hdr->pth_ifname, ifp->if_xname, sizeof(hdr->pth_ifname));
+	hdr->pth_flags |= flags;
+	hdr->pth_ipproto = ipproto;
+	hdr->pth_flowid = flowid;
+	/*
+	 * Do the same as pktap_fill_proc_info() to defer looking up inpcb.
+	 * We do it for both inbound and outbound packets unlike the mbuf case.
+	 */
+	if ((flags & PTH_FLAG_SOCKET) != 0 && ipproto != 0 && flowid != 0) {
+		hdr->pth_flags |= PTH_FLAG_DELAY_PKTAP;
+	}
+	if (kern_packet_get_wake_flag(pkt)) {
+		hdr->pth_flags |= PTH_FLAG_WAKE_PKT;
+	}
+	hdr->pth_trace_tag = kern_packet_get_trace_tag(pkt);
+	hdr->pth_protocol_family = proto;
+	hdr->pth_svc = so_svc2tc((mbuf_svc_class_t)
+	    kern_packet_get_service_class(pkt));
+	hdr->pth_iftype = ifp->if_type;
+	hdr->pth_ifunit = ifp->if_unit;
+	hdr_size = sizeof(struct pktap_header);
+	if (header != NULL && header_length != 0) {
+		if (header_length > sizeof(hdr_buffer.extra.llhdr)) {
+			PKTAP_LOG(PKTP_LOG_ERROR,
+			    "%s: header %d > %d\n",
+			    if_name(ifp), (int)header_length,
+			    (int)sizeof(hdr_buffer.extra.llhdr));
+			return;
+		}
+		bcopy(header, hdr_buffer.extra.llhdr, header_length);
+		hdr_size += header_length;
+		pre_length = (uint32_t)header_length;
+	} else if (dlt == DLT_RAW) {
+		/*
+		 * Use the same DLT as has been used for the mbuf path
+		 */
+		hdr->pth_dlt = DLT_NULL;
+		hdr_buffer.extra.proto = proto;
+		hdr_size = sizeof(struct pktap_header) + sizeof(u_int32_t);
+		pre_length = sizeof(hdr_buffer.extra.proto);
+	} else if (dlt == DLT_EN10MB) {
+		pre_length = ETHER_HDR_LEN;
+	}
+	hdr->pth_frame_pre_length = pre_length;
+
+	lck_rw_lock_shared(&pktap_lck_rw);
+	/*
+	 * No need to take the ifnet_lock as the struct ifnet field if_bpf is
+	 * protected by the BPF subsystem
+	 */
+	LIST_FOREACH(pktap, &pktap_list, pktp_link) {
+		int filter_result;
+
+		filter_result = pktap_filter_evaluate(pktap, ifp);
+		if (filter_result == PKTAP_FILTER_SKIP) {
+			continue;
+		}
+
+		if (dlt == DLT_RAW && pktap->pktp_dlt_raw_count > 0) {
+			(*tap_func)(pktap->pktp_ifp, DLT_RAW, pkt, NULL, 0);
+		}
+		if (pktap->pktp_dlt_pkttap_count > 0) {
+			(*tap_func)(pktap->pktp_ifp, DLT_PKTAP,
+			    pkt, hdr, hdr_size);
+		}
+	}
+	lck_rw_done(&pktap_lck_rw);
+}
+
+void
+pktap_input_packet(struct ifnet *ifp, protocol_family_t proto, uint32_t dlt,
+    pid_t pid, const char * pname, pid_t epid, const char * epname,
+    kern_packet_t pkt, const void * header, size_t header_length,
+    uint8_t ipproto, uint32_t flowid, uint32_t flags)
+{
+	/* Fast path */
+	if (pktap_total_tap_count == 0) {
+		return;
+	}
+
+	PKTAP_LOG(PKTP_LOG_INPUT, "IN %s proto %u pid %d epid %d\n",
+	    ifp->if_xname, proto, pid, epid);
+	pktap_bpf_tap_packet(ifp, proto, dlt, pid, pname, epid, epname, pkt,
+	    header, header_length, ipproto, flowid,
+	    PTH_FLAG_DIR_IN | (flags & ~(PTH_FLAG_DIR_IN | PTH_FLAG_DIR_OUT)),
+	    bpf_tap_packet_in);
+}
+
+void
+pktap_output_packet(struct ifnet *ifp, protocol_family_t proto, uint32_t dlt,
+    pid_t pid, const char * pname, pid_t epid, const char * epname,
+    kern_packet_t pkt, const void * header, size_t header_length,
+    uint8_t ipproto, uint32_t flowid, uint32_t flags)
+{
+	/* Fast path */
+	if (pktap_total_tap_count == 0) {
+		return;
+	}
+
+	PKTAP_LOG(PKTP_LOG_OUTPUT, "OUT %s proto %u pid %d epid %d\n",
+	    ifp->if_xname, proto, pid, epid);
+	pktap_bpf_tap_packet(ifp, proto, dlt, pid, pname, epid, epname, pkt,
+	    header, header_length, ipproto, flowid,
+	    PTH_FLAG_DIR_OUT | (flags & ~(PTH_FLAG_DIR_IN | PTH_FLAG_DIR_OUT)),
+	    bpf_tap_packet_out);
+}
+
+#endif /* SKYWALK */
 
 void
 convert_to_pktap_header_to_v2(struct bpf_packet *bpf_pkt, bool truncate)

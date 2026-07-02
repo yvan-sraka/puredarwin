@@ -151,6 +151,12 @@
 #define OS_OVERLOADABLE
 #endif
 
+#if __has_attribute(analyzer_suppress)
+#define OS_ANALYZER_SUPPRESS(RADAR) __attribute__((analyzer_suppress))
+#else
+#define OS_ANALYZER_SUPPRESS(RADAR)
+#endif
+
 #if __has_attribute(enum_extensibility)
 #define __OS_ENUM_ATTR __attribute__((enum_extensibility(open)))
 #define __OS_ENUM_ATTR_CLOSED __attribute__((enum_extensibility(closed)))
@@ -235,6 +241,13 @@
 	__attribute__((__availability__(swift, unavailable, message=_msg)))
 #else
 #define OS_SWIFT_UNAVAILABLE(_msg)
+#endif
+
+#if __has_attribute(__swift_attr__)
+#define OS_SWIFT_UNAVAILABLE_FROM_ASYNC(msg) \
+	__attribute__((__swift_attr__("@_unavailableFromAsync(message: \"" msg "\")")))
+#else
+#define OS_SWIFT_UNAVAILABLE_FROM_ASYNC(msg)
 #endif
 
 #if __has_attribute(swift_private)
@@ -334,17 +347,33 @@ typedef void (^os_block_t)(void);
 #if __has_feature(ptrauth_calls)
 #include <ptrauth.h>
 #define OS_PTRAUTH_SIGNED_PTR(type) __ptrauth(ptrauth_key_process_independent_data, 1, ptrauth_string_discriminator(type))
+#define OS_PTRAUTH_SIGNED_PTR_AUTH_NULL(type) __ptrauth(ptrauth_key_process_independent_data, 1, ptrauth_string_discriminator(type), "authenticates-null-values")
 #define OS_PTRAUTH_DISCRIMINATOR(str) ptrauth_string_discriminator(str)
 #define __ptrauth_only
 #else //  __has_feature(ptrauth_calls)
 #define OS_PTRAUTH_SIGNED_PTR(type)
+#define OS_PTRAUTH_SIGNED_PTR_AUTH_NULL(type)
 #define OS_PTRAUTH_DISCRIMINATOR(str) 0
 #define __ptrauth_only __unused
 #endif // __has_feature(ptrauth_calls)
 #endif // KERNEL
 
 #if KERNEL_PRIVATE
+#if __has_feature(ptrauth_calls)
+#define XNU_PTRAUTH_SIGNED_FUNCTION_PTR(type) \
+	__ptrauth(ptrauth_key_function_pointer, 1, ptrauth_string_discriminator(type))
+#else
+#define XNU_PTRAUTH_SIGNED_FUNCTION_PTR(type)
+#endif
 #define XNU_PTRAUTH_SIGNED_PTR OS_PTRAUTH_SIGNED_PTR
+#define XNU_PTRAUTH_SIGNED_PTR_AUTH_NULL OS_PTRAUTH_SIGNED_PTR_AUTH_NULL
 #endif // KERNEL_PRIVATE
+
+#define OS_ASSUME_PTR_ABI_SINGLE_BEGIN __ASSUME_PTR_ABI_SINGLE_BEGIN
+#define OS_ASSUME_PTR_ABI_SINGLE_END __ASSUME_PTR_ABI_SINGLE_END
+#define OS_UNSAFE_INDEXABLE __unsafe_indexable
+#define OS_HEADER_INDEXABLE __header_indexable
+#define OS_COUNTED_BY(N) __counted_by(N)
+#define OS_SIZED_BY(N) __sized_by(N)
 
 #endif // __OS_BASE__

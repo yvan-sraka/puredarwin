@@ -58,7 +58,11 @@ function(mig filename)
     endif()
 
     if(NOT MIG_ARCH)
-        set(MIG_ARCH i386)
+        if(PUREDARWIN_TARGET_ARCH STREQUAL "arm64")
+            set(MIG_ARCH arm64)
+        else()
+            set(MIG_ARCH i386)
+        endif()
     endif()
 
     get_filename_component(basename ${filename} NAME_WE)

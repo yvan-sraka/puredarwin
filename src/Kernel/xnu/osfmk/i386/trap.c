@@ -83,6 +83,7 @@
 #include <kern/processor.h>
 #include <kern/thread.h>
 #include <kern/task.h>
+#include <kern/restartable.h>
 #include <kern/sched.h>
 #include <kern/sched_prim.h>
 #include <kern/exception.h>
@@ -92,6 +93,7 @@
 #if CONFIG_TELEMETRY
 #include <kern/telemetry.h>
 #endif
+#include <kern/zalloc_internal.h>
 #include <sys/kdebug.h>
 #include <kperf/kperf.h>
 #include <prng/random.h>
@@ -111,6 +113,7 @@
 #include <libkern/OSDebug.h>
 #include <i386/cpu_threads.h>
 #include <machine/pal_routines.h>
+#include <i386/lbr.h>
 
 extern void throttle_lowpri_io(int);
 extern void kprint_state(x86_saved_state64_t *saved_state);
@@ -355,6 +358,7 @@ interrupt(x86_saved_state_t *state)
 	int             itype = DBG_INTR_TYPE_UNKNOWN;
 	int             handled;
 
+
 	x86_saved_state64_t     *state64 = saved_state64(state);
 	rip = state64->isf.rip;
 	rsp = state64->isf.rsp;
@@ -418,7 +422,7 @@ interrupt(x86_saved_state_t *state)
 	}
 
 	if (__improbable(get_preemption_level() != ipl)) {
-		panic("Preemption level altered by interrupt vector 0x%x: initial 0x%x, final: 0x%x\n", interrupt_num, ipl, get_preemption_level());
+		panic("Preemption level altered by interrupt vector 0x%x: initial 0x%x, final: 0x%x", interrupt_num, ipl, get_preemption_level());
 	}
 
 
@@ -675,6 +679,10 @@ kernel_trap(
 		goto debugger_entry;
 
 	case T_DEBUG:
+		/*
+		 * Re-enable LBR tracing for core/panic files if necessary. i386_lbr_enable confirms LBR should be re-enabled.
+		 */
+		i386_lbr_enable();
 		if ((saved_state->isf.rflags & EFL_TF) == 0 && NO_WATCHPOINTS) {
 			/* We've somehow encountered a debug
 			 * register match that does not belong
@@ -740,14 +748,6 @@ FALL_THROUGH:
 		}
 
 		/*
-		 * Check thread recovery address also.
-		 */
-		if (thread != THREAD_NULL && thread->recover) {
-			set_recovery_ip(saved_state, thread->recover);
-			thread->recover = 0;
-			goto common_return;
-		}
-		/*
 		 * Unanticipated page-fault errors in kernel
 		 * should not happen.
 		 *
@@ -775,6 +775,9 @@ debugger_entry:
 			goto common_return;
 		}
 #endif
+	}
+	if (type == T_PAGE_FAULT) {
+		panic_fault_address = vaddr;
 	}
 	pal_cli();
 	panic_trap(saved_state, trap_pl, fault_result);
@@ -960,6 +963,10 @@ user_trap(
 		i386_lbr_enable();
 	}
 
+	if (type == T_PAGE_FAULT) {
+		thread_reset_pcs_will_fault(thread);
+	}
+
 	pal_sti();
 
 	KERNEL_DEBUG_CONSTANT_IST(KDEBUG_TRACE,
@@ -1106,8 +1113,9 @@ user_trap(
 			prot |= VM_PROT_EXECUTE;
 		}
 #if DEVELOPMENT || DEBUG
+		bool do_simd_hash = thread_fpsimd_hash_enabled();
 		uint32_t fsig = 0;
-		fsig = thread_fpsimd_hash(thread);
+		fsig = do_simd_hash ? thread_fpsimd_hash(thread) : 0;
 #if DEBUG
 		fsigs[0] = fsig;
 #endif
@@ -1117,7 +1125,7 @@ user_trap(
 		    prot, FALSE, VM_KERN_MEMORY_NONE,
 		    THREAD_ABORTSAFE, NULL, 0);
 #if DEVELOPMENT || DEBUG
-		if (fsig) {
+		if (do_simd_hash && fsig) {
 			uint32_t fsig2 = thread_fpsimd_hash(thread);
 #if DEBUG
 			fsigcs++;
@@ -1183,6 +1191,10 @@ user_trap(
 		panic("Unexpected user trap, type %d", type);
 	}
 
+	if (type == T_PAGE_FAULT) {
+		thread_reset_pcs_done_faulting(thread);
+	}
+
 	if (exc != 0) {
 		uint16_t cs;
 		boolean_t intrs;
@@ -1193,7 +1205,7 @@ user_trap(
 			cs = saved_state32(saved_state)->cs;
 		}
 
-		if (last_branch_support_enabled) {
+		if (last_branch_enabled_modes == LBR_ENABLED_USERMODE) {
 			intrs = ml_set_interrupts_enabled(FALSE);
 			/*
 			 * This is a bit racy (it's possible for this thread to migrate to another CPU, then
@@ -1312,7 +1324,7 @@ copy_instruction_stream(thread_t thread, uint64_t rip, int __unused trap_code
 		enable_preemption();
 
 		if (pcb->insn_state == 0) {
-			pcb->insn_state = kalloc(sizeof(x86_instruction_state_t));
+			pcb->insn_state = kalloc_data(sizeof(x86_instruction_state_t), Z_WAITOK);
 		}
 
 		if (pcb->insn_state != 0) {
@@ -1377,10 +1389,11 @@ copy_instruction_stream(thread_t thread, uint64_t rip, int __unused trap_code
 
 #if defined(MACH_BSD) && (DEVELOPMENT || DEBUG)
 			if (panic_on_trap_procname[0] != 0) {
+				task_t task = get_threadtask(thread);
 				char procnamebuf[65] = {0};
 
-				if (thread->task->bsd_info != NULL) {
-					procname = proc_name_address(thread->task->bsd_info);
+				if (get_bsdtask_info(task) != NULL) {
+					procname = proc_name_address(get_bsdtask_info(task));
 					strlcpy(procnamebuf, procname, sizeof(procnamebuf));
 
 					if (strcasecmp(panic_on_trap_procname, procnamebuf) == 0 &&
@@ -1399,7 +1412,7 @@ copy_instruction_stream(thread_t thread, uint64_t rip, int __unused trap_code
 		pcb->insn_state_copyin_failure_errorcode = copyin_err;
 #if DEVELOPMENT || DEBUG
 		if (inspect_cacheline && pcb->insn_state == 0) {
-			pcb->insn_state = kalloc(sizeof(x86_instruction_state_t));
+			pcb->insn_state = kalloc_data(sizeof(x86_instruction_state_t), Z_WAITOK);
 		}
 		if (pcb->insn_state != 0) {
 			pcb->insn_state->insn_stream_valid_bytes = 0;
@@ -1544,9 +1557,12 @@ void
 thread_exception_return(void)
 {
 	thread_t thread = current_thread();
+	task_t   task   = current_task();
+
 	ml_set_interrupts_enabled(FALSE);
-	if (thread_is_64bit_addr(thread) != task_has_64Bit_addr(thread->task)) {
-		panic("Task/thread bitness mismatch %p %p, task: %d, thread: %d", thread, thread->task, thread_is_64bit_addr(thread), task_has_64Bit_addr(thread->task));
+	if (thread_is_64bit_addr(thread) != task_has_64Bit_addr(task)) {
+		panic("Task/thread bitness mismatch %p %p, task: %d, thread: %d",
+		    thread, task, thread_is_64bit_addr(thread), task_has_64Bit_addr(task));
 	}
 
 	if (thread_is_64bit_addr(thread)) {

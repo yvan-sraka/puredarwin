@@ -85,7 +85,6 @@
 
 #define f_flag fp_glob->fg_flag
 #define f_ops fp_glob->fg_ops
-#define f_data fp_glob->fg_data
 
 #define PSEMNAMLEN      31      /* maximum name segment length we bother with */
 
@@ -191,7 +190,7 @@ static LCK_MTX_DECLARE(psx_sem_subsys_mutex, &psx_sem_subsys_lck_grp);
 
 static int psem_cache_add(struct pseminfo *psemp, struct psemname *pnp, struct psemcache *pcp);
 static void psem_cache_delete(struct psemcache *pcp);
-int psem_cache_purge_all(proc_t);
+int psem_cache_purge_all(void);
 
 /*
  * Lookup an entry in the cache
@@ -327,7 +326,7 @@ psem_cache_delete(struct psemcache *pcp)
  * name/path will be removed making all future lookups on the name fail.
  */
 int
-psem_cache_purge_all(__unused proc_t p)
+psem_cache_purge_all(void)
 {
 	struct psemcache *pcp, *tmppcp;
 	struct psemhashhead *pcpp;
@@ -455,17 +454,8 @@ sem_open(proc_t p, struct sem_open_args *uap, user_addr_t *retval)
 	 * allowed and the one at the front of the LRU list is in use.
 	 * Otherwise we use the one at the front of the LRU list.
 	 */
-	pcp = kheap_alloc(KM_SHM, sizeof(struct psemcache), Z_WAITOK | Z_ZERO);
-	if (pcp == PSEMCACHE_NULL) {
-		error = ENOMEM;
-		goto bad;
-	}
-
-	new_pinfo = kheap_alloc(KM_SHM, sizeof(struct pseminfo), Z_WAITOK | Z_ZERO);
-	if (new_pinfo == NULL) {
-		error = ENOSPC;
-		goto bad;
-	}
+	pcp = kalloc_type(struct psemcache, Z_WAITOK | Z_ZERO | Z_NOFAIL);
+	new_pinfo = kalloc_type(struct pseminfo, Z_WAITOK | Z_ZERO | Z_NOFAIL);
 #if CONFIG_MACF
 	mac_posixsem_label_init(new_pinfo);
 #endif
@@ -502,11 +492,7 @@ sem_open(proc_t p, struct sem_open_args *uap, user_addr_t *retval)
 		}
 	}
 
-	new_pnode = kheap_alloc(KM_SHM, sizeof(struct psemnode), Z_WAITOK | Z_ZERO);
-	if (new_pnode == NULL) {
-		error = ENOSPC;
-		goto bad;
-	}
+	new_pnode = kalloc_type(struct psemnode, Z_WAITOK | Z_ZERO | Z_NOFAIL);
 
 	PSEM_SUBSYS_LOCK();
 	error = psem_cache_search(&pinfo, &nd, &pcache);
@@ -552,8 +538,8 @@ sem_open(proc_t p, struct sem_open_args *uap, user_addr_t *retval)
 		pinfo->psem_name[PSEMNAMLEN] = 0;
 		pinfo->psem_flags &= ~PSEM_DEFINED;
 		pinfo->psem_flags |= PSEM_ALLOCATED;
-		pinfo->psem_creator_pid = p->p_pid;
-		pinfo->psem_creator_uniqueid = p->p_uniqueid;
+		pinfo->psem_creator_pid = proc_getpid(p);
+		pinfo->psem_creator_uniqueid = proc_uniqueid(p);
 
 #if CONFIG_MACF
 		error = mac_posixsem_check_create(kauth_cred_get(), nameptr);
@@ -601,7 +587,7 @@ sem_open(proc_t p, struct sem_open_args *uap, user_addr_t *retval)
 	 * new . and we must free them.
 	 */
 	if (incache) {
-		kheap_free(KM_SHM, pcp, sizeof(struct psemcache));
+		kfree_type(struct psemcache, pcp);
 		pcp = PSEMCACHE_NULL;
 		if (new_pinfo != PSEMINFO_NULL) {
 			/* return value ignored - we can't _not_ do this */
@@ -609,7 +595,7 @@ sem_open(proc_t p, struct sem_open_args *uap, user_addr_t *retval)
 #if CONFIG_MACF
 			mac_posixsem_label_destroy(new_pinfo);
 #endif
-			kheap_free(KM_SHM, new_pinfo, sizeof(struct pseminfo));
+			kfree_type(struct pseminfo, new_pinfo);
 			new_pinfo = PSEMINFO_NULL;
 		}
 	}
@@ -617,7 +603,7 @@ sem_open(proc_t p, struct sem_open_args *uap, user_addr_t *retval)
 	proc_fdlock(p);
 	fp->f_flag = fmode & FMASK;
 	fp->f_ops = &psemops;
-	fp->f_data = (caddr_t)new_pnode;
+	fp_set_data(fp, new_pnode);
 	procfdtbl_releasefd(p, indx, NULL);
 	fp_drop(p, indx, fp, 1);
 	proc_fdunlock(p);
@@ -629,9 +615,9 @@ sem_open(proc_t p, struct sem_open_args *uap, user_addr_t *retval)
 bad_locked:
 	PSEM_SUBSYS_UNLOCK();
 bad:
-	kheap_free(KM_SHM, pcp, sizeof(struct psemcache));
+	kfree_type(struct psemcache, pcp);
 
-	kheap_free(KM_SHM, new_pnode, sizeof(struct psemnode));
+	kfree_type(struct psemnode, new_pnode);
 
 	if (fp != NULL) {
 		fp_free(p, indx, fp);
@@ -650,7 +636,7 @@ bad:
 #if CONFIG_MACF
 		mac_posixsem_label_destroy(new_pinfo);
 #endif
-		kheap_free(KM_SHM, new_pinfo, sizeof(struct pseminfo));
+		kfree_type(struct pseminfo, new_pinfo);
 	}
 
 	if (pnbuf != NULL) {
@@ -701,13 +687,13 @@ psem_unlink_internal(struct pseminfo *pinfo, struct psemcache *pcache)
 
 	if (!pinfo->psem_usecount) {
 		psem_delete(pinfo);
-		kheap_free(KM_SHM, pinfo, sizeof(struct pseminfo));
+		kfree_type(struct pseminfo, pinfo);
 	} else {
 		pinfo->psem_flags |= PSEM_REMOVED;
 	}
 
 	psem_cache_delete(pcache);
-	kheap_free(KM_SHM, pcache, sizeof(struct psemcache));
+	kfree_type(struct psemcache, pcache);
 	return 0;
 }
 
@@ -833,7 +819,7 @@ sem_wait_nocancel(proc_t p, struct sem_wait_nocancel_args *uap, __unused int32_t
 	if (error) {
 		return error;
 	}
-	pnode = (struct psemnode *)fp->f_data;
+	pnode = (struct psemnode *)fp_get_data(fp);
 
 	PSEM_SUBSYS_LOCK();
 	if ((pinfo = pnode->pinfo) == PSEMINFO_NULL) {
@@ -892,7 +878,7 @@ sem_trywait(proc_t p, struct sem_trywait_args *uap, __unused int32_t *retval)
 	if (error) {
 		return error;
 	}
-	pnode = (struct psemnode *)fp->f_data;
+	pnode = (struct psemnode *)fp_get_data(fp);
 
 	PSEM_SUBSYS_LOCK();
 	if ((pinfo = pnode->pinfo) == PSEMINFO_NULL) {
@@ -955,7 +941,7 @@ sem_post(proc_t p, struct sem_post_args *uap, __unused int32_t *retval)
 	if (error) {
 		return error;
 	}
-	pnode = (struct psemnode *)fp->f_data;
+	pnode = (struct psemnode *)fp_get_data(fp);
 
 	PSEM_SUBSYS_LOCK();
 	if ((pinfo = pnode->pinfo) == PSEMINFO_NULL) {
@@ -1026,12 +1012,12 @@ psem_close(struct psemnode *pnode)
 		PSEM_SUBSYS_UNLOCK();
 		/* lock dropped as only semaphore is destroyed here */
 		error = psem_delete(pinfo);
-		kheap_free(KM_SHM, pinfo, sizeof(struct pseminfo));
+		kfree_type(struct pseminfo, pinfo);
 	} else {
 		PSEM_SUBSYS_UNLOCK();
 	}
 	/* subsystem lock is dropped when we get here */
-	kheap_free(KM_SHM, pnode, sizeof(struct psemnode));
+	kfree_type(struct psemnode, pnode);
 	return error;
 }
 
@@ -1042,7 +1028,7 @@ psem_closefile(struct fileglob *fg, __unused vfs_context_t ctx)
 	 * Not locked as psem_close is called only from here and is locked
 	 * properly
 	 */
-	return psem_close((struct psemnode *)fg->fg_data);
+	return psem_close((struct psemnode *)fg_get_data(fg));
 }
 
 static int
@@ -1109,13 +1095,14 @@ psem_label_associate(struct fileproc *fp, struct vnode *vp, vfs_context_t ctx)
 	struct pseminfo *psem;
 
 	PSEM_SUBSYS_LOCK();
-	pnode = (struct psemnode *)fp->fp_glob->fg_data;
+	pnode = (struct psemnode *)fp_get_data(fp);
 	if (pnode != NULL) {
 		psem = pnode->pinfo;
 		if (psem != NULL) {
 			mac_posixsem_vnode_label_associate(
-				vfs_context_ucred(ctx), psem, psem->psem_label,
-				vp, vp->v_label);
+				vfs_context_ucred(ctx), psem,
+				mac_posixsem_label(psem),
+				vp, mac_vnode_label(vp));
 		}
 	}
 	PSEM_SUBSYS_UNLOCK();

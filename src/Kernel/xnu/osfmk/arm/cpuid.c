@@ -32,8 +32,10 @@
 #include <pexpert/pexpert.h>
 #include <arm/cpuid.h>
 #include <arm/cpuid_internal.h>
+#include <arm/cpu_data_internal.h>
+#include <arm64/proc_reg.h>
+#include <kern/lock_rw.h>
 #include <vm/vm_page.h>
-#include "proc_reg.h"
 
 #include <libkern/section_keywords.h>
 
@@ -74,7 +76,12 @@ typedef union {
 /* Statics */
 
 static SECURITY_READ_ONLY_LATE(arm_cpu_info_t) cpuid_cpu_info;
-static SECURITY_READ_ONLY_LATE(cache_info_t) cpuid_cache_info;
+static SECURITY_READ_ONLY_LATE(cache_info_t *) cpuid_cache_info_boot_cpu;
+static cache_info_t cpuid_cache_info[MAX_CPU_TYPES] = { 0 };
+static _Atomic uint8_t cpuid_cache_info_bitmap = 0;
+
+static LCK_GRP_DECLARE(cpuid_grp, "cpuid");
+static LCK_RW_DECLARE(cpuid_cache_info_lck_rw, &cpuid_grp);
 
 /* Code */
 
@@ -91,26 +98,9 @@ do_cpuid(void)
 	cpuid_cpu_info.arm_info.arm_arch = CPU_ARCH_ARMv8;
 #endif /* defined(HAS_APPLE_PAC) */
 
-#elif (__ARM_ARCH__ == 7)
-#ifdef __ARM_SUB_ARCH__
-	cpuid_cpu_info.arm_info.arm_arch = __ARM_SUB_ARCH__;
-#else /* __ARM_SUB_ARCH__ */
-	cpuid_cpu_info.arm_info.arm_arch = CPU_ARCH_ARMv7;
-#endif /* __ARM_SUB_ARCH__ */
-#else /* (__ARM_ARCH__ != 7) && (__ARM_ARCH__ != 8) */
-	/* 1176 architecture lives in the extended feature register */
-	if (cpuid_cpu_info.arm_info.arm_arch == CPU_ARCH_EXTENDED) {
-		arm_isa_feat1_reg isa = machine_read_isa_feat1();
-
-		/*
-		 * if isa feature register 1 [15:12] == 0x2, this chip
-		 * supports sign extention instructions, which indicate ARMv6
-		 */
-		if (isa.field.sign_zero_ext_support == 0x2) {
-			cpuid_cpu_info.arm_info.arm_arch = CPU_ARCH_ARMv6;
-		}
-	}
-#endif /* (__ARM_ARCH__ != 7) && (__ARM_ARCH__ != 8) */
+#else /* (__ARM_ARCH__ != 8) */
+#error Unsupported arch
+#endif /* (__ARM_ARCH__ != 8) */
 }
 
 arm_cpu_info_t *
@@ -186,6 +176,10 @@ cpuid_get_cpufamily(void)
 #endif
 			cpufamily = CPUFAMILY_ARM_LIGHTNING_THUNDER;
 			break;
+		case CPU_PART_FIRESTORM_JADE_CHOP:
+		case CPU_PART_FIRESTORM_JADE_DIE:
+		case CPU_PART_ICESTORM_JADE_CHOP:
+		case CPU_PART_ICESTORM_JADE_DIE:
 #ifndef RC_HIDE_XNU_FIRESTORM
 		case CPU_PART_FIRESTORM:
 		case CPU_PART_ICESTORM:
@@ -250,6 +244,14 @@ cpuid_get_cpusubfamily(void)
 #endif
 		cpusubfamily = CPUSUBFAMILY_ARM_M;
 		break;
+	case CPU_PART_FIRESTORM_JADE_CHOP:
+	case CPU_PART_ICESTORM_JADE_CHOP:
+		cpusubfamily = CPUSUBFAMILY_ARM_HS;
+		break;
+	case CPU_PART_FIRESTORM_JADE_DIE:
+	case CPU_PART_ICESTORM_JADE_DIE:
+		cpusubfamily = CPUSUBFAMILY_ARM_HC_HD;
+		break;
 	default:
 		cpusubfamily = CPUFAMILY_UNKNOWN;
 		break;
@@ -289,41 +291,61 @@ do_cacheid(void)
 	arm_cache_clidr_info_t arm_cache_clidr_info;
 	arm_cache_ccsidr_info_t arm_cache_ccsidr_info;
 
+	/*
+	 * We only need to parse cache geometry parameters once per cluster type.
+	 * Skip this if some other core of the same type has already parsed them.
+	 */
+	cluster_type_t cluster_type = ml_get_topology_info()->cpus[ml_get_cpu_number_local()].cluster_type;
+	uint8_t prev_cpuid_cache_info_bitmap = os_atomic_or_orig(&cpuid_cache_info_bitmap,
+	    (uint8_t)(1 << cluster_type), acq_rel);
+	if (prev_cpuid_cache_info_bitmap & (1 << cluster_type)) {
+		return;
+	}
+
+	cache_info_t *cpuid_cache_info_p = &cpuid_cache_info[cluster_type];
+
 	arm_cache_clidr_info.value = machine_read_clidr();
 
+	/*
+	 * For compatibility purposes with existing callers, let's cache the boot CPU
+	 * cache parameters and return those upon any call to cache_info();
+	 */
+	if (prev_cpuid_cache_info_bitmap == 0) {
+		cpuid_cache_info_boot_cpu = cpuid_cache_info_p;
+	}
 
 	/* Select L1 data/unified cache */
 
 	machine_write_csselr(CSSELR_L1, CSSELR_DATA_UNIFIED);
 	arm_cache_ccsidr_info.value = machine_read_ccsidr();
 
-	cpuid_cache_info.c_unified = (arm_cache_clidr_info.bits.Ctype1 == 0x4) ? 1 : 0;
+	cpuid_cache_info_p->c_unified = (arm_cache_clidr_info.bits.Ctype1 == 0x4) ? 1 : 0;
 
 	switch (arm_cache_ccsidr_info.bits.c_type) {
 	case 0x1:
-		cpuid_cache_info.c_type = CACHE_WRITE_ALLOCATION;
+		cpuid_cache_info_p->c_type = CACHE_WRITE_ALLOCATION;
 		break;
 	case 0x2:
-		cpuid_cache_info.c_type = CACHE_READ_ALLOCATION;
+		cpuid_cache_info_p->c_type = CACHE_READ_ALLOCATION;
 		break;
 	case 0x4:
-		cpuid_cache_info.c_type = CACHE_WRITE_BACK;
+		cpuid_cache_info_p->c_type = CACHE_WRITE_BACK;
 		break;
 	case 0x8:
-		cpuid_cache_info.c_type = CACHE_WRITE_THROUGH;
+		cpuid_cache_info_p->c_type = CACHE_WRITE_THROUGH;
 		break;
 	default:
-		cpuid_cache_info.c_type = CACHE_UNKNOWN;
+		cpuid_cache_info_p->c_type = CACHE_UNKNOWN;
 	}
 
-	cpuid_cache_info.c_linesz = 4 * (1 << (arm_cache_ccsidr_info.bits.LineSize + 2));
-	cpuid_cache_info.c_assoc = (arm_cache_ccsidr_info.bits.Assoc + 1);
+	cpuid_cache_info_p->c_linesz = 4 * (1 << (arm_cache_ccsidr_info.bits.LineSize + 2));
+	cpuid_cache_info_p->c_assoc = (arm_cache_ccsidr_info.bits.Assoc + 1);
 
 	/* I cache size */
-	cpuid_cache_info.c_isize = (arm_cache_ccsidr_info.bits.NumSets + 1) * cpuid_cache_info.c_linesz * cpuid_cache_info.c_assoc;
+	cpuid_cache_info_p->c_isize = (arm_cache_ccsidr_info.bits.NumSets + 1) * cpuid_cache_info_p->c_linesz * cpuid_cache_info_p->c_assoc;
 
 	/* D cache size */
-	cpuid_cache_info.c_dsize = (arm_cache_ccsidr_info.bits.NumSets + 1) * cpuid_cache_info.c_linesz * cpuid_cache_info.c_assoc;
+	cpuid_cache_info_p->c_dsize = (arm_cache_ccsidr_info.bits.NumSets + 1) * cpuid_cache_info_p->c_linesz * cpuid_cache_info_p->c_assoc;
 
 
 	if ((arm_cache_clidr_info.bits.Ctype3 == 0x4) ||
@@ -338,11 +360,11 @@ do_cacheid(void)
 		}
 		arm_cache_ccsidr_info.value = machine_read_ccsidr();
 
-		cpuid_cache_info.c_linesz = 4 * (1 << (arm_cache_ccsidr_info.bits.LineSize + 2));
-		cpuid_cache_info.c_assoc = (arm_cache_ccsidr_info.bits.Assoc + 1);
-		cpuid_cache_info.c_l2size = (arm_cache_ccsidr_info.bits.NumSets + 1) * cpuid_cache_info.c_linesz * cpuid_cache_info.c_assoc;
-		cpuid_cache_info.c_inner_cache_size = cpuid_cache_info.c_dsize;
-		cpuid_cache_info.c_bulksize_op = cpuid_cache_info.c_l2size;
+		cpuid_cache_info_p->c_linesz = 4 * (1 << (arm_cache_ccsidr_info.bits.LineSize + 2));
+		cpuid_cache_info_p->c_assoc = (arm_cache_ccsidr_info.bits.Assoc + 1);
+		cpuid_cache_info_p->c_l2size = (arm_cache_ccsidr_info.bits.NumSets + 1) * cpuid_cache_info_p->c_linesz * cpuid_cache_info_p->c_assoc;
+		cpuid_cache_info_p->c_inner_cache_size = cpuid_cache_info_p->c_dsize;
+		cpuid_cache_info_p->c_bulksize_op = cpuid_cache_info_p->c_l2size;
 
 		/* capri has a 2MB L2 cache unlike every other SoC up to this
 		 * point with a 1MB L2 cache, so to get the same performance
@@ -358,38 +380,70 @@ do_cacheid(void)
 		 * TODO: Are there any special considerations for our unusual
 		 * cache geometries (3MB)?
 		 */
-		vm_cache_geometry_colors = ((arm_cache_ccsidr_info.bits.NumSets + 1) * cpuid_cache_info.c_linesz) / PAGE_SIZE;
+		vm_cache_geometry_colors = ((arm_cache_ccsidr_info.bits.NumSets + 1) * cpuid_cache_info_p->c_linesz) / PAGE_SIZE;
 		kprintf(" vm_cache_geometry_colors: %d\n", vm_cache_geometry_colors);
 	} else {
-		cpuid_cache_info.c_l2size = 0;
+		cpuid_cache_info_p->c_l2size = 0;
 
-		cpuid_cache_info.c_inner_cache_size = cpuid_cache_info.c_dsize;
-		cpuid_cache_info.c_bulksize_op = cpuid_cache_info.c_dsize;
+		cpuid_cache_info_p->c_inner_cache_size = cpuid_cache_info_p->c_dsize;
+		cpuid_cache_info_p->c_bulksize_op = cpuid_cache_info_p->c_dsize;
 	}
 
-	if (cpuid_cache_info.c_unified == 0) {
+	if (cpuid_cache_info_p->c_unified == 0) {
 		machine_write_csselr(CSSELR_L1, CSSELR_INSTR);
 		arm_cache_ccsidr_info.value = machine_read_ccsidr();
 		uint32_t c_linesz = 4 * (1 << (arm_cache_ccsidr_info.bits.LineSize + 2));
 		uint32_t c_assoc = (arm_cache_ccsidr_info.bits.Assoc + 1);
 		/* I cache size */
-		cpuid_cache_info.c_isize = (arm_cache_ccsidr_info.bits.NumSets + 1) * c_linesz * c_assoc;
+		cpuid_cache_info_p->c_isize = (arm_cache_ccsidr_info.bits.NumSets + 1) * c_linesz * c_assoc;
+	}
+
+	if (cpuid_cache_info_p == cpuid_cache_info_boot_cpu) {
+		cpuid_cache_info_p->c_valid = true;
+	} else {
+		lck_rw_lock_exclusive(&cpuid_cache_info_lck_rw);
+		cpuid_cache_info_p->c_valid = true;
+		thread_wakeup((event_t)&cpuid_cache_info_p->c_valid);
+		lck_rw_unlock_exclusive(&cpuid_cache_info_lck_rw);
 	}
 
 	kprintf("%s() - %u bytes %s cache (I:%u D:%u (%s)), %u-way assoc, %u bytes/line\n",
 	    __FUNCTION__,
-	    cpuid_cache_info.c_dsize + cpuid_cache_info.c_isize,
-	    ((cpuid_cache_info.c_type == CACHE_WRITE_BACK) ? "WB" :
-	    (cpuid_cache_info.c_type == CACHE_WRITE_THROUGH ? "WT" : "Unknown")),
-	    cpuid_cache_info.c_isize,
-	    cpuid_cache_info.c_dsize,
-	    (cpuid_cache_info.c_unified) ? "unified" : "separate",
-	    cpuid_cache_info.c_assoc,
-	    cpuid_cache_info.c_linesz);
+	    cpuid_cache_info_p->c_dsize + cpuid_cache_info_p->c_isize,
+	    ((cpuid_cache_info_p->c_type == CACHE_WRITE_BACK) ? "WB" :
+	    (cpuid_cache_info_p->c_type == CACHE_WRITE_THROUGH ? "WT" : "Unknown")),
+	    cpuid_cache_info_p->c_isize,
+	    cpuid_cache_info_p->c_dsize,
+	    (cpuid_cache_info_p->c_unified) ? "unified" : "separate",
+	    cpuid_cache_info_p->c_assoc,
+	    cpuid_cache_info_p->c_linesz);
 }
 
 cache_info_t   *
 cache_info(void)
 {
-	return &cpuid_cache_info;
+	return cpuid_cache_info_boot_cpu;
+}
+
+cache_info_t   *
+cache_info_type(cluster_type_t cluster_type)
+{
+	assert((cluster_type >= 0) && (cluster_type < MAX_CPU_TYPES));
+	cache_info_t *ret = &cpuid_cache_info[cluster_type];
+
+	/*
+	 * cpuid_cache_info_boot_cpu is always populated by the time
+	 * cache_info_type() is callable.  Other clusters may not have completed
+	 * do_cacheid() yet.
+	 */
+	if (ret != cpuid_cache_info_boot_cpu) {
+		lck_rw_lock_shared(&cpuid_cache_info_lck_rw);
+		while (CC_UNLIKELY(!ret->c_valid)) {
+			lck_rw_sleep(&cpuid_cache_info_lck_rw, LCK_SLEEP_DEFAULT,
+			    (event_t)&ret->c_valid, THREAD_UNINT);
+		}
+		lck_rw_unlock_shared(&cpuid_cache_info_lck_rw);
+	}
+
+	return ret;
 }

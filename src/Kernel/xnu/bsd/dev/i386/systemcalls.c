@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2000-2016 Apple Inc. All rights reserved.
+ * Copyright (c) 2000-2021 Apple Inc. All rights reserved.
  *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
  *
@@ -98,7 +98,6 @@ unix_syscall(x86_saved_state_t *state)
 	struct proc             *p;
 	struct uthread          *uthread;
 	x86_saved_state32_t     *regs;
-	boolean_t               is_vfork;
 	pid_t                   pid;
 
 	assert(is_saved_state32(state));
@@ -110,16 +109,9 @@ unix_syscall(x86_saved_state_t *state)
 #endif
 	thread = current_thread();
 	uthread = get_bsdthread_info(thread);
+	p = current_proc();
 
 	uthread_reset_proc_refcount(uthread);
-
-	/* Get the approriate proc; may be different from task's for vfork() */
-	is_vfork = uthread->uu_flag & UT_VFORK;
-	if (__improbable(is_vfork != 0)) {
-		p = current_proc();
-	} else {
-		p = (struct proc *)get_bsdtask_info(current_task());
-	}
 
 	code    = regs->eax & I386_SYSCALL_NUMBER_MASK;
 	syscode = (code < nsysent) ? code : SYS_invalid;
@@ -179,7 +171,7 @@ unix_syscall(x86_saved_state_t *state)
 	 * Delayed binding of thread credential to process credential, if we
 	 * are not running with an explicitly set thread credential.
 	 */
-	kauth_cred_uthread_update(uthread, p);
+	kauth_cred_thread_update(thread, p);
 
 	uthread->uu_rval[0] = 0;
 	uthread->uu_rval[1] = 0;
@@ -187,13 +179,13 @@ unix_syscall(x86_saved_state_t *state)
 	uthread->syscall_code = code;
 	pid = proc_pid(p);
 
-#ifdef JOE_DEBUG
+#ifdef CONFIG_IOCOUNT_TRACE
 	uthread->uu_iocount = 0;
 	uthread->uu_vpindex = 0;
 #endif
 
 #if CONFIG_MACF
-	if (__improbable(p->syscall_filter_mask != NULL && !bitstr_test(p->syscall_filter_mask, syscode))) {
+	if (__improbable(proc_syscall_filter_mask(p) != NULL && !bitstr_test(proc_syscall_filter_mask(p), syscode))) {
 		error = mac_proc_check_syscall_unix(p, syscode);
 		if (error) {
 			goto skip_syscall;
@@ -209,9 +201,10 @@ unix_syscall(x86_saved_state_t *state)
 skip_syscall:
 #endif /* CONFIG_MACF */
 
-#ifdef JOE_DEBUG
+#ifdef CONFIG_IOCOUNT_TRACE
 	if (uthread->uu_iocount) {
-		printf("system call returned with uu_iocount != 0\n");
+		printf("system call returned with uu_iocount(%d) != 0\n",
+		    uthread->uu_iocount);
 	}
 #endif
 #if CONFIG_DTRACE
@@ -270,16 +263,11 @@ skip_syscall:
 		    error, uthread->uu_rval[0], uthread->uu_rval[1], pid);
 	}
 
-	if (__improbable(!is_vfork && callp->sy_call == (sy_call_t *)execve && !error)) {
+	if (__improbable(callp->sy_call == (sy_call_t *)execve && !error)) {
 		pal_execve_return(thread);
 	}
 
-#if PROC_REF_DEBUG
-	if (__improbable(uthread_get_proc_refcount(uthread) != 0)) {
-		panic("system call returned with uu_proc_refcount != 0");
-	}
-#endif
-
+	uthread_assert_zero_proc_refcount(uthread);
 	thread_exception_return();
 	/* NOTREACHED */
 }
@@ -309,15 +297,9 @@ unix_syscall64(x86_saved_state_t *state)
 #endif
 	thread = current_thread();
 	uthread = get_bsdthread_info(thread);
+	p = current_proc();
 
 	uthread_reset_proc_refcount(uthread);
-
-	/* Get the approriate proc; may be different from task's for vfork() */
-	if (__probable(!(uthread->uu_flag & UT_VFORK))) {
-		p = (struct proc *)get_bsdtask_info(current_task());
-	} else {
-		p = current_proc();
-	}
 
 	/* Verify that we are not being called from a task without a proc */
 	if (__improbable(p == NULL)) {
@@ -386,7 +368,7 @@ unix_syscall64(x86_saved_state_t *state)
 	 * Delayed binding of thread credential to process credential, if we
 	 * are not running with an explicitly set thread credential.
 	 */
-	kauth_cred_uthread_update(uthread, p);
+	kauth_cred_thread_update(thread, p);
 
 	uthread->uu_rval[0] = 0;
 	uthread->uu_rval[1] = 0;
@@ -394,13 +376,13 @@ unix_syscall64(x86_saved_state_t *state)
 	uthread->syscall_code = code;
 	pid = proc_pid(p);
 
-#ifdef JOE_DEBUG
+#ifdef CONFIG_IOCOUNT_TRACE
 	uthread->uu_iocount = 0;
 	uthread->uu_vpindex = 0;
 #endif
 
 #if CONFIG_MACF
-	if (__improbable(p->syscall_filter_mask != NULL && !bitstr_test(p->syscall_filter_mask, syscode))) {
+	if (__improbable(proc_syscall_filter_mask(p) != NULL && !bitstr_test(proc_syscall_filter_mask(p), syscode))) {
 		error = mac_proc_check_syscall_unix(p, syscode);
 		if (error) {
 			goto skip_syscall;
@@ -416,9 +398,10 @@ unix_syscall64(x86_saved_state_t *state)
 skip_syscall:
 #endif /* CONFIG_MACF */
 
-#ifdef JOE_DEBUG
+#ifdef CONFIG_IOCOUNT_TRACE
 	if (uthread->uu_iocount) {
-		printf("system call returned with uu_iocount != 0\n");
+		printf("system call returned with uu_iocount(%d) != 0\n",
+		    uthread->uu_iocount);
 	}
 #endif
 
@@ -493,12 +476,7 @@ skip_syscall:
 		    error, uthread->uu_rval[0], uthread->uu_rval[1], pid);
 	}
 
-#if PROC_REF_DEBUG
-	if (__improbable(uthread_get_proc_refcount(uthread))) {
-		panic("system call returned with uu_proc_refcount != 0");
-	}
-#endif
-
+	uthread_assert_zero_proc_refcount(uthread);
 	thread_exception_return();
 	/* NOTREACHED */
 }
@@ -609,6 +587,7 @@ unix_syscall_return(int error)
 
 
 	uthread->uu_flag &= ~UT_NOTCANCELPT;
+	uthread->syscall_code = 0;
 
 #if DEBUG || DEVELOPMENT
 	kern_allocation_name_t
@@ -628,7 +607,7 @@ unix_syscall_return(int error)
 	}
 	if (!code_is_kdebug_trace(code)) {
 		KDBG_RELEASE(BSDDBG_CODE(DBG_BSD_EXCP_SC, code) | DBG_FUNC_END,
-		    error, uthread->uu_rval[0], uthread->uu_rval[1], p->p_pid);
+		    error, uthread->uu_rval[0], uthread->uu_rval[1], proc_getpid(p));
 	}
 
 	thread_exception_return();

@@ -21,12 +21,11 @@ INSTINC_SUBDIRS = \
 	netkey \
 	nfs \
 	security \
+	skywalk \
 	pthread \
 	sys \
-	sys_private \
 	uuid \
 	vfs
-
 
 INSTINC_SUBDIRS_X86_64 = \
 	i386 \
@@ -54,13 +53,12 @@ EXPINC_SUBDIRS = \
 	netinet6 \
 	netkey \
 	security \
+	skywalk \
 	pthread \
 	sys \
-	sys_private \
 	uuid \
 	vfs \
 	vm
-
 
 EXPINC_SUBDIRS_X86_64 = \
 	i386

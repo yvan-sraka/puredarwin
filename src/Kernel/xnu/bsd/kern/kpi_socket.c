@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2003-2020 Apple Inc. All rights reserved.
+ * Copyright (c) 2003-2021 Apple Inc. All rights reserved.
  *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
  *
@@ -48,6 +48,12 @@
 #include <netinet/in.h>
 #include <libkern/OSAtomic.h>
 #include <stdbool.h>
+
+#if SKYWALK
+#include <skywalk/core/skywalk_var.h>
+#endif /* SKYWALK */
+
+#define SOCK_SEND_MBUF_MODE_VERBOSE     0x0001
 
 static errno_t sock_send_internal(socket_t, const struct msghdr *,
     mbuf_t, int, size_t *);
@@ -176,11 +182,11 @@ check_again:
 
 	/* see comments in sock_setupcall() */
 	if (callback != NULL) {
-#if (defined(__arm__) || defined(__arm64__))
+#if defined(__arm64__)
 		sock_setupcalls_locked(new_so, callback, cookie, callback, cookie, 0);
-#else /* (defined(__arm__) || defined(__arm64__)) */
+#else /* defined(__arm64__) */
 		sock_setupcalls_locked(new_so, callback, cookie, NULL, NULL, 0);
-#endif /* (defined(__arm__) || defined(__arm64__)) */
+#endif /* defined(__arm64__) */
 	}
 
 	if (sa != NULL && from != NULL) {
@@ -189,9 +195,7 @@ check_again:
 		}
 		memcpy(from, sa, fromlen);
 	}
-	if (sa != NULL) {
-		FREE(sa, M_SONAME);
-	}
+	free_sockaddr(sa);
 
 	/*
 	 * If the socket has been marked as inactive by sosetdefunct(),
@@ -230,27 +234,22 @@ sock_bind(socket_t sock, const struct sockaddr *to)
 	int error = 0;
 	struct sockaddr *sa = NULL;
 	struct sockaddr_storage ss;
-	boolean_t want_free = TRUE;
 
 	if (sock == NULL || to == NULL) {
 		return EINVAL;
 	}
 
 	if (to->sa_len > sizeof(ss)) {
-		sa = kheap_alloc(KHEAP_TEMP, to->sa_len, Z_WAITOK);
-		if (sa == NULL) {
-			return ENOBUFS;
-		}
+		sa = kalloc_data(to->sa_len, Z_WAITOK | Z_ZERO | Z_NOFAIL);
 	} else {
 		sa = (struct sockaddr *)&ss;
-		want_free = FALSE;
 	}
 	memcpy(sa, to, to->sa_len);
 
 	error = sobindlock(sock, sa, 1);        /* will lock socket */
 
-	if (sa != NULL && want_free == TRUE) {
-		kheap_free(KHEAP_TEMP, sa, sa->sa_len);
+	if (sa != (struct sockaddr *)&ss) {
+		kfree_data(sa, sa->sa_len);
 	}
 
 	return error;
@@ -263,21 +262,19 @@ sock_connect(socket_t sock, const struct sockaddr *to, int flags)
 	lck_mtx_t *mutex_held;
 	struct sockaddr *sa = NULL;
 	struct sockaddr_storage ss;
-	boolean_t want_free = TRUE;
 
 	if (sock == NULL || to == NULL) {
 		return EINVAL;
 	}
 
 	if (to->sa_len > sizeof(ss)) {
-		sa = kheap_alloc(KHEAP_TEMP, to->sa_len,
+		sa = kalloc_data(to->sa_len,
 		    (flags & MSG_DONTWAIT) ? Z_NOWAIT : Z_WAITOK);
 		if (sa == NULL) {
 			return ENOBUFS;
 		}
 	} else {
 		sa = (struct sockaddr *)&ss;
-		want_free = FALSE;
 	}
 	memcpy(sa, to, to->sa_len);
 
@@ -288,7 +285,17 @@ sock_connect(socket_t sock, const struct sockaddr *to, int flags)
 		error = EALREADY;
 		goto out;
 	}
+
+#if SKYWALK
+	sk_protect_t protect = sk_async_transmit_protect();
+#endif /* SKYWALK */
+
 	error = soconnectlock(sock, sa, 0);
+
+#if SKYWALK
+	sk_async_transmit_unprotect(protect);
+#endif /* SKYWALK */
+
 	if (!error) {
 		if ((sock->so_state & SS_ISCONNECTING) &&
 		    ((sock->so_state & SS_NBIO) != 0 ||
@@ -322,8 +329,8 @@ sock_connect(socket_t sock, const struct sockaddr *to, int flags)
 out:
 	socket_unlock(sock, 1);
 
-	if (sa != NULL && want_free == TRUE) {
-		kheap_free(KHEAP_TEMP, sa, sa->sa_len);
+	if (sa != (struct sockaddr *)&ss) {
+		kfree_data(sa, sa->sa_len);
 	}
 
 	return error;
@@ -432,7 +439,7 @@ sock_getpeername(socket_t sock, struct sockaddr *peername, int peernamelen)
 			peernamelen = sa->sa_len;
 		}
 		memcpy(peername, sa, peernamelen);
-		FREE(sa, M_SONAME);
+		free_sockaddr(sa);
 	}
 	return error;
 }
@@ -455,7 +462,7 @@ sock_getsockname(socket_t sock, struct sockaddr *sockname, int socknamelen)
 			socknamelen = sa->sa_len;
 		}
 		memcpy(sockname, sa, socknamelen);
-		FREE(sa, M_SONAME);
+		free_sockaddr(sa);
 	}
 	return error;
 }
@@ -476,7 +483,7 @@ sogetaddr_locked(struct socket *so, struct sockaddr **psa, int peer)
 	if (error == 0 && *psa == NULL) {
 		error = ENOMEM;
 	} else if (error != 0) {
-		FREE(*psa, M_SONAME);
+		free_sockaddr(*psa);
 	}
 	return error;
 }
@@ -500,7 +507,7 @@ sock_getaddr(socket_t sock, struct sockaddr **psa, int peer)
 void
 sock_freeaddr(struct sockaddr *sa)
 {
-	FREE(sa, M_SONAME);
+	free_sockaddr(sa);
 }
 
 errno_t
@@ -803,7 +810,7 @@ cleanup:
 	if (control != NULL) {
 		m_freem(control);
 	}
-	FREE(fromsa, M_SONAME);
+	free_sockaddr(fromsa);
 	return error;
 }
 
@@ -839,7 +846,6 @@ sock_send_internal(socket_t sock, const struct msghdr *msg, mbuf_t data,
 	struct mbuf *control = NULL;
 	int error = 0;
 	user_ssize_t datalen = 0;
-	char uio_buf[UIO_SIZEOF((msg != NULL ? msg->msg_iovlen : 1))];
 
 	if (sock == NULL) {
 		error = EINVAL;
@@ -849,8 +855,15 @@ sock_send_internal(socket_t sock, const struct msghdr *msg, mbuf_t data,
 	if (data == NULL && msg != NULL) {
 		struct iovec *tempp = msg->msg_iov;
 
-		auio = uio_createwithbuffer(msg->msg_iovlen, 0,
-		    UIO_SYSSPACE, UIO_WRITE, &uio_buf[0], sizeof(uio_buf));
+		auio = uio_create(msg->msg_iovlen, 0, UIO_SYSSPACE, UIO_WRITE);
+		if (auio == NULL) {
+#if (DEBUG || DEVELOPMENT)
+			printf("sock_send_internal: so %p uio_createwithbuffer(%lu) failed, ENOMEM\n",
+			    sock, UIO_SIZEOF(msg->msg_iovlen));
+#endif /* (DEBUG || DEVELOPMENT) */
+			error = ENOMEM;
+			goto errorout;
+		}
 		if (tempp != NULL) {
 			int i;
 
@@ -898,9 +911,17 @@ sock_send_internal(socket_t sock, const struct msghdr *msg, mbuf_t data,
 		control->m_len = msg->msg_controllen;
 	}
 
+#if SKYWALK
+	sk_protect_t protect = sk_async_transmit_protect();
+#endif /* SKYWALK */
+
 	error = sock->so_proto->pr_usrreqs->pru_sosend(sock, msg != NULL ?
 	    (struct sockaddr *)msg->msg_name : NULL, auio, data,
 	    control, flags);
+
+#if SKYWALK
+	sk_async_transmit_unprotect(protect);
+#endif /* SKYWALK */
 
 	/*
 	 * Residual data is possible in the case of IO vectors but not
@@ -921,6 +942,9 @@ sock_send_internal(socket_t sock, const struct msghdr *msg, mbuf_t data,
 			*sentlen = datalen;
 		}
 	}
+	if (auio != NULL) {
+		uio_free(auio);
+	}
 
 	return error;
 
@@ -939,6 +963,9 @@ errorout:
 	if (sentlen) {
 		*sentlen = 0;
 	}
+	if (auio != NULL) {
+		uio_free(auio);
+	}
 	return error;
 }
 
@@ -956,14 +983,74 @@ errno_t
 sock_sendmbuf(socket_t sock, const struct msghdr *msg, mbuf_t data,
     int flags, size_t *sentlen)
 {
+	int error;
+
 	if (data == NULL || (msg != NULL && (msg->msg_iov != NULL ||
 	    msg->msg_iovlen != 0))) {
 		if (data != NULL) {
 			m_freem(data);
 		}
-		return EINVAL;
+		error = EINVAL;
+		goto done;
 	}
-	return sock_send_internal(sock, msg, data, flags, sentlen);
+	error = sock_send_internal(sock, msg, data, flags, sentlen);
+done:
+	return error;
+}
+
+errno_t
+sock_sendmbuf_can_wait(socket_t sock, const struct msghdr *msg, mbuf_t data,
+    int flags, size_t *sentlen)
+{
+	int error;
+	int count = 0;
+	int i;
+	mbuf_t m;
+	struct msghdr msg_temp = {};
+
+	if (data == NULL || (msg != NULL && (msg->msg_iov != NULL ||
+	    msg->msg_iovlen != 0))) {
+		error = EINVAL;
+		goto done;
+	}
+
+	/*
+	 * Use the name and control
+	 */
+	msg_temp.msg_name = msg->msg_name;
+	msg_temp.msg_namelen = msg->msg_namelen;
+	msg_temp.msg_control = msg->msg_control;
+	msg_temp.msg_controllen = msg->msg_controllen;
+
+	/*
+	 * Count the number of mbufs in the chain
+	 */
+	for (m = data; m != NULL; m = mbuf_next(m)) {
+		count++;
+	}
+
+	msg_temp.msg_iov = kalloc_type(struct iovec, count, Z_WAITOK | Z_ZERO);
+	if (msg_temp.msg_iov == NULL) {
+		error = ENOMEM;
+		goto done;
+	}
+
+	msg_temp.msg_iovlen = count;
+
+	for (i = 0, m = data; m != NULL; i++, m = mbuf_next(m)) {
+		msg_temp.msg_iov[i].iov_base = mbuf_data(m);
+		msg_temp.msg_iov[i].iov_len = mbuf_len(m);
+	}
+
+	error = sock_send_internal(sock, &msg_temp, NULL, flags, sentlen);
+done:
+	if (data != NULL) {
+		m_freem(data);
+	}
+	if (msg_temp.msg_iov != NULL) {
+		kfree_type(struct iovec, count, msg_temp.msg_iov);
+	}
+	return error;
 }
 
 errno_t
@@ -1067,7 +1154,7 @@ sock_release(socket_t sock)
 
 	sock->so_retaincnt--;
 	if (sock->so_retaincnt < 0) {
-		panic("%s: negative retain count (%d) for sock=%p\n",
+		panic("%s: negative retain count (%d) for sock=%p",
 		    __func__, sock->so_retaincnt, sock);
 		/* NOTREACHED */
 	}
@@ -1306,11 +1393,11 @@ sock_setupcall(socket_t sock, sock_upcall callback, void *context)
 	 * the read and write callbacks and their respective parameters.
 	 */
 	socket_lock(sock, 1);
-#if (defined(__arm__) || defined(__arm64__))
+#if defined(__arm64__)
 	sock_setupcalls_locked(sock, callback, context, callback, context, 0);
-#else /* (defined(__arm__) || defined(__arm64__)) */
+#else /* defined(__arm64__) */
 	sock_setupcalls_locked(sock, callback, context, NULL, NULL, 0);
-#endif /* (defined(__arm__) || defined(__arm64__)) */
+#endif /* defined(__arm64__) */
 	socket_unlock(sock, 1);
 
 	return 0;
@@ -1336,7 +1423,7 @@ sock_setupcalls(socket_t sock, sock_upcall rcallback, void *rcontext,
 
 void
 sock_catchevents_locked(socket_t sock, sock_evupcall ecallback, void *econtext,
-    long emask)
+    uint32_t emask)
 {
 	socket_lock_assert_owned(sock);
 
@@ -1346,7 +1433,7 @@ sock_catchevents_locked(socket_t sock, sock_evupcall ecallback, void *econtext,
 	if (ecallback != NULL) {
 		sock->so_event = ecallback;
 		sock->so_eventarg = econtext;
-		sock->so_eventmask = (uint32_t)emask;
+		sock->so_eventmask = emask;
 	} else {
 		sock->so_event = sonullevent;
 		sock->so_eventarg = NULL;
@@ -1356,7 +1443,7 @@ sock_catchevents_locked(socket_t sock, sock_evupcall ecallback, void *econtext,
 
 errno_t
 sock_catchevents(socket_t sock, sock_evupcall ecallback, void *econtext,
-    long emask)
+    uint32_t emask)
 {
 	if (sock == NULL) {
 		return EINVAL;

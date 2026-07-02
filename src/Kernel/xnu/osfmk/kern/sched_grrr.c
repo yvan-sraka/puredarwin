@@ -38,7 +38,6 @@
 
 #include <kern/kern_types.h>
 #include <kern/clock.h>
-#include <kern/counters.h>
 #include <kern/cpu_number.h>
 #include <kern/cpu_data.h>
 #include <kern/debug.h>
@@ -231,6 +230,7 @@ const struct sched_dispatch_table sched_grrr_dispatch = {
 	.rt_queue_shutdown                              = sched_rtlocal_queue_shutdown,
 	.rt_runq_scan                                   = sched_rtlocal_runq_scan,
 	.rt_runq_count_sum                              = sched_rtlocal_runq_count_sum,
+	.rt_steal_thread                                = sched_rtlocal_steal_thread,
 
 	.qos_max_parallelism                            = sched_qos_max_parallelism,
 	.check_spill                                    = sched_check_spill,
@@ -240,9 +240,12 @@ const struct sched_dispatch_table sched_grrr_dispatch = {
 	.run_count_decr                                 = sched_run_decr,
 	.update_thread_bucket                           = sched_update_thread_bucket,
 	.pset_made_schedulable                          = sched_pset_made_schedulable,
+	.cpu_init_completed                             = NULL,
+	.thread_eligible_for_pset                       = NULL,
 };
 
-extern int      max_unsafe_quanta;
+extern int      max_unsafe_rt_quanta;
+extern int      max_unsafe_failsafe_quanta;
 
 static uint32_t grrr_quantum_us;
 static uint32_t grrr_quantum;
@@ -277,8 +280,8 @@ sched_grrr_timebase_init(void)
 	default_timeshare_computation = grrr_quantum / 2;
 	default_timeshare_constraint = grrr_quantum;
 
-	max_unsafe_computation = max_unsafe_quanta * grrr_quantum;
-	sched_safe_duration = 2 * max_unsafe_quanta * grrr_quantum;
+	sched_set_max_unsafe_rt_quanta(max_unsafe_rt_quanta);
+	sched_set_max_unsafe_fixed_quanta(max_unsafe_rt_quanta);
 }
 
 static void

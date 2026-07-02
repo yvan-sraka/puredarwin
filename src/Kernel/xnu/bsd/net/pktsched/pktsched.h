@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2011-2018 Apple Inc. All rights reserved.
+ * Copyright (c) 2011-2020 Apple Inc. All rights reserved.
  *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
  *
@@ -51,11 +51,10 @@ extern "C" {
 #include <libkern/libkern.h>
 
 /* flags for pktsched_setup */
-#define PKTSCHEDF_QALG_SFB      0x01    /* use SFB */
-#define PKTSCHEDF_QALG_ECN      0x02    /* enable ECN */
-#define PKTSCHEDF_QALG_FLOWCTL  0x04    /* enable flow control advisories */
-#define PKTSCHEDF_QALG_DELAYBASED       0x08    /* Delay based queueing */
-#define PKTSCHEDF_QALG_DRIVER_MANAGED   0x10    /* driver managed */
+#define PKTSCHEDF_QALG_ECN      0x01    /* enable ECN */
+#define PKTSCHEDF_QALG_FLOWCTL  0x02    /* enable flow control advisories */
+#define PKTSCHEDF_QALG_DELAYBASED       0x04    /* Delay based queueing */
+#define PKTSCHEDF_QALG_DRIVER_MANAGED   0x08    /* driver managed */
 
 typedef struct _pktsched_pkt_ {
 	classq_pkt_t            __pkt;
@@ -126,6 +125,13 @@ pktsched_bit_clr(u_int32_t ix, pktsched_bitmap_t *pData)
 	*pData &= ~(1 << ix);
 }
 
+static inline void
+pktsched_bit_cpy(u_int32_t ix, pktsched_bitmap_t *pData_dst,
+    pktsched_bitmap_t *pData_src)
+{
+	*pData_dst ^= (-(*pData_src & (1 << ix)) ^ *pData_dst) & (1 << ix);
+}
+
 static inline pktsched_bitmap_t
 pktsched_ffs(pktsched_bitmap_t pData)
 {
@@ -173,7 +179,7 @@ extern void pktsched_init(void);
 extern int pktsched_setup(struct ifclassq *, u_int32_t, u_int32_t,
     classq_pkt_type_t);
 extern void pktsched_teardown(struct ifclassq *);
-extern int pktsched_getqstats(struct ifclassq *, u_int32_t,
+extern int pktsched_getqstats(struct ifclassq *, u_int32_t, u_int32_t,
     struct if_ifclassq_stats *);
 extern u_int64_t pktsched_abs_to_nsecs(u_int64_t);
 extern u_int64_t pktsched_nsecs_to_abstime(u_int64_t);
@@ -189,6 +195,8 @@ extern void pktsched_pkt_encap_chain(pktsched_pkt_t *, classq_pkt_t *,
 extern mbuf_svc_class_t pktsched_get_pkt_svc(pktsched_pkt_t *);
 extern struct flowadv_fcentry *pktsched_alloc_fcentry(pktsched_pkt_t *,
     struct ifnet *, int);
+extern int pktsched_mark_ecn(pktsched_pkt_t *pkt);
+extern boolean_t pktsched_is_pkt_l4s(pktsched_pkt_t *pkt);
 #endif /* BSD_KERNEL_PRIVATE */
 
 #ifdef __cplusplus

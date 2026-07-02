@@ -227,7 +227,6 @@ void
 sfi_init(void)
 {
 	sfi_class_id_t i;
-	kern_return_t kret;
 
 	simple_lock_init(&sfi_lock, 0);
 	timer_call_setup(&sfi_timer_call_entry, sfi_timer_global_off, NULL);
@@ -241,8 +240,7 @@ sfi_init(void)
 			timer_call_setup(&sfi_classes[i].on_timer, sfi_timer_per_class_on, (void *)(uintptr_t)i);
 			sfi_classes[i].on_timer_programmed = FALSE;
 
-			kret = waitq_init(&sfi_classes[i].waitq, SYNC_POLICY_FIFO | SYNC_POLICY_DISABLE_IRQ);
-			assert(kret == KERN_SUCCESS);
+			waitq_init(&sfi_classes[i].waitq, WQT_QUEUE, SYNC_POLICY_FIFO);
 		} else {
 			/* The only allowed gap is for SFI_CLASS_UNSPECIFIED */
 			if (i != SFI_CLASS_UNSPECIFIED) {
@@ -418,14 +416,19 @@ sfi_timer_per_class_on(
 	sfi_class->class_in_on_phase = TRUE;
 	sfi_class->on_timer_programmed = FALSE;
 
+	simple_unlock(&sfi_lock);
+
+	/*
+	 * Issue the wakeup outside the lock to reduce lock hold time
+	 * rdar://problem/96463639
+	 */
+
 	kret = waitq_wakeup64_all(&sfi_class->waitq,
 	    CAST_EVENT64_T(sfi_class_id),
-	    THREAD_AWAKENED, WAITQ_ALL_PRIORITIES);
+	    THREAD_AWAKENED, WAITQ_WAKEUP_DEFAULT);
 	assert(kret == KERN_SUCCESS || kret == KERN_NOT_WAITING);
 
 	KERNEL_DEBUG_CONSTANT(MACHDBG_CODE(DBG_MACH_SFI, SFI_ON_TIMER) | DBG_FUNC_END, 0, 0, 0, 0, 0);
-
-	simple_unlock(&sfi_lock);
 
 	splx(s);
 }
@@ -739,7 +742,7 @@ sfi_get_class_offtime(sfi_class_id_t class_id, uint64_t *offtime_usecs)
 sfi_class_id_t
 sfi_thread_classify(thread_t thread)
 {
-	task_t task = thread->task;
+	task_t task = get_threadtask(thread);
 	boolean_t is_kernel_thread = (task == kernel_task);
 	sched_mode_t thmode = thread->sched_mode;
 	boolean_t focal = FALSE;
@@ -797,7 +800,7 @@ sfi_thread_classify(thread_t thread)
 	case TASK_DEFAULT_APPLICATION:
 	case TASK_UNSPECIFIED:
 		/* Focal if the task is in a coalition with a FG/focal app */
-		if (task_coalition_focal_count(thread->task) > 0) {
+		if (task_coalition_focal_count(task) > 0) {
 			focal = TRUE;
 		}
 		break;
@@ -950,7 +953,8 @@ _sfi_wait_cleanup(void)
 		int64_t sfi_wait_time = made_runnable - self->wait_sfi_begin_time;
 		assert(sfi_wait_time >= 0);
 
-		ledger_credit(self->task->ledger, task_ledgers.sfi_wait_times[current_sfi_wait_class],
+		ledger_credit(get_threadtask(self)->ledger,
+		    task_ledgers.sfi_wait_times[current_sfi_wait_class],
 		    sfi_wait_time);
 
 		self->wait_sfi_begin_time = 0;
@@ -1167,7 +1171,7 @@ sfi_reevaluate(thread_t thread __unused)
 sfi_class_id_t
 sfi_thread_classify(thread_t thread)
 {
-	task_t task = thread->task;
+	task_t task = get_threadtask(thread);
 	boolean_t is_kernel_thread = (task == kernel_task);
 
 	if (is_kernel_thread) {

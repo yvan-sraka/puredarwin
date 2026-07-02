@@ -14,7 +14,10 @@ target_sources(IOStorageFamily PRIVATE
     IOPartitionScheme.cpp
     IOStorage.cpp
 )
-target_include_directories(IOStorageFamily PRIVATE include)
+target_include_directories(IOStorageFamily PRIVATE
+    include
+    ${PUREDARWIN_SOURCE_DIR}/src/Kernel/xnu/iokit
+)
 target_compile_options(IOStorageFamily PRIVATE -Wno-implicit-int-conversion -Wno-sign-conversion -Wno-deprecated-declarations)
 set_property(TARGET IOStorageFamily PROPERTY CXX_STANDARD 17)
 install(TARGETS IOStorageFamily DESTINATION System/Library/Extensions COMPONENT BaseSystem)

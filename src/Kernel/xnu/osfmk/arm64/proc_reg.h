@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2007-2013 Apple Inc. All rights reserved.
+ * Copyright (c) 2007-2022 Apple Inc. All rights reserved.
  *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
  *
@@ -26,12 +26,258 @@
  * @APPLE_OSREFERENCE_LICENSE_HEADER_END@
  */
 /*
- * Processor registers for ARM64
+ * @OSF_COPYRIGHT@
+ */
+/* CMU_ENDHIST */
+/*
+ * Mach Operating System
+ * Copyright (c) 1991,1990 Carnegie Mellon University
+ * All Rights Reserved.
+ *
+ * Permission to use, copy, modify and distribute this software and its
+ * documentation is hereby granted, provided that both the copyright
+ * notice and this permission notice appear in all copies of the
+ * software, derivative works or modified versions, and any portions
+ * thereof, and that both notices appear in supporting documentation.
+ *
+ * CARNEGIE MELLON ALLOWS FREE USE OF THIS SOFTWARE IN ITS "AS IS"
+ * CONDITION.  CARNEGIE MELLON DISCLAIMS ANY LIABILITY OF ANY KIND FOR
+ * ANY DAMAGES WHATSOEVER RESULTING FROM THE USE OF THIS SOFTWARE.
+ *
+ * Carnegie Mellon requests users of this software to return to
+ *
+ *  Software Distribution Coordinator  or  Software.Distribution@CS.CMU.EDU
+ *  School of Computer Science
+ *  Carnegie Mellon University
+ *  Pittsburgh PA 15213-3890
+ *
+ * any improvements or extensions that they make and grant Carnegie Mellon
+ * the rights to redistribute these changes.
+ */
+
+/*
+ * Processor registers for ARM/ARM64
  */
 #ifndef _ARM64_PROC_REG_H_
 #define _ARM64_PROC_REG_H_
 
-#include <arm/proc_reg.h>
+#if defined (__arm64__)
+#include <pexpert/arm64/board_config.h>
+#elif defined (__arm__)
+#include <pexpert/arm/board_config.h>
+#endif
+
+/*
+ * Processor registers for ARM
+ */
+#if __ARM_42BIT_PA_SPACE__
+/* For now, force the issue! */
+/* We need more VA space for the identity map to bootstrap the MMU */
+#undef __ARM64_PMAP_SUBPAGE_L1__
+#endif /* __ARM_42BIT_PA_SPACE__ */
+
+/* For arm platforms, create one pset per cluster */
+#define MAX_PSETS MAX_CPU_CLUSTERS
+
+/*
+ * The clutch scheduler is enabled only on non-AMP platforms for now.
+ */
+#if CONFIG_CLUTCH
+
+#if __ARM_AMP__
+
+/* Enable the Edge scheduler for all AS Mac platforms */
+#if XNU_TARGET_OS_OSX
+#define CONFIG_SCHED_CLUTCH 1
+#define CONFIG_SCHED_EDGE   1
+#endif /* XNU_TARGET_OS_OSX */
+
+#else /* __ARM_AMP__ */
+#define CONFIG_SCHED_CLUTCH 1
+#endif /* __ARM_AMP__ */
+
+#endif /* CONFIG_CLUTCH */
+
+/* Thread groups are enabled on all ARM platforms (irrespective of scheduler) */
+#define CONFIG_THREAD_GROUPS 1
+
+#ifdef XNU_KERNEL_PRIVATE
+
+#if __ARM_VFP__
+#define ARM_VFP_DEBUG 0
+#endif /* __ARM_VFP__ */
+
+#endif /* XNU_KERNEL_PRIVATE */
+
+/*
+ * FSR registers
+ *
+ * CPSR: Current Program Status Register
+ * SPSR: Saved Program Status Registers
+ *
+ *  31 30 29 28 27     24     19   16      9  8  7  6  5  4   0
+ * +-----------------------------------------------------------+
+ * | N| Z| C| V| Q|...| J|...|GE[3:0]|...| E| A| I| F| T| MODE |
+ * +-----------------------------------------------------------+
+ */
+
+/*
+ * Flags
+ */
+#define PSR_NF 0x80000000 /* Negative/Less than */
+#define PSR_ZF 0x40000000 /* Zero */
+#define PSR_CF 0x20000000 /* Carry/Borrow/Extend */
+#define PSR_VF 0x10000000 /* Overflow */
+
+/*
+ * Modified execution mode flags
+ */
+#define PSR_TF  0x00000020 /* thumb flag (BX ARMv4T) */
+
+/*
+ * CPU mode
+ */
+#define PSR_USER_MODE 0x00000010 /* User mode */
+
+#define PSR_MODE_MASK      0x0000001F
+#define PSR_IS_KERNEL(psr) (((psr) & PSR_MODE_MASK) != PSR_USER_MODE)
+#define PSR_IS_USER(psr)   (((psr) & PSR_MODE_MASK) == PSR_USER_MODE)
+
+#define PSR_USERDFLT  PSR_USER_MODE
+
+/*
+ * Cache configuration
+ */
+
+#if defined (APPLETYPHOON)
+
+/* I-Cache */
+#define MMU_I_CLINE 6                      /* cache line size as 1<<MMU_I_CLINE (64) */
+
+/* D-Cache */
+#define MMU_CLINE   6                      /* cache line size as 1<<MMU_CLINE (64) */
+
+#elif defined (APPLETWISTER)
+
+/* I-Cache */
+#define MMU_I_CLINE 6                      /* cache line size as 1<<MMU_I_CLINE (64) */
+
+/* D-Cache */
+#define MMU_CLINE   6                      /* cache line size is 1<<MMU_CLINE (64) */
+
+#elif defined (APPLEHURRICANE)
+
+/* I-Cache */
+#define MMU_I_CLINE 6                      /* cache line size as 1<<MMU_I_CLINE (64) */
+
+/* D-Cache */
+#define MMU_CLINE   6                      /* cache line size is 1<<MMU_CLINE (64) */
+
+#elif defined (APPLEMONSOON)
+
+/* I-Cache, 96KB for Monsoon, 48KB for Mistral, 6-way. */
+#define MMU_I_CLINE 6                      /* cache line size as 1<<MMU_I_CLINE (64) */
+
+/* D-Cache, 64KB for Monsoon, 32KB for Mistral, 4-way. */
+#define MMU_CLINE   6                      /* cache line size is 1<<MMU_CLINE (64) */
+
+#elif defined (APPLEVORTEX)
+
+/* I-Cache, 128KB 8-way for Vortex, 48KB 6-way for Tempest. */
+#define MMU_I_CLINE 6                      /* cache line size as 1<<MMU_I_CLINE (64) */
+
+/* D-Cache, 128KB 8-way for Vortex, 32KB 4-way for Tempest. */
+#define MMU_CLINE   6                      /* cache line size is 1<<MMU_CLINE (64) */
+
+#elif defined (APPLELIGHTNING)
+
+/* I-Cache, 192KB for Lightning, 96KB for Thunder, 6-way. */
+#define MMU_I_CLINE 6                      /* cache line size as 1<<MMU_I_CLINE (64) */
+
+/* D-Cache, 128KB for Lightning, 8-way. 48KB for Thunder, 6-way. */
+#define MMU_CLINE   6                      /* cache line size is 1<<MMU_CLINE (64) */
+
+#elif defined (APPLEFIRESTORM)
+
+/* I-Cache, 256KB for Firestorm, 128KB for Icestorm, 6-way. */
+#define MMU_I_CLINE 6                      /* cache line size as 1<<MMU_I_CLINE (64) */
+
+/* D-Cache, 160KB for Firestorm, 8-way. 64KB for Icestorm, 6-way. */
+#define MMU_CLINE   6                      /* cache line size is 1<<MMU_CLINE (64) */
+
+#elif defined (BCM2837) /* Raspberry Pi 3 */
+
+/* I-Cache. We don't have detailed spec so we just follow the ARM technical reference. */
+#define MMU_I_CLINE 6
+
+/* D-Cache. */
+#define MMU_CLINE   6
+
+#elif defined (VMAPPLE)
+
+/* I-Cache. */
+#define MMU_I_CLINE 6
+
+/* D-Cache. */
+#define MMU_CLINE   6
+
+#else
+#error processor not supported
+#endif
+
+#define MAX_L2_CLINE_BYTES (1 << MAX_L2_CLINE)
+
+/*
+ * Format of the Debug & Watchpoint Breakpoint Value and Control Registers
+ */
+#define ARM_DBG_VR_ADDRESS_MASK             0xFFFFFFFC            /* BVR & WVR */
+#define ARM_DBG_VR_ADDRESS_MASK64           0xFFFFFFFFFFFFFFFCull /* BVR & WVR */
+
+#define ARM_DBG_CR_ADDRESS_MASK_MASK        0x1F000000 /* BCR & WCR */
+#define ARM_DBGBCR_MATCH_MASK               (1 << 22)  /* BCR only  */
+#define ARM_DBGBCR_TYPE_MASK                (1 << 21)  /* BCR only */
+#define ARM_DBGBCR_TYPE_IVA                 (0 << 21)
+#define ARM_DBG_CR_LINKED_MASK              (1 << 20)  /* BCR & WCR */
+#define ARM_DBG_CR_LINKED_UNLINKED          (0 << 20)
+#define ARM_DBG_CR_SECURITY_STATE_BOTH      (0 << 14)
+#define ARM_DBG_CR_HIGHER_MODE_ENABLE       (1 << 13)
+#define ARM_DBGWCR_BYTE_ADDRESS_SELECT_MASK 0x00001FE0 /* WCR only  */
+#define ARM_DBG_CR_BYTE_ADDRESS_SELECT_MASK 0x000001E0 /* BCR & WCR */
+#define ARM_DBGWCR_ACCESS_CONTROL_MASK      (3 << 3)   /* WCR only */
+#define ARM_DBG_CR_MODE_CONTROL_PRIVILEGED  (1 << 1)   /* BCR & WCR */
+#define ARM_DBG_CR_MODE_CONTROL_USER        (2 << 1)   /* BCR & WCR */
+#define ARM_DBG_CR_ENABLE_MASK              (1 << 0)   /* BCR & WCR */
+#define ARM_DBG_CR_ENABLE_ENABLE            (1 << 0)
+
+/*
+ * Format of the OS Lock Access (DBGOSLAR) and Lock Access Registers (DBGLAR)
+ */
+#define ARM_DBG_LOCK_ACCESS_KEY 0xC5ACCE55
+
+/* ARM Debug registers of interest */
+#define ARM_DEBUG_OFFSET_DBGPRCR       (0x310)
+#define ARM_DEBUG_OFFSET_DBGLAR        (0xFB0)
+
+/*
+ * Main ID Register (MIDR)
+ *
+ *  31 24 23 20 19  16 15   4 3   0
+ * +-----+-----+------+------+-----+
+ * | IMP | VAR | ARCH | PNUM | REV |
+ * +-----+-----+------+------+-----+
+ *
+ * where:
+ *   IMP:  Implementor code
+ *   VAR:  Variant number
+ *   ARCH: Architecture code
+ *   PNUM: Primary part number
+ *   REV:  Minor revision number
+ */
+#define MIDR_REV_SHIFT  0
+#define MIDR_REV_MASK   (0xf << MIDR_REV_SHIFT)
+#define MIDR_VAR_SHIFT  20
+#define MIDR_VAR_MASK   (0xf << MIDR_VAR_SHIFT)
+
 
 #if __ARM_KERNEL_PROTECT__
 /*
@@ -169,6 +415,15 @@
 #define PSR64_V_SHIFT    28
 #define PSR64_V          (1 << PSR64_V_SHIFT)
 
+#define PSR64_TCO_SHIFT  25
+#define PSR64_TCO        (1 << PSR64_TCO_SHIFT)
+
+#define PSR64_DIT_SHIFT  24
+#define PSR64_DIT        (1 << PSR64_DIT_SHIFT)
+
+#define PSR64_UAO_SHIFT  23
+#define PSR64_UAO        (1 << PSR64_UAO_SHIFT)
+
 #define PSR64_PAN_SHIFT  22
 #define PSR64_PAN        (1 << PSR64_PAN_SHIFT)
 
@@ -208,7 +463,7 @@
 
 #define SPSR_INTERRUPTS_ENABLED(x) (!(x & DAIF_FIQF))
 
-#if __ARM_ARCH_8_5__
+#if HAS_ARM_FEAT_SSBS2
 #define PSR64_SSBS_U32_DEFAULT  PSR64_SSBS_32
 #define PSR64_SSBS_U64_DEFAULT  PSR64_SSBS_64
 #define PSR64_SSBS_KRN_DEFAULT  PSR64_SSBS_64
@@ -228,6 +483,7 @@
 #define DAIFSC_FIQF             (1 << 0)
 #define DAIFSC_ALL              (DAIFSC_DEBUGF | DAIFSC_ASYNCF | DAIFSC_IRQF | DAIFSC_FIQF)
 #define DAIFSC_STANDARD_DISABLE (DAIFSC_ASYNCF | DAIFSC_IRQF | DAIFSC_FIQF)
+#define DAIFSC_NOASYNC          (DAIFSC_DEBUGF | DAIFSC_IRQF | DAIFSC_FIQF)
 
 /*
  * ARM64_TODO: unify with ARM?
@@ -262,7 +518,6 @@
 #else
 #define PSR64_KERNEL_DEFAULT    PSR64_KERNEL_STANDARD
 #endif
-#define PSR64_KERNEL_POISON     (PSR64_IL | PSR64_MODE_EL1)
 
 #define PSR64_IS_KERNEL(x)      ((x & PSR64_MODE_EL_MASK) > PSR64_MODE_EL0)
 #define PSR64_IS_USER(x)        ((x & PSR64_MODE_EL_MASK) == PSR64_MODE_EL0)
@@ -336,7 +591,8 @@
 // 11    EOS            Exception return is a context synchronization event
 #define SCTLR_EOS                 (1ULL << 11)
 
-// 10    RES0           0
+// 10    EnRCTX         EL0 Access to FEAT_SPECRES speculation restriction instructions
+#define SCTLR_EnRCTX              (1ULL << 10)
 
 // 9     UMA            User Mask Access
 #define SCTLR_UMA_ENABLED         (1ULL << 9)
@@ -375,11 +631,24 @@
 #define SCTLR_DSSBS_DEFAULT       (0)
 #endif
 
+#if HAS_APPLE_PAC
+#define SCTLR_ROP_KEYS_DEFAULT  SCTLR_PACIB_ENABLED /* IB is ROP */
+#else /* !HAS_APPLE_PAC */
+#define SCTLR_ROP_KEYS_DEFAULT  0
+#endif /* HAS_APPLE_PAC */
+
+#if   HAS_APPLE_PAC
+#define SCTLR_JOP_KEYS_DEFAULT  SCTLR_JOP_KEYS_ENABLED
+#else /* !HAS_APPLE_PAC */
+#define SCTLR_JOP_KEYS_DEFAULT  0
+#endif
+
 #define SCTLR_EL1_DEFAULT \
 	(SCTLR_RESERVED | SCTLR_UCI_ENABLED | SCTLR_nTWE_WFE_ENABLED | SCTLR_DZE_ENABLED | \
 	 SCTLR_I_ENABLED | SCTLR_SED_DISABLED | SCTLR_CP15BEN_ENABLED |                    \
 	 SCTLR_SA0_ENABLED | SCTLR_SA_ENABLED | SCTLR_C_ENABLED | SCTLR_M_ENABLED |        \
-	 SCTLR_CSEH_DEFAULT | SCTLR_DSSBS_DEFAULT)
+	 SCTLR_CSEH_DEFAULT | SCTLR_DSSBS_DEFAULT |                                        \
+	 SCTLR_ROP_KEYS_DEFAULT | SCTLR_JOP_KEYS_DEFAULT)
 
 /*
  * Coprocessor Access Control Register (CPACR)
@@ -608,8 +877,10 @@
 
 #if defined(HAS_APPLE_PAC)
 #define TCR_TBID0_ENABLE         TCR_TBID0_TBI_DATA_ONLY
+#define TCR_TBID1_ENABLE         TCR_TBID1_TBI_DATA_ONLY
 #else
 #define TCR_TBID0_ENABLE         0
+#define TCR_TBID1_ENABLE         0
 #endif
 
 #define TCR_E0PD0_BIT            (1ULL << 55)
@@ -703,12 +974,19 @@
 #define TCR_IPS_VALUE TCR_IPS_40BITS
 #endif /* !__ARM_42BIT_PA_SPACE__ */
 
+#if CONFIG_KERNEL_TBI
+#define TCR_EL1_DTBI    (TCR_TBI1_TOPBYTE_IGNORED | TCR_TBID1_ENABLE)
+#else /* CONFIG_KERNEL_TBI */
+#define TCR_EL1_DTBI    0
+#endif /* CONFIG_KERNEL_TBI */
+
 #define TCR_EL1_BASE \
 	(TCR_IPS_VALUE | TCR_SH0_OUTER | TCR_ORGN0_WRITEBACK |         \
 	 TCR_IRGN0_WRITEBACK | (T0SZ_BOOT << TCR_T0SZ_SHIFT) |          \
 	 TCR_SH1_OUTER | TCR_ORGN1_WRITEBACK | \
 	 TCR_IRGN1_WRITEBACK | (TCR_TG1_GRANULE_SIZE) |                 \
-	 TCR_TBI0_TOPBYTE_IGNORED | (TCR_TBID0_ENABLE) | TCR_E0PD_VALUE)
+	 TCR_TBI0_TOPBYTE_IGNORED | (TCR_TBID0_ENABLE) | TCR_E0PD_VALUE | \
+	 TCR_EL1_DTBI)
 
 #if __ARM_KERNEL_PROTECT__
 #define TCR_EL1_BOOT (TCR_EL1_BASE | (T1SZ_BOOT << TCR_T1SZ_SHIFT) | (TCR_TG0_GRANULE_SIZE))
@@ -830,7 +1108,8 @@
 
 
 /*
- *  Memory Attribute Index
+ * Memory Attribute Index. If these values change, please also update the pmap
+ * LLDB macros that rely on this value (e.g., PmapDecodeTTEARM64).
  */
 #define CACHE_ATTRINDX_WRITEBACK                 0x0 /* cache enabled, buffer enabled  (normal memory) */
 #define CACHE_ATTRINDX_WRITECOMB                 0x1 /* no cache, buffered writes (normal memory) */
@@ -1228,7 +1507,11 @@
 #define ARM_TTE_TABLE_MASK          0x0000fffffffff000ULL          /* mask for extracting pointer to next table (works at any level) */
 
 #define ARM_TTE_TABLE_APSHIFT       61
-#define ARM_TTE_TABLE_AP(x)         ((x)<<TTE_BLOCK_APSHIFT)       /* access protection */
+#define ARM_TTE_TABLE_AP_NO_EFFECT  0x0ULL
+#define ARM_TTE_TABLE_AP_USER_NA    0x1ULL
+#define ARM_TTE_TABLE_AP_RO         0x2ULL
+#define ARM_TTE_TABLE_AP_KERN_RO    0x3ULL
+#define ARM_TTE_TABLE_AP(x)         ((x) << ARM_TTE_TABLE_APSHIFT) /* access protection */
 
 #define ARM_TTE_TABLE_NS            0x8000000000000020ULL          /* value for a secure mapping */
 #define ARM_TTE_TABLE_NS_MASK       0x8000000000000020ULL          /* notSecure mapping mask */
@@ -1320,13 +1603,6 @@
 #define ARM_PTE_COMPRESSED_ALT  0x4000000000000000ULL /* ... and was "alt_acct" */
 #define ARM_PTE_COMPRESSED_MASK 0xC000000000000000ULL
 
-#define ARM_PTE_IS_COMPRESSED(x, p) \
-	((((x) & 0x3) == 0) && /* PTE is not valid... */                      \
-	 ((x) & ARM_PTE_COMPRESSED) && /* ...has "compressed" marker" */      \
-	 ((!((x) & ~ARM_PTE_COMPRESSED_MASK)) || /* ...no other bits */       \
-	 (panic("compressed PTE %p 0x%llx has extra bits 0x%llx: corrupted?", \
-	        (p), (x), (x) & ~ARM_PTE_COMPRESSED_MASK), FALSE)))
-
 #define ARM_PTE_TYPE               0x0000000000000003ULL /* valid L3 entry: includes bit #1 (counterintuitively) */
 #define ARM_PTE_TYPE_VALID         0x0000000000000003ULL /* valid L3 entry: includes bit #1 (counterintuitively) */
 #define ARM_PTE_TYPE_FAULT         0x0000000000000000ULL /* invalid L3 entry */
@@ -1385,11 +1661,6 @@
 
 #define ARM_PTE_WRITEABLE          0x0800000000000000ULL /* value for software writeable bit */
 #define ARM_PTE_WRITEABLE_MASK     0x0800000000000000ULL /* software writeable mask */
-
-#if CONFIG_PGTRACE
-#define ARM_PTE_PGTRACE            0x0200000000000000ULL /* value for software trace bit */
-#define ARM_PTE_PGTRACE_MASK       0x0200000000000000ULL /* software trace mask */
-#endif
 
 #define ARM_PTE_BOOT_PAGE_BASE \
 	(ARM_PTE_TYPE_VALID | ARM_PTE_SH(SH_OUTER_MEMORY) |       \
@@ -1464,8 +1735,13 @@ typedef enum {
 	ESR_EC_MCRR_MRRC_CP14_TRAP = 0x0c,
 	ESR_EC_ILLEGAL_INSTR_SET   = 0x0e,
 	ESR_EC_SVC_32              = 0x11,
+	ESR_EC_HVC_32              = 0x12,
 	ESR_EC_SVC_64              = 0x15,
+	ESR_EC_HVC_64              = 0x16,
 	ESR_EC_MSR_TRAP            = 0x18,
+#if __has_feature(ptrauth_calls)
+	ESR_EC_PAC_FAIL            = 0x1C,
+#endif /* __has_feature(ptrauth_calls) */
 	ESR_EC_IABORT_EL0          = 0x20,
 	ESR_EC_IABORT_EL1          = 0x21,
 	ESR_EC_PC_ALIGN            = 0x22,
@@ -1474,6 +1750,7 @@ typedef enum {
 	ESR_EC_SP_ALIGN            = 0x26,
 	ESR_EC_FLOATING_POINT_32   = 0x28,
 	ESR_EC_FLOATING_POINT_64   = 0x2C,
+	ESR_EC_SERROR_INTERRUPT    = 0x2F,
 	ESR_EC_BKPT_REG_MATCH_EL0  = 0x30, // Breakpoint Debug event taken to the EL from a lower EL.
 	ESR_EC_BKPT_REG_MATCH_EL1  = 0x31, // Breakpoint Debug event taken to the EL from the EL.
 	ESR_EC_SW_STEP_DEBUG_EL0   = 0x32, // Software Step Debug event taken to the EL from a lower EL.
@@ -1509,6 +1786,20 @@ typedef enum {
 	FSC_DEBUG_FAULT            = 0x22,
 } fault_status_t;
 #endif /* ASSEMBLER */
+
+/*
+ * HVC event
+ *  24     16 15  0
+ * +---------+-----+
+ * |000000000| IMM |
+ * +---------+-----+
+ *
+ * where:
+ *   IMM: Immediate value
+ */
+
+#define ISS_HVC_IMM_MASK  0xffff
+#define ISS_HVC_IMM(x)    ((x) & ISS_HVC_IMM_MASK)
 
 /*
  * Software step debug event ISS (EL1)
@@ -1633,6 +1924,9 @@ typedef enum {
 #define ISS_BRK_COMMENT(x)      (x & ISS_BRK_COMMENT_MASK)
 
 
+#if HAS_UCNORMAL_MEM
+#define ISS_UC 0x11
+#endif /* HAS_UCNORMAL_MEM */
 
 
 
@@ -1673,12 +1967,6 @@ typedef enum {
 #define CNTP_CTL_EL0_IMASKED     CNTV_CTL_EL0_IMASKED
 #define CNTP_CTL_EL0_ENABLE      CNTV_CTL_EL0_ENABLE
 
-/*
- * At present all other uses of ARM_DBG_* are shared bit compatibly with the 32bit definitons.
- * (cf. osfmk/arm/proc_reg.h)
- */
-#define ARM_DBG_VR_ADDRESS_MASK64 0xFFFFFFFFFFFFFFFCull /* BVR & WVR */
-
 #define MIDR_EL1_REV_SHIFT  0
 #define MIDR_EL1_REV_MASK   (0xf << MIDR_EL1_REV_SHIFT)
 #define MIDR_EL1_PNUM_SHIFT 4
@@ -1715,7 +2003,12 @@ typedef enum {
 #define MIDR_SICILY_FIRESTORM           (0x021 << MIDR_EL1_PNUM_SHIFT)
 #define MIDR_TONGA_ICESTORM             (0x022 << MIDR_EL1_PNUM_SHIFT)
 #define MIDR_TONGA_FIRESTORM            (0x023 << MIDR_EL1_PNUM_SHIFT)
+#define MIDR_JADE_CHOP_ICESTORM         (0x024 << MIDR_EL1_PNUM_SHIFT)
+#define MIDR_JADE_CHOP_FIRESTORM        (0x025 << MIDR_EL1_PNUM_SHIFT)
+#define MIDR_JADE_DIE_ICESTORM          (0x028 << MIDR_EL1_PNUM_SHIFT)
+#define MIDR_JADE_DIE_FIRESTORM         (0x029 << MIDR_EL1_PNUM_SHIFT)
 #endif
+
 
 
 /*
@@ -1750,15 +2043,32 @@ typedef enum {
 /*
  * ID_AA64ISAR0_EL1 - AArch64 Instruction Set Attribute Register 0
  *
- *  63      24 23    20 19  16 15  12 11   8 7   4 3    0
- * +----------+--------+------+------+------+-----+------+
- * | reserved | atomic |crc32 | sha2 | sha1 | aes | res0 |
- * +----------+--------+------+------+------+-----+------+
+ *  63    60 59   56 55  52 51   48 47  44 43   40 39   36 35  32 31   28 27    24 23    20 19   16 15  12 11   8 7   4 3    0
+ * +--------+-------+------+-------+------+-------+-------+------+-------+--------+--------+-------+------+------+-----+------+
+ * |  rndr  |  tlb  |  ts  |  fhm  |  dp  |  sm4  |  sm3  | sha3 |  rdm  |  res0  | atomic | crc32 | sha2 | sha1 | aes | res0 |
+ * +--------+-------+------+-------+------+-------+-------+------+-------+--------+--------+-------+------+------+-----+------+
  */
+
+#define ID_AA64ISAR0_EL1_TS_OFFSET    52
+#define ID_AA64ISAR0_EL1_TS_MASK      (0xfull << ID_AA64ISAR0_EL1_TS_OFFSET)
+#define ID_AA64ISAR0_EL1_TS_FLAGM_EN  (1ull << ID_AA64ISAR0_EL1_TS_OFFSET)
+#define ID_AA64ISAR0_EL1_TS_FLAGM2_EN (2ull << ID_AA64ISAR0_EL1_TS_OFFSET)
 
 #define ID_AA64ISAR0_EL1_FHM_OFFSET    48
 #define ID_AA64ISAR0_EL1_FHM_MASK      (0xfull << ID_AA64ISAR0_EL1_FHM_OFFSET)
 #define ID_AA64ISAR0_EL1_FHM_8_2       (1ull << ID_AA64ISAR0_EL1_FHM_OFFSET)
+
+#define ID_AA64ISAR0_EL1_DP_OFFSET     44
+#define ID_AA64ISAR0_EL1_DP_MASK       (0xfull << ID_AA64ISAR0_EL1_DP_OFFSET)
+#define ID_AA64ISAR0_EL1_DP_EN         (1ull << ID_AA64ISAR0_EL1_DP_OFFSET)
+
+#define ID_AA64ISAR0_EL1_SHA3_OFFSET   32
+#define ID_AA64ISAR0_EL1_SHA3_MASK     (0xfull << ID_AA64ISAR0_EL1_SHA3_OFFSET)
+#define ID_AA64ISAR0_EL1_SHA3_EN       (1ull << ID_AA64ISAR0_EL1_SHA3_OFFSET)
+
+#define ID_AA64ISAR0_EL1_RDM_OFFSET    28
+#define ID_AA64ISAR0_EL1_RDM_MASK      (0xfull << ID_AA64ISAR0_EL1_RDM_OFFSET)
+#define ID_AA64ISAR0_EL1_RDM_EN        (1ull << ID_AA64ISAR0_EL1_RDM_OFFSET)
 
 #define ID_AA64ISAR0_EL1_ATOMIC_OFFSET 20
 #define ID_AA64ISAR0_EL1_ATOMIC_MASK   (0xfull << ID_AA64ISAR0_EL1_ATOMIC_OFFSET)
@@ -1768,13 +2078,10 @@ typedef enum {
 #define ID_AA64ISAR0_EL1_CRC32_MASK    (0xfull << ID_AA64ISAR0_EL1_CRC32_OFFSET)
 #define ID_AA64ISAR0_EL1_CRC32_EN      (1ull << ID_AA64ISAR0_EL1_CRC32_OFFSET)
 
-#define ID_AA64ISAR0_EL1_SHA3_OFFSET   32
-#define ID_AA64ISAR0_EL1_SHA3_MASK     (0xfull << ID_AA64ISAR0_EL1_SHA3_OFFSET)
-#define ID_AA64ISAR0_EL1_SHA3_EN       (1ull << ID_AA64ISAR0_EL1_SHA3_OFFSET)
-
 #define ID_AA64ISAR0_EL1_SHA2_OFFSET   12
 #define ID_AA64ISAR0_EL1_SHA2_MASK     (0xfull << ID_AA64ISAR0_EL1_SHA2_OFFSET)
 #define ID_AA64ISAR0_EL1_SHA2_EN       (1ull << ID_AA64ISAR0_EL1_SHA2_OFFSET)
+#define ID_AA64ISAR0_EL1_SHA2_512_EN   (2ull << ID_AA64ISAR0_EL1_SHA2_OFFSET)
 
 #define ID_AA64ISAR0_EL1_SHA1_OFFSET   8
 #define ID_AA64ISAR0_EL1_SHA1_MASK     (0xfull << ID_AA64ISAR0_EL1_SHA1_OFFSET)
@@ -1784,6 +2091,168 @@ typedef enum {
 #define ID_AA64ISAR0_EL1_AES_MASK      (0xfull << ID_AA64ISAR0_EL1_AES_OFFSET)
 #define ID_AA64ISAR0_EL1_AES_EN        (1ull << ID_AA64ISAR0_EL1_AES_OFFSET)
 #define ID_AA64ISAR0_EL1_AES_PMULL_EN  (2ull << ID_AA64ISAR0_EL1_AES_OFFSET)
+
+/*
+ * ID_AA64ISAR1_EL1 - AArch64 Instruction Set Attribute Register 1
+ *
+ *  63  56 55  52 51 48 47  44 43     40 39  36 35     32 31 28 27 24 23   20 19  16 15   12 11  8 7   4 3   0
+ * +------+------+-----+------+---------+------+---------+-----+-----+-------+------+-------+-----+-----+-----+
+ * | res0 | i8mm | dgh | bf16 | specres |  sb  | frintts | gpi | gpa | lrcpc | fcma | jscvt | api | apa | dpb |
+ * +------+------+-----+------+---------+------+---------+-----+-----+-------+------+-------+-----+-----+-----+
+ */
+
+#define ID_AA64ISAR1_EL1_I8MM_OFFSET    52
+#define ID_AA64ISAR1_EL1_I8MM_MASK      (0xfull << ID_AA64ISAR1_EL1_I8MM_OFFSET)
+#define ID_AA64ISAR1_EL1_I8MM_EN        (1ull << ID_AA64ISAR1_EL1_I8MM_OFFSET)
+
+#define ID_AA64ISAR1_EL1_DGH_OFFSET     48
+#define ID_AA64ISAR1_EL1_DGH_MASK       (0xfull << ID_AA64ISAR1_EL1_DGH_OFFSET)
+
+#define ID_AA64ISAR1_EL1_BF16_OFFSET    44
+#define ID_AA64ISAR1_EL1_BF16_MASK      (0xfull << ID_AA64ISAR1_EL1_BF16_OFFSET)
+#define ID_AA64ISAR1_EL1_BF16_EN        (1ull << ID_AA64ISAR1_EL1_BF16_OFFSET)
+
+#define ID_AA64ISAR1_EL1_SPECRES_OFFSET 40
+#define ID_AA64ISAR1_EL1_SPECRES_MASK   (0xfull << ID_AA64ISAR1_EL1_SPECRES_OFFSET)
+#define ID_AA64ISAR1_EL1_SPECRES_EN     (1ull << ID_AA64ISAR1_EL1_SPECRES_OFFSET)
+
+#define ID_AA64ISAR1_EL1_SB_OFFSET      36
+#define ID_AA64ISAR1_EL1_SB_MASK        (0xfull << ID_AA64ISAR1_EL1_SB_OFFSET)
+#define ID_AA64ISAR1_EL1_SB_EN          (1ull << ID_AA64ISAR1_EL1_SB_OFFSET)
+
+#define ID_AA64ISAR1_EL1_FRINTTS_OFFSET 32
+#define ID_AA64ISAR1_EL1_FRINTTS_MASK   (0xfull << ID_AA64ISAR1_EL1_FRINTTS_OFFSET)
+#define ID_AA64ISAR1_EL1_FRINTTS_EN     (1ull << ID_AA64ISAR1_EL1_FRINTTS_OFFSET)
+
+#define ID_AA64ISAR1_EL1_GPI_OFFSET     28
+#define ID_AA64ISAR1_EL1_GPI_MASK       (0xfull << ID_AA64ISAR1_EL1_GPI_OFFSET)
+#define ID_AA64ISAR1_EL1_GPI_EN         (1ull << ID_AA64ISAR1_EL1_GPI_OFFSET)
+
+#define ID_AA64ISAR1_EL1_GPA_OFFSET     24
+#define ID_AA64ISAR1_EL1_GPA_MASK       (0xfull << ID_AA64ISAR1_EL1_GPA_OFFSET)
+
+#define ID_AA64ISAR1_EL1_LRCPC_OFFSET   20
+#define ID_AA64ISAR1_EL1_LRCPC_MASK     (0xfull << ID_AA64ISAR1_EL1_LRCPC_OFFSET)
+#define ID_AA64ISAR1_EL1_LRCPC_EN       (1ull << ID_AA64ISAR1_EL1_LRCPC_OFFSET)
+#define ID_AA64ISAR1_EL1_LRCP2C_EN      (2ull << ID_AA64ISAR1_EL1_LRCPC_OFFSET)
+
+#define ID_AA64ISAR1_EL1_FCMA_OFFSET    16
+#define ID_AA64ISAR1_EL1_FCMA_MASK      (0xfull << ID_AA64ISAR1_EL1_FCMA_OFFSET)
+#define ID_AA64ISAR1_EL1_FCMA_EN        (1ull << ID_AA64ISAR1_EL1_FCMA_OFFSET)
+
+#define ID_AA64ISAR1_EL1_JSCVT_OFFSET   12
+#define ID_AA64ISAR1_EL1_JSCVT_MASK     (0xfull << ID_AA64ISAR1_EL1_JSCVT_OFFSET)
+#define ID_AA64ISAR1_EL1_JSCVT_EN       (1ull << ID_AA64ISAR1_EL1_JSCVT_OFFSET)
+
+#define ID_AA64ISAR1_EL1_API_OFFSET     8
+#define ID_AA64ISAR1_EL1_API_MASK       (0xfull << ID_AA64ISAR1_EL1_API_OFFSET)
+#define ID_AA64ISAR1_EL1_API_PAuth_EN   (1ull << ID_AA64ISAR1_EL1_API_OFFSET)
+#define ID_AA64ISAR1_EL1_API_PAuth2_EN  (3ull << ID_AA64ISAR1_EL1_API_OFFSET)
+#define ID_AA64ISAR1_EL1_API_FPAC_EN    (4ull << ID_AA64ISAR1_EL1_API_OFFSET)
+
+#define ID_AA64ISAR1_EL1_APA_OFFSET     4
+#define ID_AA64ISAR1_EL1_APA_MASK       (0xfull << ID_AA64ISAR1_EL1_APA_OFFSET)
+
+#define ID_AA64ISAR1_EL1_DPB_OFFSET     0
+#define ID_AA64ISAR1_EL1_DPB_MASK       (0xfull << ID_AA64ISAR1_EL1_DPB_OFFSET)
+#define ID_AA64ISAR1_EL1_DPB_EN         (1ull << ID_AA64ISAR1_EL1_DPB_OFFSET)
+#define ID_AA64ISAR1_EL1_DPB2_EN        (2ull << ID_AA64ISAR1_EL1_DPB_OFFSET)
+
+/*
+ * ID_AA64ISAR2_EL1 - AArch64 Instruction Set Attribute Register 2
+ *
+ *  63   8 7     4 3    0
+ * +------+-------+------+
+ * | res0 | RPRES | WFxT |
+ * +------+-------+------+
+ */
+
+#define ID_AA64ISAR2_EL1_RPRES_OFFSET   4
+#define ID_AA64ISAR2_EL1_RPRES_MASK     (0xfull << ID_AA64ISAR2_EL1_RPRES_OFFSET)
+#define ID_AA64ISAR2_EL1_RPRES_EN       (1ull << ID_AA64ISAR2_EL1_RPRES_OFFSET)
+
+#define ID_AA64ISAR2_EL1_WFxT_OFFSET    0
+#define ID_AA64ISAR2_EL1_WFxT_MASK      (0xfull << ID_AA64ISAR2_EL1_WFxT_OFFSET)
+#define ID_AA64ISAR2_EL1_WFxT_EN        (1ull << ID_AA64ISAR2_EL1_WFxT_OFFSET)
+
+/*
+ * ID_AA64MMFR0_EL1 - AArch64 Memory Model Feature Register 0
+ *  63   60 59   56 55        48 47   44 43      40 39       36 35       32 31    28 27     24 23     20 19       16 15    12 11     8 7        4 3       0
+ * +-------+-------+------------+-------+----------+-----------+-----------+--------+---------+---------+-----------+--------+--------+----------+---------+
+ * |  ECV  |  FGT  |    RES0    |  ExS  | TGran4_2 | TGran64_2 | TGran16_2 | TGran4 | TGran64 | TGran16 | BigEndEL0 | SNSMem | BigEnd | ASIDBits | PARange |
+ * +-------+-------+------------+-------+----------+-----------+-----------+--------+---------+---------+-----------+--------+--------+----------+---------+
+ */
+
+#define ID_AA64MMFR0_EL1_ECV_OFFSET      60
+#define ID_AA64MMFR0_EL1_ECV_MASK        (0xfull << ID_AA64MMFR2_EL1_AT_OFFSET)
+#define ID_AA64MMFR0_EL1_ECV_EN          (1ull << ID_AA64MMFR2_EL1_AT_OFFSET)
+
+/*
+ * ID_AA64MMFR2_EL1 - AArch64 Memory Model Feature Register 2
+ *  63  60 59   56 55   52 51   48 47    44 43   40 39   36 35  32 31  28 27  24 23   20 19     16 15  12 14    8 7     4 3     0
+ * +------+-------+-------+-------+--------+-------+-------+------+------+------+-------+---------+------+-------+-------+-------+
+ * | E0PD |  EVT  |  BBM  |  TTL  |  RES0  |  FWB  |  IDS  |  AT  |  ST  |  NV  | CCIDX | VARANGE | IESB |  LSM  |  UAO  |  CnP  |
+ * +------+-------+-------+-------+--------+-------+-------+------+------+------+-------+---------+------+-------+-------+-------+
+ */
+
+#define ID_AA64MMFR2_EL1_AT_OFFSET      32
+#define ID_AA64MMFR2_EL1_AT_MASK        (0xfull << ID_AA64MMFR2_EL1_AT_OFFSET)
+#define ID_AA64MMFR2_EL1_AT_LSE2_EN     (1ull << ID_AA64MMFR2_EL1_AT_OFFSET)
+
+/*
+ * ID_AA64PFR0_EL1 - AArch64 Processor Feature Register 0
+ *  63    60 59    56 55    52 51   48 47   44 43    40 39    36 35   32 31   28 27 24 23     20 19  16 15 12 11  8 7   4 3   0
+ * +--------+--------+--------+-------+-------+--------+--------+-------+-------+-----+---------+------+-----+-----+-----+-----+
+ * |  CSV3  |  CSV2  |  RES0  |  DIT  |  AMU  |  MPAM  |  SEL2  |  SVE  |  RAS  | GIC | AdvSIMD |  FP  | EL3 | EL2 | EL1 | EL0 |
+ * +--------+--------+--------+-------+-------+--------+--------+-------+-------+-----+---------+------+-----+-----+-----+-----+
+ */
+
+#define ID_AA64PFR0_EL1_CSV3_OFFSET     60
+#define ID_AA64PFR0_EL1_CSV3_MASK       (0xfull << ID_AA64PFR0_EL1_CSV3_OFFSET)
+#define ID_AA64PFR0_EL1_CSV3_EN         (1ull << ID_AA64PFR0_EL1_CSV3_OFFSET)
+
+#define ID_AA64PFR0_EL1_CSV2_OFFSET     56
+#define ID_AA64PFR0_EL1_CSV2_MASK       (0xfull << ID_AA64PFR0_EL1_CSV2_OFFSET)
+#define ID_AA64PFR0_EL1_CSV2_EN         (1ull << ID_AA64PFR0_EL1_CSV2_OFFSET)
+
+#define ID_AA64PFR0_EL1_DIT_OFFSET     48
+#define ID_AA64PFR0_EL1_DIT_MASK       (0xfull << ID_AA64PFR0_EL1_DIT_OFFSET)
+#define ID_AA64PFR0_EL1_DIT_EN         (1ull << ID_AA64PFR0_EL1_DIT_OFFSET)
+
+#define ID_AA64PFR0_EL1_AdvSIMD_OFFSET  20
+#define ID_AA64PFR0_EL1_AdvSIMD_MASK    (0xfull << ID_AA64PFR0_EL1_AdvSIMD_OFFSET)
+#define ID_AA64PFR0_EL1_AdvSIMD_HPFPCVT (0x0ull << ID_AA64PFR0_EL1_AdvSIMD_OFFSET)
+#define ID_AA64PFR0_EL1_AdvSIMD_FP16    (0x1ull << ID_AA64PFR0_EL1_AdvSIMD_OFFSET)
+#define ID_AA64PFR0_EL1_AdvSIMD_DIS     (0xfull << ID_AA64PFR0_EL1_AdvSIMD_OFFSET)
+
+/*
+ * ID_AA64PFR1_EL1 - AArch64 Processor Feature Register 1
+ *  63                              20 19       16 15      12 11    8 7    4 3    0
+ * +----------------------------------+-----------+----------+-------+------+------+
+ * |               RES0               | MPAM_frac | RAS_frac |  MTE  | SSBS |  BT  |
+ * +----------------------------------+-----------+----------+-------+------+------+
+ */
+
+#define ID_AA64PFR1_EL1_SSBS_OFFSET     4
+#define ID_AA64PFR1_EL1_SSBS_MASK       (0xfull << ID_AA64PFR1_EL1_SSBS_OFFSET)
+#define ID_AA64PFR1_EL1_SSBS_EN         (1ull << ID_AA64PFR1_EL1_SSBS_OFFSET)
+
+#define ID_AA64PFR1_EL1_BT_OFFSET       0
+#define ID_AA64PFR1_EL1_BT_MASK         (0xfull << ID_AA64PFR1_EL1_BT_OFFSET)
+#define ID_AA64PFR1_EL1_BT_EN           (1ull << ID_AA64PFR1_EL1_BT_OFFSET)
+
+/*
+ * ID_AA64MMFR1_EL1 - AArch64 Memory Model Feature Register 1
+ *
+ *  63  52 51    48 47 44 43 40 39 36 35 32 31  28 27     24 23   20 19  16 15  12 11   8 7        4 3       0
+ * +------+--------+-----+-----+-----+-----+------+---------+-------+------+------+------+----------+--------+
+ * | res0 | nTLBPA | AFP | HCX | ETS | TWED | XNX | SpecSEI |  PAN  |  LO  | HPDS |  VH  | VMIDBits | HAFDBS |
+ * +------+--------+-----+-----+-----+-----+------+---------+-------+------+------+------+----------+--------+
+ */
+
+#define ID_AA64MMFR1_EL1_AFP_OFFSET     44
+#define ID_AA64MMFR1_EL1_AFP_MASK       (0xfull << ID_AA64MMFR1_EL1_AFP_OFFSET)
+#define ID_AA64MMFR1_EL1_AFP_EN         (1ull << ID_AA64MMFR1_EL1_AFP_OFFSET)
 
 
 
@@ -1798,14 +2267,18 @@ typedef enum {
 #define ACTLR_EL1_EnAFP   (1ULL << 5)
 #define ACTLR_EL1_EnPRSV  (1ULL << 6)
 
+
+#if HAS_USAT_BIT
+#define ACTLR_EL1_USAT_OFFSET    0
+#define ACTLR_EL1_USAT_MASK      (1ULL << ACTLR_EL1_USAT_OFFSET)
+#define ACTLR_EL1_USAT           ACTLR_EL1_USAT_MASK
+#endif
 #define ACTLR_EL1_DisHWP_OFFSET  3
 #define ACTLR_EL1_DisHWP_MASK    (1ULL << ACTLR_EL1_DisHWP_OFFSET)
 #define ACTLR_EL1_DisHWP         ACTLR_EL1_DisHWP_MASK
 
 
 
-#define AFPCR_DAZ_SHIFT  (0)
-#define AFPCR_FTZ_SHIFT  (1)
 
 #if defined(HAS_APPLE_PAC)
 // The value of ptrauth_string_discriminator("recover"), hardcoded so it can be used from assembly code
@@ -1938,6 +2411,21 @@ cmp $2, $0
 b.mi 1f
 .endmacro
 
+.macro CMP_FOREACH reg, cc, label, car, cdr:vararg
+    cmp \reg, \car
+    b.\cc \label
+.ifnb \cdr
+    CMP_FOREACH \reg, \cc, \label, \cdr
+.endif
+.endm
+
+.macro EXEC_COREIN_REVALL midr_el1, scratch, midr_list:vararg
+and \scratch, \midr_el1, #MIDR_EL1_PNUM_MASK
+    CMP_FOREACH \scratch, eq, Lmatch\@, \midr_list
+    b 1f
+Lmatch\@:
+.endm
+
 /*
  * $0 - MIDR_SOC[_CORE], e.g. MIDR_ARUBA_VORTEX
  * $1 - GPR containing MIDR_EL1 value
@@ -1946,7 +2434,7 @@ b.mi 1f
 .macro EXEC_COREEQ_REVALL
 and $2, $1, #MIDR_EL1_PNUM_MASK
 cmp $2, $0
-b.ne 1f
+    b.ne 1f
 .endmacro
 
 /*
@@ -2108,6 +2596,22 @@ mrs $3, $0
 bic $3, $3, $1
 orr $3, $3, $2
 msr $0, $3
+.endmacro
+
+/*
+ * Replaces the value of a field in an implementation-defined system register.
+ * sreg: system register name
+ * field: field name within the sysreg, where the assembler symbols
+ *        ARM64_REG_<field>_{shift,width} specify the bounds of the field
+ *        (note that preprocessor macros will not work here)
+ * value: the value to insert
+ * scr{1,2}: scratch regs
+ */
+.macro HID_WRITE_FIELD sreg, field, val, scr1, scr2
+mrs \scr1, \sreg
+mov \scr2, \val
+bfi \scr1, \scr2, ARM64_REG_\sreg\()_\field\()_shift, ARM64_REG_\sreg\()_\field\()_width
+msr \sreg, \scr1
 .endmacro
 
 /*

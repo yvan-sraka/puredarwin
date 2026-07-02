@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2000-2020 Apple Inc. All rights reserved.
+ * Copyright (c) 2000-2022 Apple Inc. All rights reserved.
  *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
  *
@@ -159,9 +159,9 @@ int ip6_prefer_tempaddr = 1;
 int ip6_cga_conflict_retries = IPV6_CGA_CONFLICT_RETRIES_DEFAULT;
 
 #ifdef ENABLE_ADDRSEL
-extern lck_mtx_t *addrsel_mutex;
-#define ADDRSEL_LOCK()          lck_mtx_lock(addrsel_mutex)
-#define ADDRSEL_UNLOCK()        lck_mtx_unlock(addrsel_mutex)
+static LCK_MTX_DECLARE_ATTR(addrsel_mutex, &ip6_mutex_grp, &ip6_mutex_attr);
+#define ADDRSEL_LOCK()          lck_mtx_lock(&addrsel_mutex)
+#define ADDRSEL_UNLOCK()        lck_mtx_unlock(&addrsel_mutex)
 #else
 #define ADDRSEL_LOCK()
 #define ADDRSEL_UNLOCK()
@@ -195,7 +195,7 @@ void addrsel_policy_init(void);
 #define SASEL_LOG(fmt, ...) \
 do { \
 	if (srcsel_debug) \
-	        printf("%s:%d " fmt "\n",\
+	        os_log(OS_LOG_DEFAULT, "%s:%d " fmt,\
 	            __FUNCTION__, __LINE__, ##__VA_ARGS__); \
 } while (0); \
 
@@ -206,21 +206,21 @@ do { \
  * an entry to the caller for later use.
  */
 #define REPLACE(r) do {\
-	SASEL_LOG("REPLACE r %d ia %s ifp1 %s\n", \
-	    (r), s_src, ifp1->if_xname); \
+	SASEL_LOG("REPLACE r %s ia %s ifp1 %s\n", \
+	    (#r), s_src, ifp1->if_xname); \
 	srcrule = (r); \
 	goto replace; \
 } while (0)
 
 #define NEXTSRC(r) do {\
-	SASEL_LOG("NEXTSRC r %d ia %s ifp1 %s\n", \
-	    (r), s_src, ifp1->if_xname); \
+	SASEL_LOG("NEXTSRC r %s ia %s ifp1 %s\n", \
+	    (#r), s_src, ifp1->if_xname); \
 	goto next;              /* XXX: we can't use 'continue' here */ \
 } while (0)
 
 #define BREAK(r) do { \
-	SASEL_LOG("BREAK r %d ia %s ifp1 %s\n", \
-	    (r), s_src, ifp1->if_xname); \
+	SASEL_LOG("BREAK r %s ia %s ifp1 %s\n", \
+	    (#r), s_src, ifp1->if_xname); \
 	srcrule = (r); \
 	goto out;               /* XXX: we can't use 'break' here */ \
 } while (0)
@@ -237,7 +237,7 @@ in6_selectsrc_core_ifa(struct sockaddr_in6 *addr, struct ifnet *ifp, int srcsel_
 
 	if ((in6 = in6_selectsrc_core(addr,
 	    (ip6_prefer_tempaddr ? IPV6_SRCSEL_HINT_PREFER_TMPADDR : 0),
-	    ifp, 0, &src_storage, &src_ifp, &err, &ifa)) == NULL) {
+	    ifp, 0, &src_storage, &src_ifp, &err, &ifa, NULL)) == NULL) {
 		if (err == 0) {
 			err = EADDRNOTAVAIL;
 		}
@@ -282,7 +282,7 @@ done:
 struct in6_addr *
 in6_selectsrc_core(struct sockaddr_in6 *dstsock, uint32_t hint_mask,
     struct ifnet *ifp, int srcsel_debug, struct in6_addr *src_storage,
-    struct ifnet **sifp, int *errorp, struct ifaddr **ifapp)
+    struct ifnet **sifp, int *errorp, struct ifaddr **ifapp, struct route_in6 *ro)
 {
 	u_int32_t odstzone;
 	int bestrule = IP6S_SRCRULE_0;
@@ -294,6 +294,8 @@ in6_selectsrc_core(struct sockaddr_in6 *dstsock, uint32_t hint_mask,
 	const struct in6_addr *tmp = NULL;
 	int dst_scope = -1, best_scope = -1, best_matchlen = -1;
 	uint64_t secs = net_uptime();
+	struct nd_defrouter *dr = NULL;
+	uint32_t genid = in6_ifaddrlist_genid;
 	VERIFY(dstsock != NULL);
 	VERIFY(src_storage != NULL);
 	VERIFY(ifp != NULL);
@@ -313,7 +315,7 @@ in6_selectsrc_core(struct sockaddr_in6 *dstsock, uint32_t hint_mask,
 
 		tmp = &in6addr_any;
 		(void) inet_ntop(AF_INET6, tmp, s_src, sizeof(s_src));
-		printf("%s out src %s dst %s ifp %s\n",
+		os_log(OS_LOG_DEFAULT, "%s out src %s dst %s ifp %s",
 		    __func__, s_src, s_dst, ifp->if_xname);
 	}
 
@@ -323,7 +325,24 @@ in6_selectsrc_core(struct sockaddr_in6 *dstsock, uint32_t hint_mask,
 		goto done;
 	}
 
+	/*
+	 * Determine if the route is an indirect here
+	 * and if it is get the default router that would be
+	 * used as next hop.
+	 * Later in the function it is used to apply rule 5.5 of RFC 6724.
+	 */
+	if (ro != NULL && ro->ro_rt != NULL &&
+	    (ro->ro_rt->rt_flags & RTF_GATEWAY) &&
+	    ro->ro_rt->rt_gateway != NULL) {
+		struct rtentry *rt = ro->ro_rt;
+		lck_mtx_lock(nd6_mutex);
+		dr = defrouter_lookup(NULL,
+		    &SIN6(rt->rt_gateway)->sin6_addr, rt->rt_ifp);
+		lck_mtx_unlock(nd6_mutex);
+	}
+
 	lck_rw_lock_shared(&in6_ifaddr_rwlock);
+addrloop:
 	TAILQ_FOREACH(ia, &in6_ifaddrhead, ia6_link) {
 		int new_scope = -1, new_matchlen = -1;
 		struct in6_addrpolicy *new_policy = NULL;
@@ -344,7 +363,7 @@ in6_selectsrc_core(struct sockaddr_in6 *dstsock, uint32_t hint_mask,
 		 */
 		if (ia->ia6_flags & IN6_IFF_CLAT46) {
 			SASEL_LOG("NEXT ia %s address on ifp1 %s skipped as it is "
-			    "reserved for CLAT46", s_src, ifp1->if_xname);
+			    "reserved for CLAT46\n", s_src, ifp1->if_xname);
 			goto next;
 		}
 
@@ -399,7 +418,7 @@ in6_selectsrc_core(struct sockaddr_in6 *dstsock, uint32_t hint_mask,
 			goto next;
 		}
 		/* Rule 1: Prefer same address */
-		if (IN6_ARE_ADDR_EQUAL(&dst, &ia->ia_addr.sin6_addr)) {
+		if (in6_are_addr_equal_scoped(&dst, &ia->ia_addr.sin6_addr, dstzone, srczone)) {
 			BREAK(IP6S_SRCRULE_1); /* there should be no better candidate */
 		}
 		if (ia_best == NULL) {
@@ -468,6 +487,75 @@ in6_selectsrc_core(struct sockaddr_in6 *dstsock, uint32_t hint_mask,
 			}
 			if (ia_best->ia_ifp != ifp && ia->ia_ifp == ifp) {
 				REPLACE(IP6S_SRCRULE_5);
+			}
+		}
+
+		/*
+		 * Rule 5.5: Prefer addresses in a prefix advertised by the next-hop.
+		 * If SA or SA's prefix is assigned by the selected next-hop that will
+		 * be used to send to D and SB or SB's prefix is assigned by a different
+		 * next-hop, then prefer SA.  Similarly, if SB or SB's prefix is
+		 * assigned by the next-hop that will be used to send to D and SA or
+		 * SA's prefix is assigned by a different next-hop, then prefer SB.
+		 */
+		if (dr != NULL && ia_best->ia6_ndpr != ia->ia6_ndpr) {
+			boolean_t ia_best_has_prefix = FALSE;
+			boolean_t ia_has_prefix = FALSE;
+			struct nd_prefix ia_best_prefix = {};
+			struct nd_prefix ia_prefix = {};
+			struct nd_prefix *p_ia_best_prefix = NULL;
+			struct nd_prefix *p_ia_prefix = NULL;
+
+			if (ia_best->ia6_ndpr) {
+				ia_best_prefix = *ia_best->ia6_ndpr;
+			}
+
+			if (ia->ia6_ndpr) {
+				ia_prefix = *ia->ia6_ndpr;
+			}
+
+			IFA_UNLOCK(&ia->ia_ifa);
+			lck_rw_done(&in6_ifaddr_rwlock);
+
+			p_ia_best_prefix = nd6_prefix_lookup(&ia_best_prefix, ND6_PREFIX_EXPIRY_UNSPEC);
+			p_ia_prefix = nd6_prefix_lookup(&ia_prefix, ND6_PREFIX_EXPIRY_UNSPEC);
+
+			lck_mtx_lock(nd6_mutex);
+			if (p_ia_best_prefix != NULL) {
+				NDPR_LOCK(p_ia_best_prefix);
+				ia_best_has_prefix = (pfxrtr_lookup(p_ia_best_prefix, dr) != NULL);
+				NDPR_UNLOCK(p_ia_best_prefix);
+				NDPR_REMREF(p_ia_best_prefix);
+			}
+			if (p_ia_prefix != NULL) {
+				NDPR_LOCK(p_ia_prefix);
+				ia_has_prefix = (pfxrtr_lookup(p_ia_prefix, dr) != NULL);
+				NDPR_UNLOCK(p_ia_prefix);
+				NDPR_REMREF(p_ia_prefix);
+			}
+			lck_mtx_unlock(nd6_mutex);
+
+			lck_rw_lock_shared(&in6_ifaddr_rwlock);
+			if (genid != os_atomic_load(&in6_ifaddrlist_genid, acquire)) {
+				SASEL_LOG("Address list seems to have changed. Restarting source "
+				    "address selection.\n");
+				genid = in6_ifaddrlist_genid;
+				/*
+				 * We are starting from scratch. Free up the reference
+				 * on ia_best and also reset it to NULL.
+				 */
+				IFA_REMREF(&ia_best->ia_ifa);
+				ia_best = NULL;
+				goto addrloop;
+			}
+			IFA_LOCK(&ia->ia_ifa);
+
+			if (ia_best_has_prefix && !ia_has_prefix) {
+				NEXTSRC(IP6S_SRCRULE_5_5);
+			}
+
+			if (!ia_best_has_prefix && ia_has_prefix) {
+				REPLACE(IP6S_SRCRULE_5_5);
 			}
 		}
 
@@ -631,8 +719,12 @@ done:
 		tmp = (src_storage != NULL) ? src_storage : &in6addr_any;
 		(void) inet_ntop(AF_INET6, tmp, s_src, sizeof(s_src));
 
-		printf("%s out src %s dst %s dst_scope %d best_scope %d\n",
+		os_log(OS_LOG_DEFAULT, "%s out src %s dst %s dst_scope %d best_scope %d",
 		    __func__, s_src, s_dst, dst_scope, best_scope);
+	}
+
+	if (dr != NULL) {
+		NDDR_REMREF(dr);
 	}
 
 	return src_storage;
@@ -687,11 +779,14 @@ in6_selectsrc(struct sockaddr_in6 *dstsock, struct ip6_pktopts *opts,
 		if (INP_INTCOPROC_ALLOWED(inp)) {
 			ip6oa.ip6oa_flags |= IP6OAF_INTCOPROC_ALLOWED;
 		}
+		if (INP_MANAGEMENT_ALLOWED(inp)) {
+			ip6oa.ip6oa_flags |= IP6OAF_MANAGEMENT_ALLOWED;
+		}
 	} else {
 		mopts = NULL;
 		/* Allow the kernel to retransmit packets. */
 		ip6oa.ip6oa_flags |= IP6OAF_INTCOPROC_ALLOWED |
-		    IP6OAF_AWDL_UNRESTRICTED;
+		    IP6OAF_AWDL_UNRESTRICTED | IP6OAF_MANAGEMENT_ALLOWED;
 	}
 
 	if (ip6oa.ip6oa_boundif != IFSCOPE_NONE) {
@@ -728,7 +823,7 @@ in6_selectsrc(struct sockaddr_in6 *dstsock, struct ip6_pktopts *opts,
 		srcsock.sin6_len = sizeof(srcsock);
 		srcsock.sin6_addr = pi->ipi6_addr;
 		if (ifp != NULL) {
-			*errorp = in6_setscope(&srcsock.sin6_addr, ifp, NULL);
+			*errorp = in6_setscope(&srcsock.sin6_addr, ifp, IN6_NULL_IF_EMBEDDED_SCOPE(&srcsock.sin6_scope_id));
 			if (*errorp != 0) {
 				src_storage = NULL;
 				goto done;
@@ -792,7 +887,7 @@ in6_selectsrc(struct sockaddr_in6 *dstsock, struct ip6_pktopts *opts,
 	}
 
 	if (in6_selectsrc_core(dstsock, hint_mask, ifp, inp_debug, src_storage,
-	    &sifp, errorp, NULL) == NULL) {
+	    &sifp, errorp, NULL, ro) == NULL) {
 		src_storage = NULL;
 		goto done;
 	}
@@ -919,7 +1014,8 @@ selectroute(struct sockaddr_in6 *srcsock, struct sockaddr_in6 *dstsock,
 	}
 
 	if (ip6_select_srcif_debug) {
-		printf("%s src %s dst %s ifscope %d is_direct %d select_srcif %d\n",
+		os_log(OS_LOG_DEFAULT, "%s src %s dst %s ifscope %d "
+		    "is_direct %d select_srcif %d",
 		    __func__, s_src, s_dst, ifscope, is_direct, select_srcif);
 	}
 
@@ -1044,14 +1140,14 @@ getsrcif:
 
 		if (ip6_select_srcif_debug && ifa != NULL) {
 			if (ro->ro_rt != NULL) {
-				printf("%s %s->%s ifscope %d->%d ifa_if %s "
-				    "ro_if %s\n",
+				os_log(OS_LOG_DEFAULT, "%s %s->%s ifscope %d->%d ifa_if %s "
+				    "ro_if %s",
 				    __func__,
 				    s_src, s_dst, ifscope,
 				    scope, if_name(ifa->ifa_ifp),
 				    if_name(rt_ifp));
 			} else {
-				printf("%s %s->%s ifscope %d->%d ifa_if %s\n",
+				os_log(OS_LOG_DEFAULT, "%s %s->%s ifscope %d->%d ifa_if %s",
 				    __func__,
 				    s_src, s_dst, ifscope, scope,
 				    if_name(ifa->ifa_ifp));
@@ -1082,11 +1178,11 @@ getsrcif:
 		ifa = (struct ifaddr *)ifa_foraddr6(&srcsock->sin6_addr);
 
 		if (ip6_select_srcif_debug && ifa != NULL) {
-			printf("%s %s->%s ifscope %d ifa_if %s\n",
+			os_log(OS_LOG_DEFAULT, "%s %s->%s ifscope %d ifa_if %s",
 			    __func__,
 			    s_src, s_dst, ifscope, if_name(ifa->ifa_ifp));
 		} else if (ip6_select_srcif_debug) {
-			printf("%s %s->%s ifscope %d ifa_if NULL\n",
+			os_log(OS_LOG_DEFAULT, "%s %s->%s ifscope %d ifa_if NULL",
 			    __func__,
 			    s_src, s_dst, ifscope);
 		}
@@ -1124,8 +1220,8 @@ getroute:
 		    (!(ron->ro_rt->rt_flags & RTF_LLINFO) ||
 		    (select_srcif && (ifa == NULL ||
 		    (ifa->ifa_ifp != ron->ro_rt->rt_ifp && !proxied_ifa))))) ||
-		    !IN6_ARE_ADDR_EQUAL(&satosin6(&ron->ro_dst)->sin6_addr,
-		    &sin6_next->sin6_addr)) {
+		    !in6_are_addr_equal_scoped(&satosin6(&ron->ro_dst)->sin6_addr,
+		    &sin6_next->sin6_addr, ron->ro_rt->rt_ifp->if_index, sin6_next->sin6_scope_id)) {
 			if (ron->ro_rt != NULL) {
 				RT_UNLOCK(ron->ro_rt);
 			}
@@ -1140,8 +1236,8 @@ getroute:
 			}
 			if (ROUTE_UNUSABLE(ron) ||
 			    !(ron->ro_rt->rt_flags & RTF_LLINFO) ||
-			    !IN6_ARE_ADDR_EQUAL(&satosin6(rt_key(ron->ro_rt))->
-			    sin6_addr, &sin6_next->sin6_addr)) {
+			    !in6_are_addr_equal_scoped(&satosin6(rt_key(ron->ro_rt))->
+			    sin6_addr, &sin6_next->sin6_addr, ron->ro_rt->rt_ifp->if_index, sin6_next->sin6_scope_id)) {
 				if (ron->ro_rt != NULL) {
 					RT_UNLOCK(ron->ro_rt);
 				}
@@ -1183,7 +1279,7 @@ getroute:
 	}
 	if (ROUTE_UNUSABLE(ro) || (ro->ro_rt != NULL &&
 	    (satosin6(&ro->ro_dst)->sin6_family != AF_INET6 ||
-	    !IN6_ARE_ADDR_EQUAL(&satosin6(&ro->ro_dst)->sin6_addr, dst) ||
+	    !in6_are_addr_equal_scoped(&satosin6(&ro->ro_dst)->sin6_addr, dst, ro->ro_rt->rt_ifp->if_index, dstsock->sin6_scope_id) ||
 	    (select_srcif && (ifa == NULL ||
 	    (ifa->ifa_ifp != ro->ro_rt->rt_ifp && !proxied_ifa)))))) {
 		if (ro->ro_rt != NULL) {
@@ -1203,7 +1299,7 @@ getroute:
 		sa6->sin6_addr = *dst;
 		if (IN6_IS_ADDR_MC_LINKLOCAL(dst)) {
 			ro->ro_rt = rtalloc1_scoped(
-				&((struct route *)ro)->ro_dst, 0, 0, ifscope);
+				SA(&((struct route *)ro)->ro_dst), 0, 0, ifscope);
 		} else {
 			rtalloc_scoped((struct route *)ro, ifscope);
 		}
@@ -1261,16 +1357,18 @@ validateroute:
 			} else {
 				if (ip6_select_srcif_debug) {
 					if (ifa != NULL) {
-						printf("%s->%s ifscope %d "
+						os_log(OS_LOG_DEFAULT,
+						    "%s->%s ifscope %d "
 						    "ro_if %s != ifa_if %s "
-						    "(cached route cleared)\n",
+						    "(cached route cleared)",
 						    s_src, s_dst,
 						    ifscope, if_name(ifp),
 						    if_name(ifa->ifa_ifp));
 					} else {
-						printf("%s->%s ifscope %d "
+						os_log(OS_LOG_DEFAULT,
+						    "%s->%s ifscope %d "
 						    "ro_if %s (no ifa_if "
-						    "found)\n", s_src, s_dst,
+						    "found)", s_src, s_dst,
 						    ifscope, if_name(ifp));
 					}
 				}
@@ -1339,7 +1437,9 @@ done:
 	(!((_ip6oa)->ip6oa_flags & IP6OAF_INTCOPROC_ALLOWED) && \
 	    IFNET_IS_INTCOPROC(_ifp)) ||                        \
 	(!((_ip6oa)->ip6oa_flags & IP6OAF_AWDL_UNRESTRICTED) && \
-	    IFNET_IS_AWDL_RESTRICTED(_ifp)))
+	    IFNET_IS_AWDL_RESTRICTED(_ifp)) &&                  \
+	(!((_ip6oa)->ip6oa_flags & IP6OAF_MANAGEMENT_ALLOWED) && \
+	    IFNET_IS_MANAGEMENT(_ifp)))
 
 	if (error == 0 && ip6oa != NULL &&
 	    ((ifp && CHECK_RESTRICTIONS(ip6oa, ifp)) ||
@@ -1351,7 +1451,7 @@ done:
 		}
 		ifp = NULL;     /* ditch ifp; keep ifp0 */
 		error = EHOSTUNREACH;
-		ip6oa->ip6oa_retflags |= IP6OARF_IFDENIED;
+		ip6oa->ip6oa_flags |= IP6OAF_R_IFDENIED;
 	}
 #undef CHECK_RESTRICTIONS
 
@@ -1400,7 +1500,8 @@ done:
 		}
 	}
 	if (ip6_select_srcif_debug) {
-		printf("%s %s->%s ifscope %d ifa_if %s ro_if %s (error=%d)\n",
+		os_log(OS_LOG_DEFAULT,
+		    "%s %s->%s ifscope %d ifa_if %s ro_if %s (error=%d)",
 		    __func__,
 		    s_src, s_dst, ifscope,
 		    (ifa != NULL) ? if_name(ifa->ifa_ifp) : "NONE",
@@ -1548,11 +1649,15 @@ in6_pcbsetport(struct in6_addr *laddr, struct inpcb *inp, struct proc *p,
 	bool found, randomport;
 	struct inpcbinfo *pcbinfo = inp->inp_pcbinfo;
 	kauth_cred_t cred;
+#if SKYWALK
+	bool laddr_unspecified = IN6_IS_ADDR_UNSPECIFIED(laddr);
+#else
 #pragma unused(laddr)
+#endif
 	if (!locked) { /* Make sure we don't run into a deadlock: 4052373 */
-		if (!lck_rw_try_lock_exclusive(pcbinfo->ipi_lock)) {
+		if (!lck_rw_try_lock_exclusive(&pcbinfo->ipi_lock)) {
 			socket_unlock(inp->inp_socket, 0);
-			lck_rw_lock_exclusive(pcbinfo->ipi_lock);
+			lck_rw_lock_exclusive(&pcbinfo->ipi_lock);
 			socket_lock(inp->inp_socket, 0);
 		}
 
@@ -1562,7 +1667,7 @@ in6_pcbsetport(struct in6_addr *laddr, struct inpcb *inp, struct proc *p,
 		 */
 		if (inp->inp_lport != 0) {
 			VERIFY(inp->inp_flags2 & INP2_INHASHLIST);
-			lck_rw_done(pcbinfo->ipi_lock);
+			lck_rw_done(&pcbinfo->ipi_lock);
 
 			/*
 			 * It is not an error if another thread allocated
@@ -1591,7 +1696,7 @@ in6_pcbsetport(struct in6_addr *laddr, struct inpcb *inp, struct proc *p,
 		kauth_cred_unref(&cred);
 		if (error != 0) {
 			if (!locked) {
-				lck_rw_done(pcbinfo->ipi_lock);
+				lck_rw_done(&pcbinfo->ipi_lock);
 			}
 			return error;
 		}
@@ -1637,8 +1742,15 @@ in6_pcbsetport(struct in6_addr *laddr, struct inpcb *inp, struct proc *p,
 			 */
 			inp->in6p_laddr = in6addr_any;
 			inp->in6p_last_outifp = NULL;
+			inp->inp_lifscope = IFSCOPE_NONE;
+#if SKYWALK
+			if (NETNS_TOKEN_VALID(&inp->inp_netns_token)) {
+				netns_set_ifnet(&inp->inp_netns_token,
+				    NULL);
+			}
+#endif /* SKYWALK */
 			if (!locked) {
-				lck_rw_done(pcbinfo->ipi_lock);
+				lck_rw_done(&pcbinfo->ipi_lock);
 			}
 			return EAGAIN;
 		}
@@ -1664,7 +1776,35 @@ in6_pcbsetport(struct in6_addr *laddr, struct inpcb *inp, struct proc *p,
 		}
 
 		found = (in6_pcblookup_local(pcbinfo, &inp->in6p_laddr,
-		    lport, wild) == NULL);
+		    lport, inp->inp_lifscope, wild) == NULL);
+#if SKYWALK
+		if (found &&
+		    (SOCK_PROTO(so) == IPPROTO_TCP ||
+		    SOCK_PROTO(so) == IPPROTO_UDP) &&
+		    !(inp->inp_flags2 & INP2_EXTERNAL_PORT)) {
+			if (laddr_unspecified &&
+			    (inp->inp_flags & IN6P_IPV6_V6ONLY) == 0) {
+				struct in_addr ip_zero = { .s_addr = 0 };
+
+				netns_release(&inp->inp_wildcard_netns_token);
+				if (netns_reserve_in(
+					    &inp->inp_wildcard_netns_token,
+					    ip_zero,
+					    (uint8_t)SOCK_PROTO(so), lport,
+					    NETNS_BSD, NULL) != 0) {
+					/* port in use in IPv4 namespace */
+					found = false;
+				}
+			}
+			if (found &&
+			    netns_reserve_in6(&inp->inp_netns_token,
+			    inp->in6p_laddr, (uint8_t)SOCK_PROTO(so), lport,
+			    NETNS_BSD, NULL) != 0) {
+				netns_release(&inp->inp_wildcard_netns_token);
+				found = false;
+			}
+		}
+#endif /* SKYWALK */
 	} while (!found);
 
 	inp->inp_lport = lport;
@@ -1673,17 +1813,20 @@ in6_pcbsetport(struct in6_addr *laddr, struct inpcb *inp, struct proc *p,
 	if (in_pcbinshash(inp, 1) != 0) {
 		inp->in6p_laddr = in6addr_any;
 		inp->in6p_last_outifp = NULL;
-
+		inp->inp_lifscope = IFSCOPE_NONE;
+#if SKYWALK
+		netns_release(&inp->inp_netns_token);
+#endif /* SKYWALK */
 		inp->inp_lport = 0;
 		inp->inp_flags &= ~INP_ANONPORT;
 		if (!locked) {
-			lck_rw_done(pcbinfo->ipi_lock);
+			lck_rw_done(&pcbinfo->ipi_lock);
 		}
 		return EAGAIN;
 	}
 
 	if (!locked) {
-		lck_rw_done(pcbinfo->ipi_lock);
+		lck_rw_done(&pcbinfo->ipi_lock);
 	}
 	return 0;
 }
@@ -1941,8 +2084,7 @@ add_addrsel_policyent(const struct in6_addrpolicy *newpolicy)
 {
 	struct addrsel_policyent *new, *pol;
 
-	MALLOC(new, struct addrsel_policyent *, sizeof(*new), M_IFADDR,
-	    M_WAITOK);
+	new = kalloc_type(struct addrsel_policyent, Z_WAITOK | Z_ZERO);
 
 	ADDRSEL_LOCK();
 
@@ -1953,12 +2095,10 @@ add_addrsel_policyent(const struct in6_addrpolicy *newpolicy)
 		    IN6_ARE_ADDR_EQUAL(&newpolicy->addrmask.sin6_addr,
 		    &pol->ape_policy.addrmask.sin6_addr)) {
 			ADDRSEL_UNLOCK();
-			FREE(new, M_IFADDR);
+			kfree_type(struct addrsel_policyent, new);
 			return EEXIST;        /* or override it? */
 		}
 	}
-
-	bzero(new, sizeof(*new));
 
 	/* XXX: should validate entry */
 	new->ape_policy = *newpolicy;
@@ -1979,8 +2119,8 @@ delete_addrsel_policyent(const struct in6_addrpolicy *key)
 
 	/* search for the entry in the table */
 	TAILQ_FOREACH(pol, &addrsel_policytab, ape_entry) {
-		if (IN6_ARE_ADDR_EQUAL(&key->addr.sin6_addr,
-		    &pol->ape_policy.addr.sin6_addr) &&
+		if (in6_are_addr_equal_scoped(&key->addr.sin6_addr,
+		    &pol->ape_policy.addr.sin6_addr, key->addr.sin6_scope_id, pol->ape_policy.addr.sin6_scope_id) &&
 		    IN6_ARE_ADDR_EQUAL(&key->addrmask.sin6_addr,
 		    &pol->ape_policy.addrmask.sin6_addr)) {
 			break;
@@ -1992,7 +2132,7 @@ delete_addrsel_policyent(const struct in6_addrpolicy *key)
 	}
 
 	TAILQ_REMOVE(&addrsel_policytab, pol, ape_entry);
-	FREE(pol, M_IFADDR);
+	kfree_type(struct addrsel_policyent, pol);
 	pol = NULL;
 	ADDRSEL_UNLOCK();
 
@@ -2114,7 +2254,7 @@ in6_src_ioctl(u_long cmd, caddr_t data)
  */
 int
 in6_embedscope(struct in6_addr *in6, const struct sockaddr_in6 *sin6,
-    struct in6pcb *in6p, struct ifnet **ifpp, struct ip6_pktopts *opt)
+    struct in6pcb *in6p, struct ifnet **ifpp, struct ip6_pktopts *opt, uint32_t *ret_ifscope)
 {
 	struct ifnet *ifp = NULL;
 	u_int32_t scopeid;
@@ -2166,11 +2306,22 @@ in6_embedscope(struct in6_addr *in6, const struct sockaddr_in6 *sin6,
 				ifp = ifindex2ifnet[pi->ipi6_ifindex];
 				ifnet_head_done();
 			}
-			in6->s6_addr16[1] = htons((uint16_t)pi->ipi6_ifindex);
+
+			if (in6_embedded_scope) {
+				in6->s6_addr16[1] = htons((uint16_t)pi->ipi6_ifindex);
+			}
+			if (ret_ifscope != NULL) {
+				*ret_ifscope = pi->ipi6_ifindex;
+			}
 		} else if (in6p != NULL && IN6_IS_ADDR_MULTICAST(in6) &&
 		    in6p->in6p_moptions != NULL && im6o_multicast_ifp != NULL) {
 			ifp = im6o_multicast_ifp;
-			in6->s6_addr16[1] = htons(ifp->if_index);
+			if (in6_embedded_scope) {
+				in6->s6_addr16[1] = htons(ifp->if_index);
+			}
+			if (ret_ifscope != NULL) {
+				*ret_ifscope = ifp->if_index;
+			}
 		} else if (scopeid != 0) {
 			/*
 			 * Since scopeid is unsigned, we only have to check it
@@ -2186,8 +2337,13 @@ in6_embedscope(struct in6_addr *in6, const struct sockaddr_in6 *sin6,
 				ifp = ifindex2ifnet[scopeid];
 				ifnet_head_done();
 			}
-			/* XXX assignment to 16bit from 32bit variable */
-			in6->s6_addr16[1] = htons(scopeid & 0xffff);
+			if (in6_embedded_scope) {
+				/* XXX assignment to 16bit from 32bit variable */
+				in6->s6_addr16[1] = htons(scopeid & 0xffff);
+			}
+			if (ret_ifscope != NULL) {
+				*ret_ifscope = scopeid;
+			}
 		}
 
 		if (ifpp != NULL) {
@@ -2218,6 +2374,12 @@ in6_recoverscope(
 
 	sin6->sin6_addr = *in6;
 
+	if (!in6_embedded_scope) {
+		if (ifp != NULL && IN6_IS_SCOPE_EMBED(in6)) {
+			sin6->sin6_scope_id = ifp->if_index;
+		}
+		return 0;
+	}
 	/*
 	 * don't try to read *in6 beyond here, since the caller may
 	 * ask us to overwrite existing sockaddr_in6
