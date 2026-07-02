@@ -17,10 +17,8 @@ pmap_ppl_unlockdown_pages(vm_address_t kva __unused, vm_size_t size __unused,
 {
 }
 
-#ifdef PVH_FLAG_IOMMU
 void *
 ptep_get_iommu(pt_entry_t *pte_p __unused)
 {
 	return NULL;
 }
-#endif /* PVH_FLAG_IOMMU */
