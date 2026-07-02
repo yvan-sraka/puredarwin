@@ -4,12 +4,42 @@ on:
   pull_request:
   push:
   workflow_dispatch:
+    inputs:
+      arch:
+        description: "Target architecture (x86_64, arm64, or blank for both)"
+        required: false
+        type: string
+        default: ""
 
 jobs:
-  build:
-    name: build (x86_64)
-    runs-on: macos-15-intel
+  matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      include: ${{ steps.set.outputs.include }}
+    steps:
+      - id: set
+        run: |
+          arch="${{ github.event.inputs.arch }}"
+          if [ "${{ github.event_name }}" != "workflow_dispatch" ] || [ -z "$arch" ]; then
+            include='[{"arch":"x86_64","runner":"macos-15-intel"},{"arch":"arm64","runner":"macos-15"}]'
+          elif [ "$arch" = "x86_64" ]; then
+            include='[{"arch":"x86_64","runner":"macos-15-intel"}]'
+          elif [ "$arch" = "arm64" ]; then
+            include='[{"arch":"arm64","runner":"macos-15"}]'
+          else
+            echo "Unknown arch: $arch" >&2
+            exit 1
+          fi
+          echo "include=$include" >> "$GITHUB_OUTPUT"
 
+  build:
+    name: build (${{ matrix.arch }})
+    needs: matrix
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.matrix.outputs.include) }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -22,6 +52,7 @@ jobs:
       - name: Configure
         run: |
           cmake -B build -G Ninja \
+            -DPUREDARWIN_TARGET_ARCH=${{ matrix.arch }} \
             -DOPENSSL_ROOT_DIR="$(brew --prefix openssl)" \
             -DZLIB_ROOT="$(brew --prefix zlib)"
 
