@@ -33,7 +33,9 @@
 #include <mach_assert.h>
 #include <machine/asm.h>
 #include "assym.s"
+#if defined(APPLE_ARM64_ARCH_FAMILY)
 #include <arm64/tunables/tunables.s>
+#endif
 #include <arm64/exception_asm.h>
 
 #if __ARM_KERNEL_PROTECT__
@@ -777,7 +779,9 @@ common_start:
 	// Read MIDR before start of per-SoC tunables
 	mrs x12, MIDR_EL1
 
+#if defined(APPLE_ARM64_ARCH_FAMILY)
 	APPLY_TUNABLES x12, x13, x14
+#endif
 
 
 #if HAS_CLUSTER
