@@ -29,8 +29,9 @@
 #ifndef __KPERF_KPC_H__
 #define __KPERF_KPC_H__
 
+#include <machine/machine_kpc.h> /* KPC_MAX_COUNTERS */
 #if KPC
-#include <kern/kpc.h> /* KPC_MAX_COUNTERS */
+#include <kern/kpc.h>
 #endif
 
 void kperf_kpc_thread_ast(thread_t thread);
