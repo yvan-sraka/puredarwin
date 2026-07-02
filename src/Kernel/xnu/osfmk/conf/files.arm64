@@ -90,8 +90,7 @@ osfmk/OPTIONS/hi_res_clock	optional hi_res_clock
 
 # Kernel performance monitoring
 osfmk/arm64/perfmon_arm64.c optional config_perfmon
-# osfmk/arm64/kpc.c is not in the open-source drop.
-# osfmk/arm64/kpc.c		optional kpc nos_arm_asm
+osfmk/arm64/kpc.c		optional kpc nos_arm_asm
 osfmk/arm64/monotonic_arm64.c optional monotonic
 
 osfmk/arm64/platform_tests.c			optional config_xnupost
