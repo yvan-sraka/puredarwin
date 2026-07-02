@@ -145,4 +145,8 @@
 #define PRECISE_USER_KERNEL_TIME 1
 #endif /* !CONFIG_SKIP_PRECISE_USER_KERNEL_TIME */
 
+#if defined(__arm64e__) && !defined(HAS_APPLE_PAC)
+#define HAS_APPLE_PAC 1
+#endif
+
 #endif /* ! _PEXPERT_ARM_BOARD_CONFIG_H */
