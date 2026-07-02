@@ -3,9 +3,9 @@ find_program(dsymutil_path NAMES dsymutil llvm-dsymutil REQUIRED)
 # Map cmake arch name to XNU ARCH_CONFIGS name
 if(PUREDARWIN_TARGET_ARCH STREQUAL "arm64")
     set(XNU_ARCH_CONFIGS "ARM64")
-    # MakeInc.top uses override for DEFAULT_ARM64_MACHINE_CONFIG, so a command-line
-    # assignment is ignored. RC_ProjectName=*_host selects NONE (generic arm64).
-    set(XNU_MAKE_MACHINE_CONFIG "RC_ProjectName=puredarwin_host")
+    # Generic NONE has no board defines; BCM2837 is the open-source arm64 target
+    # and does not require Apple's libVMAPPLE KernelSupport archive.
+    set(XNU_MAKE_MACHINE_CONFIG "TARGET_CONFIGS=RELEASE ARM64 BCM2837")
 else()
     set(XNU_ARCH_CONFIGS "X86_64")
     set(XNU_MAKE_MACHINE_CONFIG "")
