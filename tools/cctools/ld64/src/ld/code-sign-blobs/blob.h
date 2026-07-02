@@ -182,7 +182,15 @@ public:
 	}
 	
 	BlobType *clone() const
-	{ assert(validateBlob()); return specific(this->BlobCore::clone());	}
+	{
+		assert(validateBlob());
+		size_t len = this->length();
+		BlobType *copy = static_cast<BlobType *>(::malloc(len));
+		if (!copy)
+			return NULL;
+		::memcpy(copy, this, len);
+		return specific(static_cast<BlobCore *>(copy));
+	}
 
 	static BlobType *readBlob(int fd)
 	{ return specific(BlobCore::readBlob(fd, _magic, sizeof(BlobType), 0), true); }
