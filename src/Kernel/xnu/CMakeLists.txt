@@ -3,13 +3,13 @@ find_program(dsymutil_path NAMES dsymutil llvm-dsymutil REQUIRED)
 # Map cmake arch name to XNU ARCH_CONFIGS name
 if(PUREDARWIN_TARGET_ARCH STREQUAL "arm64")
     set(XNU_ARCH_CONFIGS "ARM64")
-    # BCM2837 is the open-source arm64 board (no libVMAPPLE). Disable
-    # ARM_LARGE_MEMORY so T1SZ_BOOT + PAC pointer bits fit in 64 bits.
-    set(XNU_MAKE_MACHINE_CONFIG
-        "TARGET_CONFIGS=RELEASE ARM64 BCM2837 LARGE_MEMORY_DEFINE=-UARM_LARGE_MEMORY")
+    set(XNU_MAKE_MACHINE_CONFIG "TARGET_CONFIGS=RELEASE ARM64 BCM2837")
+    # BCM2837 on MacOSX: avoid ARM_LARGE_MEMORY (41-bit pointers) with T1SZ_BOOT=26.
+    set(XNU_MAKE_EXTRA_ARGS LARGE_MEMORY_DEFINE=-UARM_LARGE_MEMORY)
 else()
     set(XNU_ARCH_CONFIGS "X86_64")
     set(XNU_MAKE_MACHINE_CONFIG "")
+    set(XNU_MAKE_EXTRA_ARGS "")
 endif()
 
 set(XNU_FIREHOSE_INCLUDE "${CMAKE_CURRENT_SOURCE_DIR}/../libfirehose_kernel/include")
@@ -43,7 +43,7 @@ externalproject_add(xnu_headers.extproj
     COMMAND
         make -C <SOURCE_DIR> installhdrs ARCH_CONFIGS=${XNU_ARCH_CONFIGS} BUILD_LTO=0
             BUILD_WERROR=0 DO_CTFMERGE=0 KERNEL_CONFIGS=RELEASE
-            ${XNU_MAKE_MACHINE_CONFIG}
+            ${XNU_MAKE_MACHINE_CONFIG} ${XNU_MAKE_EXTRA_ARGS}
             SRCROOT=${CMAKE_CURRENT_SOURCE_DIR} OBJROOT=<BINARY_DIR>
             DSTROOT=${CMAKE_CURRENT_BINARY_DIR}/xnu_header_install
     INSTALL_COMMAND true # installed during build
@@ -111,7 +111,7 @@ externalproject_add(xnu
     COMMAND
         make -C <SOURCE_DIR> install ARCH_CONFIGS=${XNU_ARCH_CONFIGS} BUILD_LTO=0
             BUILD_WERROR=0 DO_CTFMERGE=0 KERNEL_CONFIGS=RELEASE
-            ${XNU_MAKE_MACHINE_CONFIG}
+            ${XNU_MAKE_MACHINE_CONFIG} ${XNU_MAKE_EXTRA_ARGS}
             SRCROOT=${CMAKE_CURRENT_SOURCE_DIR} OBJROOT=<BINARY_DIR>
             SYMROOT=${CMAKE_CURRENT_BINARY_DIR}/xnu_sym DSTROOT=${CMAKE_CURRENT_BINARY_DIR}/xnu
     INSTALL_COMMAND true # installed during build
