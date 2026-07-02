@@ -150,11 +150,14 @@ boolean_t validate_c_segs = TRUE;
  * the boot-arg & device-tree code.
  */
 
+#if CONFIG_FREEZE
+struct  freezer_context freezer_context_global;
+#endif /* CONFIG_FREEZE */
+
 #if !XNU_TARGET_OS_OSX
 
 #if CONFIG_FREEZE
 int     vm_compressor_mode = VM_PAGER_FREEZER_DEFAULT;
-struct  freezer_context freezer_context_global;
 #else /* CONFIG_FREEZE */
 int     vm_compressor_mode = VM_PAGER_NOT_CONFIGURED;
 #endif /* CONFIG_FREEZE */
