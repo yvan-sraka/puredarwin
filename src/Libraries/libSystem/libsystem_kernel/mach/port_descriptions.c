@@ -46,7 +46,7 @@ mach_host_special_port_description(int port)
 	static const char *hsp_descs[] = {
 		[HOST_PORT] = "host (restricted)",
 		[HOST_PRIV_PORT] = "host private (restricted)",
-		[HOST_IO_MASTER_PORT] = "I/O master (restricted)",
+		[HOST_IO_MAIN_PORT] = "I/O main (restricted)",
 
 		[HOST_DYNAMIC_PAGER_PORT] = "dynamic pager",
 		[HOST_AUDIT_CONTROL_PORT] = "audit control",
@@ -73,8 +73,9 @@ mach_host_special_port_description(int port)
 		[HOST_FILECOORDINATIOND_PORT] = "filecoordinationd",
 		[HOST_FAIRPLAYD_PORT] = "fairplayd",
 		[HOST_IOCOMPRESSIONSTATS_PORT] = "I/O compression stats",
+		[HOST_MEMORY_ERROR_PORT] = "memory error stats",
 	};
-	_Static_assert(HOST_IOCOMPRESSIONSTATS_PORT == HOST_MAX_SPECIAL_PORT,
+	_Static_assert(HOST_MEMORY_ERROR_PORT == HOST_MAX_SPECIAL_PORT,
 	    "all host special ports must have descriptions");
 
 	return hsp_descs[port_index];
@@ -96,7 +97,6 @@ mach_task_special_port_description(int port)
 		[TASK_BOOTSTRAP_PORT] = "bootstrap",
 		[TASK_INSPECT_PORT] = "inspect",
 		[TASK_READ_PORT] = "read",
-		[TASK_SEATBELT_PORT] = "seatbelt",
 		[TASK_ACCESS_PORT] = "access",
 		[TASK_DEBUG_CONTROL_PORT] = "debug control",
 		[TASK_RESOURCE_NOTIFY_PORT] = "resource notify",
@@ -152,7 +152,7 @@ mach_host_special_port_for_id(const char *id)
 #define SP_ENTRY(id) [id] = #id
 		SP_ENTRY(HOST_PORT),
 		SP_ENTRY(HOST_PRIV_PORT),
-		SP_ENTRY(HOST_IO_MASTER_PORT),
+		SP_ENTRY(HOST_IO_MAIN_PORT),
 		SP_ENTRY(HOST_DYNAMIC_PAGER_PORT),
 		SP_ENTRY(HOST_AUDIT_CONTROL_PORT),
 		SP_ENTRY(HOST_USER_NOTIFICATION_PORT),
@@ -192,7 +192,6 @@ mach_task_special_port_for_id(const char *id)
 		SP_ENTRY(TASK_BOOTSTRAP_PORT),
 		SP_ENTRY(TASK_INSPECT_PORT),
 		SP_ENTRY(TASK_READ_PORT),
-		SP_ENTRY(TASK_SEATBELT_PORT),
 		SP_ENTRY(TASK_ACCESS_PORT),
 		SP_ENTRY(TASK_DEBUG_CONTROL_PORT),
 		SP_ENTRY(TASK_RESOURCE_NOTIFY_PORT),
