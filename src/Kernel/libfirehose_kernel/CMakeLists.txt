@@ -13,3 +13,8 @@ target_link_libraries(libfirehose_kernel PRIVATE AvailabilityHeaders xnu_private
 target_link_libraries(libfirehose_kernel PRIVATE xnu_kernel_headers xnu_kernel_private_headers)
 target_link_libraries(libfirehose_kernel PRIVATE libplatform_headers libplatform_private_headers)
 target_link_libraries(libfirehose_kernel PRIVATE pthread_common_headers pthread_common_private_headers)
+
+# xnu links the kernel as arm64e on macOS; match that sub-architecture.
+if(PUREDARWIN_TARGET_ARCH STREQUAL "arm64")
+    set_property(TARGET libfirehose_kernel PROPERTY OSX_ARCHITECTURES arm64e)
+endif()
