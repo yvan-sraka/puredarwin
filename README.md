@@ -8,6 +8,17 @@ One current goal of this project is to provide a useful bootable ISO/VM of some 
 
 See the [Website](https://www.puredarwin.org) for more information.
 
+### Nix (optional)
+
+A `flake.nix` provides reproducible build dependencies on macOS and a QEMU-focused shell on Linux:
+
+```sh
+nix develop          # cmake, ninja, openssl, zlib (+ qemu tools on Linux)
+nix develop .#qemu   # QEMU image helpers only (Linux)
+```
+
+PureDarwin still requires AppleClang from Xcode on macOS; the flake supplies dependencies and environment variables, not the compiler.
+
 ## Building PureDarwin
 
 To build PureDarwin, you will need OpenSSL installed, which is used by xar and ld64.
