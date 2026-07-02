@@ -859,8 +859,11 @@ LDFILES_KERNEL_ONLY = $(TARGET)/all-kpi.exp $(TARGET)/all-alias.exp $(TARGET)/sy
 LD_KERNEL_LIBS	   = -lcc_kext
 LD_KERNEL_ARCHIVES = $(LDFLAGS_KERNEL_SDK) -lfirehose_kernel
 # Link opensource binary library
-ifneq ($(filter T6000 T8101 VMAPPLE T6000 T8101 VMAPPLE,$(CURRENT_MACHINE_CONFIG)),)
-	LDFLAGS_KERNEL_ONLY += -rdynamic -Wl,-force_load,$(KDKROOT)/System/Library/KernelSupport/lib$(CURRENT_MACHINE_CONFIG).os.$(CURRENT_KERNEL_CONFIG).a
+ifneq ($(filter T6000 T8101 VMAPPLE,$(CURRENT_MACHINE_CONFIG)),)
+_PUREDARWIN_KERNEL_SUPPORT_LIB = $(KDKROOT)/System/Library/KernelSupport/lib$(CURRENT_MACHINE_CONFIG).os.$(CURRENT_KERNEL_CONFIG).a
+ifneq ($(wildcard $(_PUREDARWIN_KERNEL_SUPPORT_LIB)),)
+	LDFLAGS_KERNEL_ONLY += -rdynamic -Wl,-force_load,$(_PUREDARWIN_KERNEL_SUPPORT_LIB)
+endif
 endif
 
 
